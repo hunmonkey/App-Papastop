@@ -796,15 +796,15 @@ def ensure_nllb_model(on_line: Callable[[str], None]) -> None:
     on_line("NLLB 모델 준비가 끝났습니다.")
 
 
-def translate_srt_file_nllb(
-    source_path: Path,
-    target_path: Path,
+_nllb_translator = None
+_nllb_tokenizers: dict[str, object] = {}
+
+
+def load_nllb(
     from_code: str,
     to_code: str,
     on_line: Callable[[str], None],
-    on_progress: Callable[[float], None],
-    should_stop: Callable[[], bool] | None = None,
-) -> None:
+) -> tuple[object, object, str]:
     nllb_from = NLLB_LANGUAGE_CODES.get(from_code)
     nllb_to = NLLB_LANGUAGE_CODES.get(to_code)
     if not nllb_from or not nllb_to:
@@ -814,16 +814,35 @@ def translate_srt_file_nllb(
         raise RuntimeError("NLLB 번역 엔진(ctranslate2/transformers)이 설치되어 있지 않습니다.")
 
     ensure_nllb_model(on_line)
-
     prepare_cuda_library_path()
+
     import ctranslate2
     from transformers import AutoTokenizer
 
-    on_line(f"NLLB 번역 모델을 준비합니다: {language_label(from_code)} -> {language_label(to_code)}")
-    tokenizer = AutoTokenizer.from_pretrained(NLLB_MODEL_NAME, src_lang=nllb_from)
-    device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
-    translator = ctranslate2.Translator(str(NLLB_MODEL_DIR), device=device)
+    global _nllb_translator
+    if _nllb_translator is None:
+        on_line("NLLB 번역 모델을 불러옵니다.")
+        device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+        _nllb_translator = ctranslate2.Translator(str(NLLB_MODEL_DIR), device=device)
 
+    if nllb_from not in _nllb_tokenizers:
+        _nllb_tokenizers[nllb_from] = AutoTokenizer.from_pretrained(NLLB_MODEL_NAME, src_lang=nllb_from)
+
+    return _nllb_tokenizers[nllb_from], _nllb_translator, nllb_to
+
+
+def translate_srt_file_nllb(
+    source_path: Path,
+    target_path: Path,
+    from_code: str,
+    to_code: str,
+    on_line: Callable[[str], None],
+    on_progress: Callable[[float], None],
+    should_stop: Callable[[], bool] | None = None,
+) -> None:
+    tokenizer, translator, nllb_to = load_nllb(from_code, to_code, on_line)
+
+    on_line(f"NLLB로 번역합니다: {language_label(from_code)} -> {language_label(to_code)}")
     text = read_text_file(source_path)
     blocks = parse_srt_blocks(text)
     if not blocks:
