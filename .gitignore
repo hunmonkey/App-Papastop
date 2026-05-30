@@ -1,0 +1,52 @@
+# ============================================================
+Git 버전관리 제외 목록
+# ============================================================
+
+# 환경 변수 (절대 커밋 금지)
+.env
+.env.*
+!.env.example
+.codex
+.papastop_cache/
+
+# 기초 연결 정보 (절대 커밋 금지)
+Rule_PW.txt
+
+# Python 캐시/검사 산출물
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.pyre/
+.pytype/
+.dmypy.json
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
+
+# 가상 환경
+venv/
+.venv/
+.venv*/
+venv*/
+env/
+ENV/
+.python-version
+
+# 로그
+*.log
+logs/
+
+# IDE/에디터
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
