@@ -1239,6 +1239,12 @@ class PapaStopApp(tk.Tk):
             style="Accent.TButton",
         ).grid(row=5, column=0, columnspan=2, sticky=tk.EW)
 
+        ttk.Button(
+            frame,
+            text="폴더 SRT 모두 번역",
+            command=self.translate_subtitle_folder,
+        ).grid(row=6, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
+
     def _build_convert_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="자막 변환 저장", style="Panel.TLabelframe")
         frame.pack(fill=tk.X)
@@ -1691,6 +1697,71 @@ class PapaStopApp(tk.Tk):
             self._emit("step", ("translate", "완료"))
             self._emit("status", "대기 중")
             self._emit("done", f"번역 자막을 저장했습니다.\n{target_path}")
+
+        self._reset_progress()
+        self._run_worker(work)
+
+    def translate_subtitle_folder(self) -> None:
+        folder = filedialog.askdirectory()
+        if not folder:
+            return
+
+        source_code = language_code_from_display(self.translate_from_var.get())
+        target_code = language_code_from_display(self.translate_to_var.get())
+        if source_code == target_code:
+            messagebox.showwarning(APP_NAME, "원본 언어와 번역 언어가 같습니다.")
+            return
+
+        srt_files = [
+            path
+            for path in sorted(Path(folder).glob("*.srt"))
+            if not path.stem.endswith(f".{target_code}")
+        ]
+        if not srt_files:
+            messagebox.showinfo(APP_NAME, "폴더에서 번역할 SRT 파일을 찾지 못했습니다.")
+            return
+
+        def work() -> None:
+            self._emit("status", "폴더 일괄 번역 중")
+            self._emit("step", ("translate", "진행 중"))
+            saved_paths: list[Path] = []
+            errors: list[str] = []
+            total = len(srt_files)
+
+            for index, srt_path in enumerate(srt_files, start=1):
+                ensure_not_cancelled(self.cancel_event.is_set)
+                self._emit("log", f"[{index}/{total}] 번역 시작: {srt_path.name}")
+                target_path = srt_path.with_name(f"{srt_path.stem}.{target_code}.srt")
+                try:
+                    translate_srt_file(
+                        source_path=srt_path,
+                        target_path=target_path,
+                        from_code=source_code,
+                        to_code=target_code,
+                        on_line=lambda line: self._emit("log", line),
+                        on_progress=lambda value, item_index=index: self._emit(
+                            "progress",
+                            ((item_index - 1) + value / 100) / total * 100,
+                        ),
+                        should_stop=self.cancel_event.is_set,
+                    )
+                    saved_paths.append(target_path)
+                    self._emit("subtitle_path", str(target_path))
+                except OperationCancelled:
+                    raise
+                except Exception as exc:
+                    errors.append(f"{srt_path.name}: {exc}")
+                    self._emit("log", f"오류: {srt_path.name} - {exc}")
+
+            if not saved_paths and errors:
+                raise RuntimeError("폴더에서 번역에 성공한 파일이 없습니다.\n" + "\n".join(errors[:3]))
+
+            self._emit("step", ("translate", "완료"))
+            self._emit("status", "대기 중")
+            message = f"폴더에서 자막 {len(saved_paths)}개를 번역했습니다."
+            if errors:
+                message += f"\n오류 {len(errors)}개는 작업 기록을 확인해 주세요."
+            self._emit("done", message)
 
         self._reset_progress()
         self._run_worker(work)
