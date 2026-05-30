@@ -16,6 +16,10 @@ Rule_PW.txt
 __pycache__/
 *.py[cod]
 *$py.class
+build/
+dist/
+release/
+*.spec
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

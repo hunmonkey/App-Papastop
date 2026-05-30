@@ -20,7 +20,17 @@ from tkinter import filedialog, messagebox, ttk
 
 
 APP_NAME = "PapaStop"
-APP_DIR = Path(__file__).resolve().parent
+def is_frozen_app() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def app_dir() -> Path:
+    if is_frozen_app():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+APP_DIR = app_dir()
 REQUIREMENTS_PATH = APP_DIR / "requirements.txt"
 APP_CACHE_DIR = APP_DIR / ".papastop_cache"
 HF_CACHE_DIR = APP_CACHE_DIR / "huggingface"
@@ -31,6 +41,14 @@ ENGINE_PACKAGES = {
     "imageio-ffmpeg": "imageio_ffmpeg",
 }
 
+# NVIDIA 그래픽카드가 있을 때만 추가로 설치하는 GPU 가속 라이브러리입니다.
+# faster-whisper(CTranslate2)가 GPU에서 추론하려면 cuda-runtime/cuBLAS/cuDNN이 필요합니다.
+CUDA_RUNTIME_PACKAGES = [
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12",
+]
+
 MEDIA_FILE_TYPES = [
     (
         "Video and audio files",
@@ -38,6 +56,22 @@ MEDIA_FILE_TYPES = [
     ),
     ("All files", "*.*"),
 ]
+
+MEDIA_EXTENSIONS = {
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".wmv",
+    ".flv",
+    ".webm",
+    ".m4v",
+    ".mp3",
+    ".wav",
+    ".m4a",
+    ".aac",
+    ".flac",
+}
 
 SUBTITLE_FILE_TYPES = [("SRT subtitle", "*.srt"), ("All files", "*.*")]
 SUBTITLE_SAVE_TYPES = [
@@ -77,6 +111,10 @@ class SubtitleBlock:
     lines: list[str]
 
 
+class OperationCancelled(RuntimeError):
+    pass
+
+
 def has_module(module_name: str) -> bool:
     return importlib.util.find_spec(module_name) is not None
 
@@ -92,6 +130,8 @@ def is_running_in_venv() -> bool:
 
 
 def install_target_label() -> str:
+    if is_frozen_app():
+        return "EXE 패키지 내부"
     if is_running_in_venv():
         return "프로젝트 전용 가상환경"
     return "현재 Windows 사용자 Python 폴더"
@@ -103,6 +143,38 @@ def prepare_model_cache_environment() -> None:
     os.environ.setdefault("HF_HUB_CACHE", str(HF_CACHE_DIR / "hub"))
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+
+def prepare_cuda_library_path() -> None:
+    """faster-whisper(CTranslate2)가 GPU에서 cuda-runtime/cuBLAS/cuDNN을 찾도록
+    pip로 설치된 nvidia 라이브러리 폴더를 DLL 검색 경로에 추가합니다.
+    Windows에서는 PATH 등록이 있어야 GPU 추론이 정상 동작합니다."""
+    try:
+        import nvidia
+    except ImportError:
+        return
+
+    bin_dirs: list[str] = []
+    for namespace_path in getattr(nvidia, "__path__", []):
+        root = Path(namespace_path)
+        for component in ("cuda_runtime", "cublas", "cudnn", "cuda_nvrtc"):
+            bin_dir = root / component / "bin"
+            if bin_dir.is_dir():
+                bin_dirs.append(str(bin_dir))
+
+    if not bin_dirs:
+        return
+
+    current_path = os.environ.get("PATH", "")
+    missing = [bin_dir for bin_dir in bin_dirs if bin_dir not in current_path]
+    if missing:
+        os.environ["PATH"] = os.pathsep.join(missing) + os.pathsep + current_path
+
+    for bin_dir in bin_dirs:
+        try:
+            os.add_dll_directory(bin_dir)
+        except OSError:
+            pass
 
 
 def run_command(
@@ -207,6 +279,22 @@ def check_engine_status() -> dict[str, str]:
 
 
 def install_python_engines(on_line: Callable[[str], None]) -> None:
+    if is_frozen_app():
+        missing_packages = [
+            package_name
+            for package_name, module_name in ENGINE_PACKAGES.items()
+            if not has_module(module_name)
+        ]
+        if missing_packages:
+            raise RuntimeError(
+                "EXE 패키지 안에서 엔진을 찾지 못했습니다. "
+                "배포 파일을 다시 압축 해제하거나 새 패키지를 받아 주세요."
+            )
+
+        on_line("EXE 패키지에는 필요한 엔진이 이미 포함되어 있습니다.")
+        on_line("별도 설치 없이 바로 자막 제작과 번역 기능을 사용할 수 있습니다.")
+        return
+
     command = [sys.executable, "-m", "pip", "install", "--upgrade"]
 
     if not is_running_in_venv():
@@ -216,6 +304,10 @@ def install_python_engines(on_line: Callable[[str], None]) -> None:
         command.extend(["-r", str(REQUIREMENTS_PATH)])
     else:
         command.extend(ENGINE_PACKAGES.keys())
+
+    if detect_nvidia_gpus():
+        command.extend(CUDA_RUNTIME_PACKAGES)
+        on_line("NVIDIA 그래픽카드가 감지되어 GPU 가속 라이브러리도 함께 설치합니다.")
 
     on_line("Python 자막/번역 엔진 설치를 시작합니다.")
     on_line(f"설치 위치: {install_target_label()}")
@@ -269,6 +361,56 @@ def bytes_to_gb(value: int | float | str | None) -> str:
         return "확인 필요"
 
     return f"{number / (1024 ** 3):.1f} GB"
+
+
+def format_file_size(size_bytes: int) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(size_bytes)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size_bytes} B"
+
+
+def media_files_in_folder(folder_path: Path) -> list[Path]:
+    if not folder_path.exists() or not folder_path.is_dir():
+        return []
+
+    return sorted(
+        (
+            path
+            for path in folder_path.iterdir()
+            if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
+        ),
+        key=lambda path: path.name.lower(),
+    )
+
+
+def language_display(code: str) -> str:
+    return LANGUAGES.get(code, code)
+
+
+def language_code_from_display(value: str) -> str:
+    if value in LANGUAGES:
+        return value
+
+    for code, label in LANGUAGES.items():
+        if value == label:
+            return code
+
+    for code, label in LANGUAGES.items():
+        if value.startswith(f"{label} "):
+            return code
+
+    return value
+
+
+def language_values(allow_auto: bool = True) -> list[str]:
+    source = LANGUAGES if allow_auto else TRANSLATION_LANGUAGES
+    return [language_display(code) for code in source]
 
 
 def detect_hardware() -> dict[str, str]:
@@ -481,6 +623,41 @@ def convert_subtitle_file(
     return target_path
 
 
+def ensure_not_cancelled(should_stop: Callable[[], bool] | None) -> None:
+    if should_stop and should_stop():
+        raise OperationCancelled("작업이 중지되었습니다.")
+
+
+def validate_media_for_transcription(media_path: Path) -> None:
+    if media_path.suffix.lower() not in MEDIA_EXTENSIONS:
+        raise RuntimeError(f"지원하지 않는 파일 형식입니다: {media_path.suffix}")
+
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg를 찾지 못했습니다. 먼저 엔진 설치를 눌러 주세요.")
+
+    try:
+        completed = subprocess.run(
+            [ffmpeg, "-hide_banner", "-i", str(media_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=windows_creation_flags(),
+            timeout=20,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("동영상 정보를 확인하는 데 시간이 너무 오래 걸렸습니다.") from exc
+
+    probe_text = f"{completed.stdout}\n{completed.stderr}"
+    if "Invalid data found" in probe_text or "No such file" in probe_text:
+        raise RuntimeError("파일을 동영상/음성 파일로 읽지 못했습니다.")
+
+    if "Audio:" not in probe_text:
+        raise RuntimeError("이 파일에서 음성 트랙을 찾지 못했습니다. 자막을 만들려면 소리가 들어 있어야 합니다.")
+
+
 def language_label(code: str) -> str:
     return f"{LANGUAGES.get(code, code)} ({code})"
 
@@ -492,6 +669,7 @@ def translate_srt_file(
     to_code: str,
     on_line: Callable[[str], None],
     on_progress: Callable[[float], None],
+    should_stop: Callable[[], bool] | None = None,
 ) -> None:
     if from_code == to_code:
         raise ValueError("원본 언어와 번역 언어가 같습니다.")
@@ -536,6 +714,7 @@ def translate_srt_file(
     translated_lines = 0
 
     for block in blocks:
+        ensure_not_cancelled(should_stop)
         new_lines: list[str] = []
         for line in block.lines:
             if line.strip():
@@ -564,11 +743,16 @@ def transcribe_media(
     beam_size: int,
     on_line: Callable[[str], None],
     on_progress: Callable[[float], None],
-) -> Path:
+    should_stop: Callable[[], bool] | None = None,
+) -> tuple[Path, str]:
     if not has_module("faster_whisper"):
         raise RuntimeError("faster-whisper가 설치되어 있지 않습니다. 먼저 엔진 설치를 눌러 주세요.")
 
+    ensure_not_cancelled(should_stop)
+    validate_media_for_transcription(media_path)
+    ensure_not_cancelled(should_stop)
     prepare_model_cache_environment()
+    prepare_cuda_library_path()
 
     from faster_whisper import WhisperModel
 
@@ -581,6 +765,7 @@ def transcribe_media(
     on_progress(10)
 
     model = WhisperModel(model_size, device=device, compute_type=compute_arg)
+    ensure_not_cancelled(should_stop)
     on_progress(25)
     on_line("영상의 소리를 분석합니다.")
 
@@ -596,6 +781,7 @@ def transcribe_media(
     detected_language = getattr(info, "language", None) or language_code or "audio"
 
     for segment in segments:
+        ensure_not_cancelled(should_stop)
         rows.append((float(segment.start), float(segment.end), str(segment.text)))
         if duration:
             on_progress(25 + min(65, float(segment.end) / float(duration) * 65))
@@ -605,11 +791,11 @@ def transcribe_media(
     if not rows:
         raise RuntimeError("소리에서 자막으로 만들 문장을 찾지 못했습니다.")
 
-    output_path = output_dir / f"{media_path.stem}.{detected_language}.srt"
+    output_path = output_dir / f"{media_path.stem}.srt"
     output_path.write_text(render_srt(rows), encoding="utf-8")
     on_progress(100)
     on_line(f"자막 저장 완료: {output_path}")
-    return output_path
+    return output_path, detected_language
 
 
 def extract_embedded_subtitle(
@@ -650,6 +836,41 @@ def extract_embedded_subtitle(
     return output_path
 
 
+class ToolTip:
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self.window: tk.Toplevel | None = None
+        widget.bind("<Enter>", self.show)
+        widget.bind("<Leave>", self.hide)
+
+    def show(self, _event: tk.Event | None = None) -> None:
+        if self.window or not self.text:
+            return
+
+        x = self.widget.winfo_rootx() + 18
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        self.window = tk.Toplevel(self.widget)
+        self.window.wm_overrideredirect(True)
+        self.window.wm_geometry(f"+{x}+{y}")
+        label = ttk.Label(
+            self.window,
+            text=self.text,
+            background="#fff7cc",
+            foreground="#111827",
+            relief=tk.SOLID,
+            borderwidth=1,
+            padding=(8, 5),
+            wraplength=360,
+        )
+        label.pack()
+
+    def hide(self, _event: tk.Event | None = None) -> None:
+        if self.window:
+            self.window.destroy()
+            self.window = None
+
+
 class PapaStopApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -658,17 +879,23 @@ class PapaStopApp(tk.Tk):
 
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.busy = False
+        self.cancel_event = threading.Event()
+        self.media_table_paths: dict[str, Path] = {}
+        self.selected_media_iids: set[str] = set()
 
         self.media_path_var = tk.StringVar()
+        self.media_folder_var = tk.StringVar()
         self.output_dir_var = tk.StringVar()
         self.subtitle_path_var = tk.StringVar()
         self.model_var = tk.StringVar(value="base")
-        self.source_lang_var = tk.StringVar(value="auto")
+        self.source_lang_var = tk.StringVar(value=language_display("auto"))
         self.device_var = tk.StringVar(value="auto")
         self.compute_var = tk.StringVar(value="auto")
         self.beam_var = tk.IntVar(value=5)
-        self.translate_from_var = tk.StringVar(value="en")
-        self.translate_to_var = tk.StringVar(value="ko")
+        self.auto_translate_var = tk.BooleanVar(value=False)
+        self.auto_translate_to_var = tk.StringVar(value=language_display("ko"))
+        self.translate_from_var = tk.StringVar(value=language_display("en"))
+        self.translate_to_var = tk.StringVar(value=language_display("ko"))
         self.translate_output_path_var = tk.StringVar()
         self.convert_format_var = tk.StringVar(value="vtt")
         self.convert_output_path_var = tk.StringVar()
@@ -751,6 +978,14 @@ class PapaStopApp(tk.Tk):
         self._build_hardware_panel(hardware_tab)
         self._build_log_panel(log_tab)
 
+    def _label_with_help(self, parent: ttk.Frame, text: str, help_text: str) -> ttk.Frame:
+        frame = ttk.Frame(parent)
+        ttk.Label(frame, text=text).pack(side=tk.LEFT)
+        help_label = ttk.Label(frame, text="?", width=2, anchor=tk.CENTER, foreground="#2563eb")
+        help_label.pack(side=tk.LEFT, padx=(4, 0))
+        ToolTip(help_label, help_text)
+        return frame
+
     def _build_file_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="파일", style="Panel.TLabelframe")
         frame.pack(fill=tk.X, pady=(0, 10))
@@ -763,9 +998,48 @@ class PapaStopApp(tk.Tk):
         ttk.Entry(media_row, textvariable=self.media_path_var).grid(row=0, column=0, sticky=tk.EW)
         ttk.Button(media_row, text="찾기", command=self.choose_media_file).grid(row=0, column=1, padx=(6, 0))
 
-        ttk.Label(frame, text="저장 폴더").grid(row=2, column=0, sticky=tk.W)
+        ttk.Label(frame, text="동영상 폴더").grid(row=2, column=0, sticky=tk.W)
+        folder_row = ttk.Frame(frame)
+        folder_row.grid(row=3, column=0, sticky=tk.EW, pady=(4, 10))
+        folder_row.columnconfigure(0, weight=1)
+        ttk.Entry(folder_row, textvariable=self.media_folder_var).grid(row=0, column=0, sticky=tk.EW)
+        ttk.Button(folder_row, text="폴더", command=self.choose_media_folder).grid(row=0, column=1, padx=(6, 0))
+
+        table_frame = ttk.Frame(frame)
+        table_frame.grid(row=4, column=0, sticky=tk.EW, pady=(0, 10))
+        table_frame.columnconfigure(0, weight=1)
+
+        self.media_tree = ttk.Treeview(
+            table_frame,
+            columns=("selected", "name", "ext", "size"),
+            show="headings",
+            height=3,
+        )
+        self.media_tree.heading("selected", text="체크박스")
+        self.media_tree.heading("name", text="파일명")
+        self.media_tree.heading("ext", text="확장자")
+        self.media_tree.heading("size", text="파일용량")
+        self.media_tree.column("selected", width=70, stretch=False, anchor=tk.CENTER)
+        self.media_tree.column("name", width=220, stretch=True)
+        self.media_tree.column("ext", width=70, stretch=False, anchor=tk.CENTER)
+        self.media_tree.column("size", width=90, stretch=False, anchor=tk.E)
+        self.media_tree.grid(row=0, column=0, sticky=tk.EW)
+        self.media_tree.bind("<Button-1>", self._on_media_tree_click)
+
+        media_scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.media_tree.yview)
+        media_scrollbar.grid(row=0, column=1, sticky=tk.NS)
+        self.media_tree.configure(yscrollcommand=media_scrollbar.set)
+
+        selection_row = ttk.Frame(frame)
+        selection_row.grid(row=5, column=0, sticky=tk.EW, pady=(0, 6))
+        selection_row.columnconfigure(0, weight=1)
+        selection_row.columnconfigure(1, weight=1)
+        ttk.Button(selection_row, text="전체 선택", command=self.select_all_media_files).grid(row=0, column=0, sticky=tk.EW, padx=(0, 3))
+        ttk.Button(selection_row, text="전체 해제", command=self.clear_media_file_selection).grid(row=0, column=1, sticky=tk.EW, padx=(3, 0))
+
+        ttk.Label(frame, text="저장 폴더").grid(row=6, column=0, sticky=tk.W)
         output_row = ttk.Frame(frame)
-        output_row.grid(row=3, column=0, sticky=tk.EW, pady=(4, 0))
+        output_row.grid(row=7, column=0, sticky=tk.EW, pady=(4, 0))
         output_row.columnconfigure(0, weight=1)
         ttk.Entry(output_row, textvariable=self.output_dir_var).grid(row=0, column=0, sticky=tk.EW)
         ttk.Button(output_row, text="폴더", command=self.choose_output_dir).grid(row=0, column=1, padx=(6, 0))
@@ -797,7 +1071,11 @@ class PapaStopApp(tk.Tk):
         for column in range(2):
             frame.columnconfigure(column, weight=1)
 
-        ttk.Label(frame, text="Whisper 모델").grid(row=0, column=0, sticky=tk.W)
+        self._label_with_help(
+            frame,
+            "Whisper 모델",
+            "소리를 글자로 바꾸는 인공지능 모델의 크기입니다. tiny/base는 빠르고, small 이상은 더 정확하지만 시간이 더 걸립니다.",
+        ).grid(row=0, column=0, sticky=tk.W)
         ttk.Combobox(
             frame,
             textvariable=self.model_var,
@@ -809,11 +1087,15 @@ class PapaStopApp(tk.Tk):
         ttk.Combobox(
             frame,
             textvariable=self.source_lang_var,
-            values=list(LANGUAGES.keys()),
+            values=language_values(allow_auto=True),
             state="readonly",
         ).grid(row=1, column=1, sticky=tk.EW, pady=(4, 8))
 
-        ttk.Label(frame, text="사용 장치").grid(row=2, column=0, sticky=tk.W)
+        self._label_with_help(
+            frame,
+            "사용 장치",
+            "자막을 만들 때 CPU 또는 그래픽카드 GPU 중 무엇을 쓸지 정합니다. NVIDIA 그래픽카드가 있으면 cuda가 빠를 수 있습니다.",
+        ).grid(row=2, column=0, sticky=tk.W)
         ttk.Combobox(
             frame,
             textvariable=self.device_var,
@@ -821,7 +1103,11 @@ class PapaStopApp(tk.Tk):
             state="readonly",
         ).grid(row=3, column=0, sticky=tk.EW, pady=(4, 8), padx=(0, 6))
 
-        ttk.Label(frame, text="계산 방식").grid(row=2, column=1, sticky=tk.W)
+        self._label_with_help(
+            frame,
+            "계산 방식",
+            "계산을 얼마나 가볍게 할지 정합니다. int8은 가볍고 CPU에 유리하며, float16은 GPU에서 빠른 편입니다.",
+        ).grid(row=2, column=1, sticky=tk.W)
         ttk.Combobox(
             frame,
             textvariable=self.compute_var,
@@ -829,7 +1115,11 @@ class PapaStopApp(tk.Tk):
             state="readonly",
         ).grid(row=3, column=1, sticky=tk.EW, pady=(4, 8))
 
-        ttk.Label(frame, text="정확도 단계").grid(row=4, column=0, sticky=tk.W)
+        self._label_with_help(
+            frame,
+            "정확도 단계",
+            "문장을 고를 때 몇 가지 후보를 비교할지 정합니다. 숫자가 높으면 더 꼼꼼하지만 느려질 수 있습니다.",
+        ).grid(row=4, column=0, sticky=tk.W)
         ttk.Spinbox(frame, from_=1, to=10, textvariable=self.beam_var).grid(
             row=5,
             column=0,
@@ -844,18 +1134,46 @@ class PapaStopApp(tk.Tk):
             command=self.apply_recommended_settings,
         ).grid(row=6, column=0, columnspan=2, sticky=tk.EW)
 
+        translate_row = ttk.Frame(frame)
+        translate_row.grid(row=7, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
+        translate_row.columnconfigure(1, weight=1)
+        auto_translate_check = ttk.Checkbutton(
+            translate_row,
+            text="자막 만든 뒤 자동 번역 →",
+            variable=self.auto_translate_var,
+        )
+        auto_translate_check.grid(row=0, column=0, sticky=tk.W)
+        ToolTip(
+            auto_translate_check,
+            "체크하면 여러 영상의 자막을 만든 뒤 곧바로 선택한 언어로 번역까지 한 번에 진행합니다. "
+            "번역 원본 언어는 위의 '원본 언어' 설정을 따르며, '자동 감지'면 소리에서 감지한 언어를 사용합니다.",
+        )
+        ttk.Combobox(
+            translate_row,
+            textvariable=self.auto_translate_to_var,
+            values=language_values(allow_auto=False),
+            state="readonly",
+            width=12,
+        ).grid(row=0, column=1, sticky=tk.E, padx=(8, 0))
+
         ttk.Button(
             frame,
             text="자막 만들기",
             command=self.make_subtitle,
             style="Accent.TButton",
-        ).grid(row=7, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
+        ).grid(row=8, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
 
         ttk.Button(
             frame,
             text="영상 속 기존 자막 추출",
             command=self.extract_embedded_subtitle,
-        ).grid(row=8, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
+        ).grid(row=9, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
+
+        ttk.Button(
+            frame,
+            text="작업 중지",
+            command=self.stop_current_work,
+        ).grid(row=10, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
 
     def _build_translate_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="번역 저장", style="Panel.TLabelframe")
@@ -878,7 +1196,7 @@ class PapaStopApp(tk.Tk):
         ttk.Combobox(
             language_row,
             textvariable=self.translate_from_var,
-            values=list(TRANSLATION_LANGUAGES.keys()),
+            values=language_values(allow_auto=False),
             state="readonly",
         ).grid(row=1, column=0, sticky=tk.EW, padx=(0, 6), pady=(4, 0))
 
@@ -886,7 +1204,7 @@ class PapaStopApp(tk.Tk):
         ttk.Combobox(
             language_row,
             textvariable=self.translate_to_var,
-            values=list(TRANSLATION_LANGUAGES.keys()),
+            values=language_values(allow_auto=False),
             state="readonly",
         ).grid(row=1, column=1, sticky=tk.EW, pady=(4, 0))
 
@@ -954,7 +1272,11 @@ class PapaStopApp(tk.Tk):
         frame.pack(fill=tk.X, pady=(0, 10))
         frame.columnconfigure(0, weight=1)
 
-        ttk.Progressbar(frame, variable=self.progress_var, maximum=100).grid(row=0, column=0, sticky=tk.EW)
+        progress_row = ttk.Frame(frame)
+        progress_row.grid(row=0, column=0, sticky=tk.EW)
+        progress_row.columnconfigure(0, weight=1)
+        ttk.Progressbar(progress_row, variable=self.progress_var, maximum=100).grid(row=0, column=0, sticky=tk.EW)
+        ttk.Button(progress_row, text="작업 중지", command=self.stop_current_work).grid(row=0, column=1, padx=(8, 0))
 
         self.step_tree = ttk.Treeview(frame, columns=("status",), show="tree headings", height=6)
         self.step_tree.heading("#0", text="단계")
@@ -1016,9 +1338,31 @@ class PapaStopApp(tk.Tk):
 
         media_path = Path(path)
         self.media_path_var.set(str(media_path))
+        self.media_folder_var.set(str(media_path.parent))
         if not self.output_dir_var.get():
             self.output_dir_var.set(str(media_path.parent))
+        self._fill_media_table([media_path])
         self._set_step("file", "완료")
+
+    def choose_media_folder(self) -> None:
+        path = filedialog.askdirectory()
+        if not path:
+            return
+
+        folder_path = Path(path)
+        self.media_folder_var.set(str(folder_path))
+        if not self.output_dir_var.get():
+            self.output_dir_var.set(str(folder_path))
+
+        media_files = media_files_in_folder(folder_path)
+        self._fill_media_table(media_files)
+        if media_files:
+            self.media_path_var.set(str(media_files[0]))
+            self._set_step("file", "완료")
+            self._append_log(f"동영상/음성 파일 {len(media_files)}개를 찾았습니다.")
+        else:
+            self.media_path_var.set("")
+            self._append_log("선택한 폴더에서 지원하는 동영상/음성 파일을 찾지 못했습니다.")
 
     def choose_output_dir(self) -> None:
         path = filedialog.askdirectory()
@@ -1034,8 +1378,9 @@ class PapaStopApp(tk.Tk):
 
     def choose_translate_output_file(self) -> None:
         source_path = self._selected_subtitle_path()
+        target_code = language_code_from_display(self.translate_to_var.get())
         initial_dir = source_path.parent if source_path else Path.cwd()
-        initial_file = self._default_subtitle_name(source_path, self.translate_to_var.get(), "srt")
+        initial_file = self._default_subtitle_name(source_path, target_code, "srt")
         path = filedialog.asksaveasfilename(
             defaultextension=".srt",
             filetypes=[("SRT subtitle", "*.srt"), ("All files", "*.*")],
@@ -1060,6 +1405,60 @@ class PapaStopApp(tk.Tk):
         if path:
             self.convert_output_path_var.set(str(ensure_subtitle_extension(Path(path), output_format)))
 
+    def _fill_media_table(self, media_files: list[Path]) -> None:
+        for item in self.media_tree.get_children():
+            self.media_tree.delete(item)
+
+        self.media_table_paths.clear()
+        self.selected_media_iids.clear()
+
+        for index, media_path in enumerate(media_files, start=1):
+            iid = f"media-{index}"
+            self.media_table_paths[iid] = media_path
+            self.selected_media_iids.add(iid)
+            try:
+                size_label = format_file_size(media_path.stat().st_size)
+            except OSError:
+                size_label = "확인 필요"
+
+            self.media_tree.insert(
+                "",
+                tk.END,
+                iid=iid,
+                values=("☑", media_path.name, media_path.suffix.lower(), size_label),
+            )
+
+    def _on_media_tree_click(self, event: tk.Event) -> None:
+        if self.media_tree.identify_region(event.x, event.y) != "cell":
+            return
+
+        if self.media_tree.identify_column(event.x) != "#1":
+            return
+
+        iid = self.media_tree.identify_row(event.y)
+        if not iid:
+            return
+
+        self._toggle_media_iid(iid)
+
+    def _toggle_media_iid(self, iid: str) -> None:
+        if iid in self.selected_media_iids:
+            self.selected_media_iids.remove(iid)
+            self.media_tree.set(iid, "selected", "☐")
+        else:
+            self.selected_media_iids.add(iid)
+            self.media_tree.set(iid, "selected", "☑")
+
+    def select_all_media_files(self) -> None:
+        for iid in self.media_table_paths:
+            self.selected_media_iids.add(iid)
+            self.media_tree.set(iid, "selected", "☑")
+
+    def clear_media_file_selection(self) -> None:
+        self.selected_media_iids.clear()
+        for iid in self.media_table_paths:
+            self.media_tree.set(iid, "selected", "☐")
+
     def apply_recommended_settings(self) -> None:
         settings, reason = recommend_transcribe_settings()
         self.model_var.set(str(settings["model"]))
@@ -1067,6 +1466,15 @@ class PapaStopApp(tk.Tk):
         self.compute_var.set(str(settings["compute"]))
         self.beam_var.set(int(settings["beam"]))
         self._append_log(reason)
+
+    def stop_current_work(self) -> None:
+        if not self.busy:
+            self._append_log("진행 중인 작업이 없습니다.")
+            return
+
+        self.cancel_event.set()
+        self.status_var.set("중지 요청 중")
+        self._append_log("작업 중지를 요청했습니다. 현재 처리 중인 작은 단계를 마친 뒤 멈춥니다.")
 
     def refresh_engines(self) -> None:
         def work() -> None:
@@ -1102,31 +1510,109 @@ class PapaStopApp(tk.Tk):
 
     def make_subtitle(self) -> None:
         try:
-            media_path, output_dir = self._validated_media_and_output()
+            jobs = self._selected_media_jobs()
         except ValueError as exc:
             messagebox.showwarning(APP_NAME, str(exc))
             return
 
+        auto_translate = bool(self.auto_translate_var.get())
+        translate_to = language_code_from_display(self.auto_translate_to_var.get())
+        source_lang = language_code_from_display(self.source_lang_var.get())
+
         def work() -> None:
             self._emit("status", "자막 만드는 중")
             self._emit("step", ("model", "진행 중"))
-            output_path = transcribe_media(
-                media_path=media_path,
-                output_dir=output_dir,
-                model_size=self.model_var.get(),
-                language_code=self.source_lang_var.get(),
-                device=self.device_var.get(),
-                compute_type=self.compute_var.get(),
-                beam_size=int(self.beam_var.get()),
-                on_line=lambda line: self._emit("log", line),
-                on_progress=lambda value: self._emit("progress", value),
-            )
+            saved_paths: list[Path] = []
+            translated_paths: list[Path] = []
+            errors: list[str] = []
+            total = len(jobs)
+            subtitle_weight = 0.6 if auto_translate else 1.0
+
+            for index, (media_path, output_dir) in enumerate(jobs, start=1):
+                ensure_not_cancelled(self.cancel_event.is_set)
+                self._emit("log", f"[{index}/{total}] 자막 생성 시작: {media_path.name}")
+                try:
+                    output_path, detected_language = transcribe_media(
+                        media_path=media_path,
+                        output_dir=output_dir,
+                        model_size=self.model_var.get(),
+                        language_code=source_lang,
+                        device=self.device_var.get(),
+                        compute_type=self.compute_var.get(),
+                        beam_size=int(self.beam_var.get()),
+                        on_line=lambda line: self._emit("log", line),
+                        on_progress=lambda value, item_index=index: self._emit(
+                            "progress",
+                            ((item_index - 1) + (value / 100) * subtitle_weight) / total * 100,
+                        ),
+                        should_stop=self.cancel_event.is_set,
+                    )
+                    saved_paths.append(output_path)
+                    self._emit("subtitle_path", str(output_path))
+
+                    if auto_translate:
+                        from_code = source_lang if source_lang != "auto" else detected_language
+                        if from_code not in TRANSLATION_LANGUAGES:
+                            self._emit(
+                                "log",
+                                f"[{index}/{total}] 번역할 수 없는 원본 언어({from_code})라 "
+                                f"번역을 건너뜁니다: {media_path.name}",
+                            )
+                        elif from_code == translate_to:
+                            self._emit(
+                                "log",
+                                f"[{index}/{total}] 원본과 번역 언어가 같아 번역을 건너뜁니다: {media_path.name}",
+                            )
+                        else:
+                            self._emit("step", ("translate", "진행 중"))
+                            translated_path = output_path.with_name(
+                                f"{output_path.stem}.{translate_to}.srt"
+                            )
+                            self._emit(
+                                "log",
+                                f"[{index}/{total}] 번역 시작: "
+                                f"{language_label(from_code)} -> {language_label(translate_to)}",
+                            )
+                            translate_srt_file(
+                                source_path=output_path,
+                                target_path=translated_path,
+                                from_code=from_code,
+                                to_code=translate_to,
+                                on_line=lambda line: self._emit("log", line),
+                                on_progress=lambda value, item_index=index: self._emit(
+                                    "progress",
+                                    (
+                                        (item_index - 1)
+                                        + subtitle_weight
+                                        + (value / 100) * (1 - subtitle_weight)
+                                    )
+                                    / total
+                                    * 100,
+                                ),
+                                should_stop=self.cancel_event.is_set,
+                            )
+                            translated_paths.append(translated_path)
+                            self._emit("subtitle_path", str(translated_path))
+                            self._emit("step", ("translate", "완료"))
+                except OperationCancelled:
+                    raise
+                except Exception as exc:
+                    errors.append(f"{media_path.name}: {exc}")
+                    self._emit("log", f"오류: {media_path.name} - {exc}")
+
+            if not saved_paths and errors:
+                raise RuntimeError("선택한 파일에서 자막을 만들지 못했습니다.\n" + "\n".join(errors[:3]))
+
             self._emit("step", ("model", "완료"))
             self._emit("step", ("audio", "완료"))
             self._emit("step", ("subtitle", "완료"))
-            self._emit("subtitle_path", str(output_path))
             self._emit("status", "대기 중")
-            self._emit("done", f"자막을 저장했습니다.\n{output_path}")
+            message = f"자막 {len(saved_paths)}개를 저장했습니다."
+            if translated_paths:
+                message += f"\n번역 자막 {len(translated_paths)}개도 저장했습니다."
+            if errors:
+                message += f"\n오류 {len(errors)}개는 작업 기록을 확인해 주세요."
+            self._emit("done", message)
 
         self._reset_progress()
         self._set_step("file", "완료")
@@ -1163,7 +1649,8 @@ class PapaStopApp(tk.Tk):
             messagebox.showwarning(APP_NAME, "번역할 SRT 파일을 먼저 선택해 주세요.")
             return
 
-        target_code = self.translate_to_var.get()
+        source_code = language_code_from_display(self.translate_from_var.get())
+        target_code = language_code_from_display(self.translate_to_var.get())
         target_path = self._subtitle_target_path(
             source_path,
             self.translate_output_path_var.get(),
@@ -1177,7 +1664,7 @@ class PapaStopApp(tk.Tk):
             translate_srt_file(
                 source_path=source_path,
                 target_path=target_path,
-                from_code=self.translate_from_var.get(),
+                from_code=source_code,
                 to_code=target_code,
                 on_line=lambda line: self._emit("log", line),
                 on_progress=lambda value: self._emit("progress", value),
@@ -1229,6 +1716,28 @@ class PapaStopApp(tk.Tk):
         output_dir = Path(output_dir_text) if output_dir_text else media_path.parent
         return media_path, output_dir
 
+    def _selected_media_jobs(self) -> list[tuple[Path, Path]]:
+        selected_paths = [
+            self.media_table_paths[iid]
+            for iid in self.media_table_paths
+            if iid in self.selected_media_iids
+        ]
+
+        if not selected_paths:
+            media_path = Path(self.media_path_var.get().strip())
+            if media_path.exists() and media_path.is_file():
+                selected_paths = [media_path]
+
+        if not selected_paths:
+            raise ValueError("자막을 만들 동영상 또는 음성 파일을 먼저 선택해 주세요.")
+
+        output_dir_text = self.output_dir_var.get().strip()
+        jobs: list[tuple[Path, Path]] = []
+        for media_path in selected_paths:
+            output_dir = Path(output_dir_text) if output_dir_text else media_path.parent
+            jobs.append((media_path, output_dir))
+        return jobs
+
     def _selected_subtitle_path(self) -> Path | None:
         path_text = self.subtitle_path_var.get().strip()
         if not path_text:
@@ -1263,12 +1772,15 @@ class PapaStopApp(tk.Tk):
             return
 
         if not allow_when_busy:
+            self.cancel_event.clear()
             self.busy = True
 
         def wrapped() -> None:
             started = time.time()
             try:
                 target()
+            except OperationCancelled as exc:
+                self._emit("cancelled", str(exc))
             except Exception as exc:
                 self._emit("error", str(exc))
             finally:
@@ -1307,6 +1819,10 @@ class PapaStopApp(tk.Tk):
                 self.busy = bool(payload)
             elif kind == "done":
                 messagebox.showinfo(APP_NAME, str(payload))
+            elif kind == "cancelled":
+                self.busy = False
+                self.status_var.set("중지됨")
+                self._append_log(str(payload))
             elif kind == "error":
                 self.busy = False
                 self.status_var.set("오류 발생")
@@ -1342,8 +1858,48 @@ class PapaStopApp(tk.Tk):
 
 
 def main() -> None:
+    if "--self-test" in sys.argv:
+        output_path = None
+        argument_index = sys.argv.index("--self-test")
+        if len(sys.argv) > argument_index + 1:
+            output_path = Path(sys.argv[argument_index + 1])
+        run_self_test(output_path)
+        return
+
     app = PapaStopApp()
     app.mainloop()
+
+
+def run_self_test(output_path: Path | None) -> None:
+    engine_status = check_engine_status()
+    import_results: dict[str, str] = {}
+
+    for package_name, module_name in ENGINE_PACKAGES.items():
+        try:
+            __import__(module_name)
+            import_results[package_name] = "ok"
+        except Exception as exc:
+            import_results[package_name] = f"error: {exc}"
+
+    app = PapaStopApp()
+    app.update_idletasks()
+    window_size = [app.winfo_reqwidth(), app.winfo_reqheight()]
+    app.destroy()
+
+    result = {
+        "app": APP_NAME,
+        "frozen": is_frozen_app(),
+        "app_dir": str(APP_DIR),
+        "engine_status": engine_status,
+        "engine_imports": import_results,
+        "window_size": window_size,
+    }
+
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

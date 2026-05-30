@@ -8,6 +8,12 @@ from papastop import (
     convert_subtitle_file,
     ensure_subtitle_extension,
     format_timestamp,
+    format_file_size,
+    ensure_not_cancelled,
+    language_code_from_display,
+    language_display,
+    media_files_in_folder,
+    OperationCancelled,
     parse_srt_blocks,
     recommend_transcribe_settings,
     render_srt,
@@ -93,6 +99,32 @@ class SubtitleUtilityTests(unittest.TestCase):
         settings, _reason = recommend_transcribe_settings([])
         self.assertEqual(settings["device"], "cpu")
         self.assertEqual(settings["compute"], "int8")
+
+    def test_language_display_round_trip(self):
+        self.assertEqual(language_display("en"), "영어")
+        self.assertEqual(language_code_from_display("영어"), "en")
+        self.assertEqual(language_code_from_display("자동 감지"), "auto")
+
+    def test_format_file_size(self):
+        self.assertEqual(format_file_size(500), "500 B")
+        self.assertEqual(format_file_size(1536), "1.5 KB")
+
+    def test_media_files_in_folder(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            mp4_path = temp_path / "video.mp4"
+            aac_path = temp_path / "sound.aac"
+            txt_path = temp_path / "note.txt"
+            mp4_path.write_bytes(b"mp4")
+            aac_path.write_bytes(b"aac")
+            txt_path.write_text("not media", encoding="utf-8")
+
+            self.assertEqual(media_files_in_folder(temp_path), [aac_path, mp4_path])
+
+    def test_ensure_not_cancelled(self):
+        with self.assertRaises(OperationCancelled):
+            ensure_not_cancelled(lambda: True)
+        ensure_not_cancelled(lambda: False)
 
 
 if __name__ == "__main__":
