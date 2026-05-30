@@ -783,8 +783,17 @@ def translate_srt_file(
     on_line(f"번역 자막 저장 완료: {target_path}")
 
 
+def nllb_model_dir() -> Path:
+    if is_frozen_app():
+        meipass = Path(getattr(sys, "_MEIPASS", APP_DIR))
+        bundled = meipass / NLLB_MODEL_DIR.name
+        if bundled.is_dir():
+            return bundled
+    return NLLB_MODEL_DIR
+
+
 def ensure_nllb_model(on_line: Callable[[str], None]) -> None:
-    if NLLB_MODEL_DIR.is_dir():
+    if nllb_model_dir().is_dir():
         return
 
     on_line("NLLB 모델을 준비합니다. 처음 한 번만 큰 다운로드와 변환이 필요합니다(수 GB, 시간이 걸립니다).")
@@ -823,7 +832,7 @@ def load_nllb(
     if _nllb_translator is None:
         on_line("NLLB 번역 모델을 불러옵니다.")
         device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
-        _nllb_translator = ctranslate2.Translator(str(NLLB_MODEL_DIR), device=device)
+        _nllb_translator = ctranslate2.Translator(str(nllb_model_dir()), device=device)
 
     if nllb_from not in _nllb_tokenizers:
         _nllb_tokenizers[nllb_from] = AutoTokenizer.from_pretrained(NLLB_MODEL_NAME, src_lang=nllb_from)

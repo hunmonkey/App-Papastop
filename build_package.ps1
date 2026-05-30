@@ -45,11 +45,13 @@ Write-Host "Building PapaStop package..."
     --collect-all nvidia.cudnn `
     --collect-all nvidia.cuda_runtime `
     --collect-all nvidia.cuda_nvrtc `
+    --collect-all transformers `
     --exclude-module tests `
     --exclude-module stanza.tests `
     --exclude-module torch.utils.tensorboard `
     --exclude-module numpy.f2py.tests `
     --add-data "README.md;." `
+    --add-data ".papastop_cache/nllb-200-distilled-1.3B-ct2;nllb-200-distilled-1.3B-ct2" `
     .\papastop.py
 
 Write-Host "Package created: dist\PapaStop\PapaStop.exe"
