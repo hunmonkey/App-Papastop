@@ -103,6 +103,28 @@ LANGUAGES = {
 
 TRANSLATION_LANGUAGES = {key: value for key, value in LANGUAGES.items() if key != "auto"}
 
+# 번역 엔진: argos(가벼움·빠름), nllb(고품질·GPU)
+TRANSLATION_ENGINES = {
+    "argos": "Argos (가벼움·빠름)",
+    "nllb": "NLLB (고품질)",
+}
+
+# NLLB(ctranslate2) 모델 위치와 FLORES-200 언어 코드 매핑
+NLLB_MODEL_NAME = "facebook/nllb-200-distilled-1.3B"
+NLLB_MODEL_DIR = APP_CACHE_DIR / "nllb-200-distilled-1.3B-ct2"
+NLLB_LANGUAGE_CODES = {
+    "ko": "kor_Hang",
+    "en": "eng_Latn",
+    "ja": "jpn_Jpan",
+    "zh": "zho_Hans",
+    "es": "spa_Latn",
+    "fr": "fra_Latn",
+    "de": "deu_Latn",
+    "it": "ita_Latn",
+    "pt": "por_Latn",
+    "ru": "rus_Cyrl",
+}
+
 
 @dataclass
 class SubtitleBlock:
@@ -421,6 +443,19 @@ def language_values(allow_auto: bool = True) -> list[str]:
     return [language_display(code) for code in source]
 
 
+def translation_engine_values() -> list[str]:
+    return list(TRANSLATION_ENGINES.values())
+
+
+def translation_engine_code(value: str) -> str:
+    if value in TRANSLATION_ENGINES:
+        return value
+    for code, label in TRANSLATION_ENGINES.items():
+        if value == label:
+            return code
+    return "argos"
+
+
 def detect_hardware() -> dict[str, str]:
     hardware = {
         "운영체제": platform.platform(),
@@ -678,9 +713,16 @@ def translate_srt_file(
     on_line: Callable[[str], None],
     on_progress: Callable[[float], None],
     should_stop: Callable[[], bool] | None = None,
+    engine: str = "argos",
 ) -> None:
     if from_code == to_code:
         raise ValueError("원본 언어와 번역 언어가 같습니다.")
+
+    if engine == "nllb":
+        translate_srt_file_nllb(
+            source_path, target_path, from_code, to_code, on_line, on_progress, should_stop
+        )
+        return
 
     if not has_module("argostranslate"):
         raise RuntimeError("Argos Translate가 설치되어 있지 않습니다. 먼저 엔진 설치를 눌러 주세요.")
@@ -727,6 +769,82 @@ def translate_srt_file(
         for line in block.lines:
             if line.strip():
                 new_lines.append(translate.translate(line, from_code, to_code))
+            else:
+                new_lines.append(line)
+
+            translated_lines += 1
+            on_progress(min(95, translated_lines / total_lines * 95))
+
+        translated_blocks.append(SubtitleBlock(block.index, block.timing, new_lines))
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(render_srt_blocks(translated_blocks), encoding="utf-8")
+    on_progress(100)
+    on_line(f"번역 자막 저장 완료: {target_path}")
+
+
+def ensure_nllb_model(on_line: Callable[[str], None]) -> None:
+    if NLLB_MODEL_DIR.is_dir():
+        return
+
+    on_line("NLLB 모델을 준비합니다. 처음 한 번만 큰 다운로드와 변환이 필요합니다(수 GB, 시간이 걸립니다).")
+    from ctranslate2.converters import TransformersConverter
+
+    APP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    converter = TransformersConverter(NLLB_MODEL_NAME)
+    converter.convert(str(NLLB_MODEL_DIR), quantization="int8_float16")
+    on_line("NLLB 모델 준비가 끝났습니다.")
+
+
+def translate_srt_file_nllb(
+    source_path: Path,
+    target_path: Path,
+    from_code: str,
+    to_code: str,
+    on_line: Callable[[str], None],
+    on_progress: Callable[[float], None],
+    should_stop: Callable[[], bool] | None = None,
+) -> None:
+    nllb_from = NLLB_LANGUAGE_CODES.get(from_code)
+    nllb_to = NLLB_LANGUAGE_CODES.get(to_code)
+    if not nllb_from or not nllb_to:
+        raise RuntimeError("NLLB가 지원하지 않는 언어입니다.")
+
+    if not has_module("ctranslate2") or not has_module("transformers"):
+        raise RuntimeError("NLLB 번역 엔진(ctranslate2/transformers)이 설치되어 있지 않습니다.")
+
+    ensure_nllb_model(on_line)
+
+    prepare_cuda_library_path()
+    import ctranslate2
+    from transformers import AutoTokenizer
+
+    on_line(f"NLLB 번역 모델을 준비합니다: {language_label(from_code)} -> {language_label(to_code)}")
+    tokenizer = AutoTokenizer.from_pretrained(NLLB_MODEL_NAME, src_lang=nllb_from)
+    device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+    translator = ctranslate2.Translator(str(NLLB_MODEL_DIR), device=device)
+
+    text = read_text_file(source_path)
+    blocks = parse_srt_blocks(text)
+    if not blocks:
+        raise RuntimeError("SRT 자막 내용을 읽지 못했습니다.")
+
+    translated_blocks: list[SubtitleBlock] = []
+    total_lines = sum(len(block.lines) for block in blocks) or 1
+    translated_lines = 0
+
+    for block in blocks:
+        ensure_not_cancelled(should_stop)
+        new_lines: list[str] = []
+        for line in block.lines:
+            if line.strip():
+                source_tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(line))
+                results = translator.translate_batch([source_tokens], target_prefix=[[nllb_to]])
+                target_tokens = results[0].hypotheses[0]
+                if target_tokens and target_tokens[0] == nllb_to:
+                    target_tokens = target_tokens[1:]
+                translated = tokenizer.decode(tokenizer.convert_tokens_to_ids(target_tokens))
+                new_lines.append(translated)
             else:
                 new_lines.append(line)
 
@@ -908,6 +1026,7 @@ class PapaStopApp(tk.Tk):
         self.auto_translate_to_var = tk.StringVar(value=language_display("ko"))
         self.translate_from_var = tk.StringVar(value=language_display("en"))
         self.translate_to_var = tk.StringVar(value=language_display("ko"))
+        self.translate_engine_var = tk.StringVar(value=TRANSLATION_ENGINES["argos"])
         self.translate_output_path_var = tk.StringVar()
         self.convert_format_var = tk.StringVar(value="vtt")
         self.convert_output_path_var = tk.StringVar()
@@ -1220,6 +1339,20 @@ class PapaStopApp(tk.Tk):
             values=language_values(allow_auto=False),
             state="readonly",
         ).grid(row=1, column=1, sticky=tk.EW, pady=(4, 0))
+
+        ttk.Label(language_row, text="번역 엔진").grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
+        engine_combo = ttk.Combobox(
+            language_row,
+            textvariable=self.translate_engine_var,
+            values=translation_engine_values(),
+            state="readonly",
+        )
+        engine_combo.grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(4, 0))
+        ToolTip(
+            engine_combo,
+            "Argos는 가볍고 빠릅니다. NLLB는 더 정확하지만 첫 사용 시 모델 다운로드가 필요하고 GPU에서 빠릅니다. "
+            "이 설정은 번역 저장·폴더 일괄 번역과 자막 제작의 자동 번역에 모두 적용됩니다.",
+        )
 
         ttk.Label(frame, text="번역 저장 이름").grid(row=3, column=0, sticky=tk.W)
         translate_output_row = ttk.Frame(frame)
@@ -1537,6 +1670,7 @@ class PapaStopApp(tk.Tk):
         auto_translate = bool(self.auto_translate_var.get())
         translate_to = language_code_from_display(self.auto_translate_to_var.get())
         source_lang = language_code_from_display(self.source_lang_var.get())
+        engine = translation_engine_code(self.translate_engine_var.get())
 
         def work() -> None:
             self._emit("status", "자막 만드는 중")
@@ -1616,6 +1750,7 @@ class PapaStopApp(tk.Tk):
                                     * 100,
                                 ),
                                 should_stop=self.cancel_event.is_set,
+                                engine=engine,
                             )
                             translated_paths.append(translated_path)
                             self._emit("subtitle_path", str(translated_path))
@@ -1676,6 +1811,7 @@ class PapaStopApp(tk.Tk):
 
         source_code = language_code_from_display(self.translate_from_var.get())
         target_code = language_code_from_display(self.translate_to_var.get())
+        engine = translation_engine_code(self.translate_engine_var.get())
         target_path = self._subtitle_target_path(
             source_path,
             self.translate_output_path_var.get(),
@@ -1693,6 +1829,7 @@ class PapaStopApp(tk.Tk):
                 to_code=target_code,
                 on_line=lambda line: self._emit("log", line),
                 on_progress=lambda value: self._emit("progress", value),
+                engine=engine,
             )
             self._emit("step", ("translate", "완료"))
             self._emit("status", "대기 중")
@@ -1708,6 +1845,7 @@ class PapaStopApp(tk.Tk):
 
         source_code = language_code_from_display(self.translate_from_var.get())
         target_code = language_code_from_display(self.translate_to_var.get())
+        engine = translation_engine_code(self.translate_engine_var.get())
         if source_code == target_code:
             messagebox.showwarning(APP_NAME, "원본 언어와 번역 언어가 같습니다.")
             return
@@ -1744,6 +1882,7 @@ class PapaStopApp(tk.Tk):
                             ((item_index - 1) + value / 100) / total * 100,
                         ),
                         should_stop=self.cancel_event.is_set,
+                        engine=engine,
                     )
                     saved_paths.append(target_path)
                     self._emit("subtitle_path", str(target_path))

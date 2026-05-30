@@ -1,7 +1,9 @@
 faster-whisper
 argostranslate
 imageio-ffmpeg
+transformers
 
+# transformers는 NLLB 고품질 번역 엔진(선택)에 사용됩니다.
 # GPU(NVIDIA) 가속 라이브러리 — 그래픽카드가 있을 때만 필요합니다.
 # 앱의 "엔진 설치"는 NVIDIA가 감지되면 아래 패키지를 자동으로 함께 설치합니다.
 # 수동 설치: pip install nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cudnn-cu12
