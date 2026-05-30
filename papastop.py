@@ -1086,12 +1086,13 @@ class PapaStopApp(tk.Tk):
         self._label_with_help(
             frame,
             "Whisper 모델",
-            "소리를 글자로 바꾸는 인공지능 모델의 크기입니다. tiny/base는 빠르고, small 이상은 더 정확하지만 시간이 더 걸립니다.",
+            "소리를 글자로 바꾸는 인공지능 모델입니다. tiny/base는 빠르고, small 이상은 더 정확합니다. "
+            "large-v3-turbo는 large급 정확도에 더 빠르고, distil-large-v3는 영어에 특화된 고속 모델입니다.",
         ).grid(row=0, column=0, sticky=tk.W)
         ttk.Combobox(
             frame,
             textvariable=self.model_var,
-            values=("tiny", "base", "small", "medium", "large-v3"),
+            values=("tiny", "base", "small", "medium", "large-v3", "large-v3-turbo", "distil-large-v3"),
             state="readonly",
         ).grid(row=1, column=0, sticky=tk.EW, pady=(4, 8), padx=(0, 6))
 
