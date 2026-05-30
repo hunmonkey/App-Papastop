@@ -147,20 +147,28 @@ def prepare_model_cache_environment() -> None:
 
 def prepare_cuda_library_path() -> None:
     """faster-whisper(CTranslate2)가 GPU에서 cuda-runtime/cuBLAS/cuDNN을 찾도록
-    pip로 설치된 nvidia 라이브러리 폴더를 DLL 검색 경로에 추가합니다.
-    Windows에서는 PATH 등록이 있어야 GPU 추론이 정상 동작합니다."""
+    설치된 nvidia 라이브러리 폴더를 DLL 검색 경로에 추가합니다.
+    Windows에서는 PATH 등록이 있어야 GPU 추론이 정상 동작합니다.
+    개발 환경(venv)과 EXE 패키지(frozen) 양쪽을 모두 지원합니다."""
+    roots: list[Path] = []
+
     try:
         import nvidia
+
+        roots.extend(Path(path) for path in getattr(nvidia, "__path__", []))
     except ImportError:
-        return
+        pass
+
+    if is_frozen_app():
+        meipass = Path(getattr(sys, "_MEIPASS", APP_DIR))
+        roots.extend([meipass / "nvidia", APP_DIR / "_internal" / "nvidia", APP_DIR / "nvidia"])
 
     bin_dirs: list[str] = []
-    for namespace_path in getattr(nvidia, "__path__", []):
-        root = Path(namespace_path)
+    for root in roots:
         for component in ("cuda_runtime", "cublas", "cudnn", "cuda_nvrtc"):
-            bin_dir = root / component / "bin"
-            if bin_dir.is_dir():
-                bin_dirs.append(str(bin_dir))
+            bin_dir = str(root / component / "bin")
+            if (root / component / "bin").is_dir() and bin_dir not in bin_dirs:
+                bin_dirs.append(bin_dir)
 
     if not bin_dirs:
         return
