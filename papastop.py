@@ -733,40 +733,44 @@ def translate_srt_file(
     on_line(f"번역 자막 저장 완료: {target_path}")
 
 
-def transcribe_media(
-    media_path: Path,
-    output_dir: Path,
+def load_whisper_model(
     model_size: str,
-    language_code: str,
     device: str,
     compute_type: str,
-    beam_size: int,
     on_line: Callable[[str], None],
-    on_progress: Callable[[float], None],
-    should_stop: Callable[[], bool] | None = None,
-) -> tuple[Path, str]:
+) -> object:
     if not has_module("faster_whisper"):
         raise RuntimeError("faster-whisper가 설치되어 있지 않습니다. 먼저 엔진 설치를 눌러 주세요.")
 
-    ensure_not_cancelled(should_stop)
-    validate_media_for_transcription(media_path)
-    ensure_not_cancelled(should_stop)
     prepare_model_cache_environment()
     prepare_cuda_library_path()
 
     from faster_whisper import WhisperModel
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    language_arg = None if language_code == "auto" else language_code
     compute_arg = "default" if compute_type == "auto" else compute_type
-
     on_line(f"모델을 준비합니다: {model_size}")
     on_line("처음 쓰는 모델은 자동으로 다운로드됩니다. 영상 파일이 큰 경우 시간이 걸립니다.")
-    on_progress(10)
+    return WhisperModel(model_size, device=device, compute_type=compute_arg)
 
-    model = WhisperModel(model_size, device=device, compute_type=compute_arg)
+
+def transcribe_media(
+    media_path: Path,
+    output_dir: Path,
+    model: object,
+    language_code: str,
+    beam_size: int,
+    on_line: Callable[[str], None],
+    on_progress: Callable[[float], None],
+    should_stop: Callable[[], bool] | None = None,
+) -> tuple[Path, str]:
     ensure_not_cancelled(should_stop)
-    on_progress(25)
+    validate_media_for_transcription(media_path)
+    ensure_not_cancelled(should_stop)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    language_arg = None if language_code == "auto" else language_code
+
+    on_progress(5)
     on_line("영상의 소리를 분석합니다.")
 
     segments, info = model.transcribe(
@@ -784,9 +788,9 @@ def transcribe_media(
         ensure_not_cancelled(should_stop)
         rows.append((float(segment.start), float(segment.end), str(segment.text)))
         if duration:
-            on_progress(25 + min(65, float(segment.end) / float(duration) * 65))
+            on_progress(5 + min(90, float(segment.end) / float(duration) * 90))
         elif len(rows) % 5 == 0:
-            on_progress(min(90, 25 + len(rows)))
+            on_progress(min(95, 5 + len(rows)))
 
     if not rows:
         raise RuntimeError("소리에서 자막으로 만들 문장을 찾지 못했습니다.")
@@ -1528,6 +1532,15 @@ class PapaStopApp(tk.Tk):
             total = len(jobs)
             subtitle_weight = 0.6 if auto_translate else 1.0
 
+            ensure_not_cancelled(self.cancel_event.is_set)
+            model = load_whisper_model(
+                self.model_var.get(),
+                self.device_var.get(),
+                self.compute_var.get(),
+                lambda line: self._emit("log", line),
+            )
+            self._emit("step", ("model", "완료"))
+
             for index, (media_path, output_dir) in enumerate(jobs, start=1):
                 ensure_not_cancelled(self.cancel_event.is_set)
                 self._emit("log", f"[{index}/{total}] 자막 생성 시작: {media_path.name}")
@@ -1535,10 +1548,8 @@ class PapaStopApp(tk.Tk):
                     output_path, detected_language = transcribe_media(
                         media_path=media_path,
                         output_dir=output_dir,
-                        model_size=self.model_var.get(),
+                        model=model,
                         language_code=source_lang,
-                        device=self.device_var.get(),
-                        compute_type=self.compute_var.get(),
                         beam_size=int(self.beam_var.get()),
                         on_line=lambda line: self._emit("log", line),
                         on_progress=lambda value, item_index=index: self._emit(
@@ -1603,7 +1614,6 @@ class PapaStopApp(tk.Tk):
             if not saved_paths and errors:
                 raise RuntimeError("선택한 파일에서 자막을 만들지 못했습니다.\n" + "\n".join(errors[:3]))
 
-            self._emit("step", ("model", "완료"))
             self._emit("step", ("audio", "완료"))
             self._emit("step", ("subtitle", "완료"))
             self._emit("status", "대기 중")
