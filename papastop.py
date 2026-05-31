@@ -850,14 +850,19 @@ def nllb_model_dir() -> Path:
     return NLLB_MODEL_DIR
 
 
+def nllb_model_is_downloaded() -> bool:
+    return nllb_model_dir().is_dir()
+
+
 def ensure_nllb_model(on_line: Callable[[str], None]) -> None:
     if nllb_model_dir().is_dir():
         return
 
-    on_line("NLLB 모델을 준비합니다. 처음 한 번만 큰 다운로드와 변환이 필요합니다(수 GB, 시간이 걸립니다).")
+    on_line("NLLB 모델을 준비합니다. 처음 한 번만 큰 다운로드(약 5GB)와 변환이 필요하며 수 분 걸립니다.")
     from ctranslate2.converters import TransformersConverter
 
     APP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    on_line("모델을 내려받아 변환하는 중입니다. 진행 표시줄이 움직이는 동안 기다려 주세요.")
     converter = TransformersConverter(NLLB_MODEL_NAME)
     converter.convert(str(NLLB_MODEL_DIR), quantization="int8_float16")
     on_line("NLLB 모델 준비가 끝났습니다.")
@@ -1158,6 +1163,7 @@ class PapaStopApp(tk.Tk):
         self.translate_from_var = tk.StringVar(value=language_display("en"))
         self.translate_to_var = tk.StringVar(value=language_display("ko"))
         self.translate_engine_var = tk.StringVar(value=TRANSLATION_ENGINES["argos"])
+        self.nllb_status_var = tk.StringVar(value="")
         self.translate_output_path_var = tk.StringVar()
         self.convert_format_var = tk.StringVar(value="vtt")
         self.convert_output_path_var = tk.StringVar()
@@ -1170,6 +1176,7 @@ class PapaStopApp(tk.Tk):
         self.after(250, self.refresh_hardware)
         self.after(450, self.refresh_engines)
         self.after(650, self.refresh_model_status)
+        self.after(750, self.refresh_nllb_status)
 
     def _configure_style(self) -> None:
         style = ttk.Style(self)
@@ -1506,6 +1513,16 @@ class PapaStopApp(tk.Tk):
             "이 설정은 번역 저장·폴더 일괄 번역과 자막 제작의 자동 번역에 모두 적용됩니다.",
         )
 
+        nllb_row = ttk.Frame(language_row)
+        nllb_row.grid(row=4, column=0, columnspan=2, sticky=tk.EW, pady=(4, 0))
+        nllb_row.columnconfigure(0, weight=1)
+        ttk.Label(nllb_row, textvariable=self.nllb_status_var, style="Subtle.TLabel").grid(
+            row=0, column=0, sticky=tk.W
+        )
+        ttk.Button(nllb_row, text="NLLB 모델 준비", command=self.prepare_nllb_model).grid(
+            row=0, column=1, padx=(4, 0)
+        )
+
         ttk.Label(frame, text="번역 저장 이름").grid(row=3, column=0, sticky=tk.W)
         translate_output_row = ttk.Frame(frame)
         translate_output_row.grid(row=4, column=0, columnspan=2, sticky=tk.EW, pady=(4, 8))
@@ -1579,7 +1596,8 @@ class PapaStopApp(tk.Tk):
         progress_row = ttk.Frame(frame)
         progress_row.grid(row=0, column=0, sticky=tk.EW)
         progress_row.columnconfigure(0, weight=1)
-        ttk.Progressbar(progress_row, variable=self.progress_var, maximum=100).grid(row=0, column=0, sticky=tk.EW)
+        self.progress_bar = ttk.Progressbar(progress_row, variable=self.progress_var, maximum=100)
+        self.progress_bar.grid(row=0, column=0, sticky=tk.EW)
         ttk.Button(progress_row, text="작업 중지", command=self.stop_current_work).grid(row=0, column=1, padx=(8, 0))
 
         self.step_tree = ttk.Treeview(frame, columns=("status",), show="tree headings", height=6)
@@ -1791,6 +1809,30 @@ class PapaStopApp(tk.Tk):
             self._emit("status", "대기 중")
             self._emit("model_status", None)
             self._emit("done", f"{model} 모델 다운로드가 끝났습니다.")
+
+        self._run_worker(work)
+
+    def refresh_nllb_status(self) -> None:
+        if nllb_model_is_downloaded():
+            self.nllb_status_var.set("✓ NLLB 모델 준비됨")
+        else:
+            self.nllb_status_var.set("✗ NLLB 모델 없음 — 고품질 번역 전 '준비' 필요")
+
+    def prepare_nllb_model(self) -> None:
+        if nllb_model_is_downloaded():
+            messagebox.showinfo(APP_NAME, "NLLB 모델은 이미 준비되어 있습니다.")
+            return
+
+        def work() -> None:
+            self._emit("status", "NLLB 모델 준비 중")
+            self._emit("busy_bar", True)
+            try:
+                ensure_nllb_model(lambda line: self._emit("log", line))
+            finally:
+                self._emit("busy_bar", False)
+            self._emit("status", "대기 중")
+            self._emit("nllb_status", None)
+            self._emit("done", "NLLB 모델 준비가 끝났습니다.")
 
         self._run_worker(work)
 
@@ -2222,6 +2264,16 @@ class PapaStopApp(tk.Tk):
                 self.subtitle_path_var.set(str(payload))
             elif kind == "model_status":
                 self.refresh_model_status()
+            elif kind == "nllb_status":
+                self.refresh_nllb_status()
+            elif kind == "busy_bar":
+                if payload:
+                    self.progress_bar.configure(mode="indeterminate")
+                    self.progress_bar.start(15)
+                else:
+                    self.progress_bar.stop()
+                    self.progress_bar.configure(mode="determinate")
+                    self.progress_var.set(0)
             elif kind == "busy":
                 self.busy = bool(payload)
             elif kind == "done":
