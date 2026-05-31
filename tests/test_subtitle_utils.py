@@ -8,6 +8,7 @@ from papastop import (
     convert_subtitle_file,
     ensure_subtitle_extension,
     format_timestamp,
+    format_duration_short,
     format_file_size,
     ensure_not_cancelled,
     language_code_from_display,
@@ -108,6 +109,11 @@ class SubtitleUtilityTests(unittest.TestCase):
     def test_format_file_size(self):
         self.assertEqual(format_file_size(500), "500 B")
         self.assertEqual(format_file_size(1536), "1.5 KB")
+
+    def test_format_duration_short(self):
+        self.assertEqual(format_duration_short(5), "5초")
+        self.assertEqual(format_duration_short(65), "1분 5초")
+        self.assertEqual(format_duration_short(3661), "1시간 1분")
 
     def test_media_files_in_folder(self):
         with tempfile.TemporaryDirectory() as temp_dir:

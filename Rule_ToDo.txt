@@ -1,28 +1,40 @@
 ============================================================
-Rule_ToDo.txt — AI 작업 인수인계용 진행 기록 / To-Do
+AI 작업 인수인계용 진행 기록 / To-Do
 ============================================================
 
 이 파일은 사람(황재훈 님)과 AI, 그리고 AI들 사이의 "공용 메모장 + 투두리스트"입니다.
-사전 정보가 전혀 없는 AI라도 이 파일만 읽으면 "지금 무슨 작업을, 왜, 어디까지 했고,
-무엇이 남았으며, 각 단계에서 어느 파일을 어떻게 고치는지"를 파악해 일관되게 이어갈 수 있어야 합니다.
+사전 정보가 전혀 없는 AI라도 이 파일을 읽고 어떤 작업을 이어서 해야 하는지 파악해 일관되게 이어갈 수 있어야 합니다.
+짧고 정확하게 기록한다.
 
 
 ------------------------------------------------------------
 ■ 이 파일의 사용 규칙 (AI는 반드시 지킬 것)
 ------------------------------------------------------------
-1. 작업을 시작하기 전에 이 파일을 먼저 읽는다. (CLAUDE.md, AGENTS.md, Rule_Project_Etc.txt와 함께)
-2. 한 단계를 끝내면 그 항목의 상태를 [완료]로 바꾸고, "무엇을 했는지 + 검증 결과 + 날짜"를 적는다.
-3. 그 다음 [대기] 단계를 [진행]으로 올려 작업한다. [진행] 항목은 항상 하나만 둔다.
-4. 새 할 일이 생기면 항목을 추가하되, "왜 / 어디를(파일·함수) / 어떻게 / 검증 방법"을 미리 적어 둔다.
-5. 파일명·함수명은 정확히 적는다. (줄 번호는 코드가 바뀌면 어긋나므로 함수명 위주로 쓴다.)
-6. 추정이 아니라 확인된 사실을 적는다. 확인 못 한 것은 "미검증"이라고 표시한다.
-7. 상태 표기: [완료] / [진행] / [대기]
+1. 작업을 시작하기 전에 작업 계획, 단계, 내용에 대해 기록한다.
+2. 기록을 할 때 현재상태, 작업 제목, 날짜 및 시각 (YYYY-MM-DD HH:MM:SS), 어디, 무엇/어떻게, 검증을 기록한다. (상태는 대기, 진행, 완료 3가지 중 하나를 사용한다.)
 
-(작업 행동·호칭·배포·보안·터미널 안전 규칙은 CLAUDE.md / AGENTS.md를 우선 적용한다.)
+(예시)
+
+[완료] 2-1. 데이터 폴더 방식 전환  (2026-05-31 14:30:31)
+  어디: papastop.py
+  무엇/어떻게:
+   · APP_CACHE_DIR 폴더명을 ".papastop_cache" → ".papastop_data" 로 변경.
+   · prepare_cuda_library_path(): EXE에서 _MEIPASS 번들 대신 외부 APP_CACHE_DIR/"nvidia"에서 CUDA를 찾도록 변경.
+   · nllb_model_dir(): EXE 번들(_MEIPASS) 분기를 제거하고 항상 외부 폴더(NLLB_MODEL_DIR) 사용.
+   · Whisper는 원래부터 외부 HF 캐시(.papastop_data/huggingface)를 쓰므로 변경 없음.
+   · 개발 폴더 .papastop_cache → .papastop_data 로 이름 변경(데이터 보존).
+  검증: _MEIPASS 잔존 참조 없음 확인. is_frozen_app은 다른 곳에서 계속 사용되어 유지.
+
+3. 순서대로 작업을 진행하며 [대기] 상태의 작업을 [진행]으로 변경한 후 작업 진행한다. (진행은 항상 하나만 둔다.)
+4. [진행] 상태의 작업을 완료한 이후 상태를 [완료]로 변경하며 다음 순서의 [대기] 작업을 [작업] 으로 변경 한 후 이어서 작업 진행한다.
+5. 모든 작업의 상태가 [완료] 로 변경되면 '작업 진행 계획'에 있는 내용 전체를 루트 폴더의 'Rule_Todo_Done.txt 파일로 이동시킨다.
+6. '작업 진행 계획'은 다음 질문에 대한 작업을 위하여 깨끗이 비워둔다.
+6. 파일명·함수명은 정확히 적는다. (줄 번호는 코드가 바뀌면 어긋나므로 함수명 위주로 쓴다.)
+7. 추정이 아니라 확인된 사실을 적는다. 확인 못 한 것은 "미검증"이라고 표시한다.
 
 
 ------------------------------------------------------------
-■ 0. 프로젝트 한 줄 요약
+■ 프로젝트 한 줄 요약
 ------------------------------------------------------------
 PapaStop: 영상·음성을 자막(SRT)으로 만들고 번역하는 Windows 데스크톱 앱.
  - 단일 파일 papastop.py (tkinter GUI)
@@ -33,121 +45,5 @@ PapaStop: 영상·음성을 자막(SRT)으로 만들고 번역하는 Windows 데
 
 
 ------------------------------------------------------------
-■ 1. 현재 작업 주제: "단일 EXE 포터블 배포" + 관련 버그 수정
+■ 작업 진행 계획
 ------------------------------------------------------------
-[왜 시작했나]
- 황재훈 님 요구: 배포를 'EXE 파일 하나'로 하고 싶다. 단 성능·관리·업그레이드도 좋아야 한다.
- 검토 결론: 순수 onefile(전체 4GB를 매 실행마다 임시폴더에 압축 해제 → 시작이 매우 느림)은 부적합.
- → 채택한 방식: "단일 EXE(코드만) + 그 옆에 비압축 .papastop_data 폴더(모델·CUDA)".
-   · 무거운 데이터(번역 모델 1.3GB + CUDA 1.9GB + Whisper 모델)는 압축하지 않음 → 시작이 빠름.
-   · EXE와 .papastop_data 폴더를 같은 위치(또는 USB)에 함께 두면 설치 없이 포터블 실행.
-   · 모델만 교체하거나 EXE만 교체하는 업그레이드가 가능.
-
-[배포물 구조 (목표 = 현재 달성 상태)]
- dist\PapaStop.exe        ← 약 315MB. 코드 + 파이썬 라이브러리만.
- dist\.papastop_data\     ← 약 9.1GB. 비압축 동봉(포터블).
-   ├ nvidia\              ← CUDA 라이브러리 (cublas/cudnn/cuda_runtime/cuda_nvrtc, 각 하위 bin)
-   ├ nllb-200-distilled-1.3B-ct2\   ← 번역 모델
-   └ huggingface\hub\     ← Whisper 모델들 (현재 tiny/large-v3/distil-large-v3/large-v3-turbo 4개)
-
-[핵심 동작 원리 (다음 AI가 알아야 할 것)]
- · is_frozen_app()이 참(EXE)일 때 APP_DIR = EXE가 놓인 폴더. 그 옆 .papastop_data를 데이터 루트로 본다.
- · APP_CACHE_DIR = APP_DIR/".papastop_data" (변수명은 CACHE지만 실제 폴더는 .papastop_data).
- · 개발 환경과 EXE 배포가 동일한 .papastop_data 구조를 공유한다.
-
-
-------------------------------------------------------------
-■ 2. 작업 단계별 진행 기록
-------------------------------------------------------------
-
-[완료] 2-1. 데이터 폴더 방식 전환  (2026-05-31)
-  어디: papastop.py
-  무엇/어떻게:
-   · APP_CACHE_DIR 폴더명을 ".papastop_cache" → ".papastop_data" 로 변경.
-   · prepare_cuda_library_path(): EXE에서 _MEIPASS 번들 대신 외부 APP_CACHE_DIR/"nvidia"에서 CUDA를 찾도록 변경.
-   · nllb_model_dir(): EXE 번들(_MEIPASS) 분기를 제거하고 항상 외부 폴더(NLLB_MODEL_DIR) 사용.
-   · Whisper는 원래부터 외부 HF 캐시(.papastop_data/huggingface)를 쓰므로 변경 없음.
-   · 개발 폴더 .papastop_cache → .papastop_data 로 이름 변경(데이터 보존).
-  검증: _MEIPASS 잔존 참조 없음 확인. is_frozen_app은 다른 곳에서 계속 사용되어 유지.
-
-[완료] 2-2. 빌드 스크립트 onefile 전환  (2026-05-31)
-  어디: build_package.ps1
-  무엇/어떻게:
-   · PyInstaller 옵션 --onedir → --onefile.
-   · nvidia/NLLB를 EXE에 넣던 옵션 제거 (--collect-all nvidia.* 4줄, NLLB --add-data 1줄).
-   · 빌드 후 dist\.papastop_data\ 구성: .venv의 nvidia, 개발 .papastop_data의 NLLB·huggingface를 비압축 복사.
-
-[완료] 2-3. 1차 빌드 및 검증  (2026-05-31)
-  결과: PapaStop.exe 315MB + .papastop_data 생성.
-  self-test 통과: frozen=true, app_dir=dist, 엔진 import 모두 ok, GPU(RTX 5070 Ti) 감지.
-  정리: dist\PapaStop\ (이전 onedir 빌드 잔재 4.1GB) 삭제. Whisper 모델 4개는 유지(황재훈 님 요청).
-
-[완료] 2-4. Whisper "모델이 있는데 재다운로드" 버그 수정  (2026-05-31)
-  증상: UI에 "✓ 모델 받음"인데 자막 제작 시 다시 다운로드(이더넷 수신 급증, 모델 준비에서 멈춤).
-  원인: HuggingFace 캐시의 blobs(파일 색인) 폴더가 비어 있음(원본 개발 폴더·EXE 둘 다).
-        faster-whisper(huggingface_hub)는 인터넷 연결 시 blobs 기준으로 캐시 무결성을 검사하는데
-        비어 있어 "불완전"으로 판단 → 재다운로드. 반면 whisper_model_is_downloaded()는 model.bin만
-        확인해 "있음"으로 표시 → 둘이 어긋났음.
-  어디: papastop.py
-  어떻게:
-   · local_whisper_model_path(model_size) 추가 — 받아둔 snapshots/<버전> 폴더 경로를 반환(없으면 None).
-   · whisper_model_is_downloaded() 를 위 함수 기반으로 단순화.
-   · load_whisper_model(): 로컬 폴더가 있으면 모델 '이름' 대신 '폴더 경로'를 WhisperModel()에 전달.
-     → faster-whisper가 os.path.isdir 분기(transcribe.py)로 폴더를 직접 로드하여 인터넷 검증·재다운로드를
-       건너뜀(오프라인에서도 동작). 근거: faster_whisper/transcribe.py 의 model_size_or_path 처리.
-  검증: 개발 환경에서 폴더 경로 로드 = 4.5초, 다운로드 0 확인. EXE 재빌드 후 self-test 재통과.
-  참고: 이번엔 코드만 바뀌어 데이터 재복사 없이 PyInstaller만 직접 실행해 EXE만 갱신함.
-
-[완료] 2-5. 최종 GUI 검증 (2026-05-31)
-  무엇/어떻게: 황재훈 님이 dist\PapaStop.exe 실행 후 자막 제작 테스트 완료.
-  검증: GitHub 푸시 요청에 따라, 재다운로드 버그 수정 및 GPU 정상 동작 확인된 것으로 간주.
-
-
-------------------------------------------------------------
-■ 3. 남은 작업 / 다음 단계 후보
-------------------------------------------------------------
-[완료] 3-1. 변경사항 git 반영 (2026-05-31)
-  무엇/어떻게: UI/UX 개편, 첫 실행 경험 자동화, 버그 수정 등 모든 변경사항을 커밋하고 dev/main 브랜치에 푸시.
-  검증: GitHub 저장소 확인.
-
-[진행] 3-2. build_package.ps1 개선 검토: 코드만 바뀐 재빌드에서 데이터 재복사를 생략하는 옵션(예: -SkipData).
-        (지금은 데이터가 이미 dist에 있으면 PyInstaller만 직접 돌려 EXE만 갱신하는 방식으로 대응 중)
-[대기] 3-3. (선택) .papastop_data 용량 축소: Whisper 모델 4개 중 배포용만 남기기.
-        현재는 황재훈 님이 테스트·다른 용도로 4개 모두 유지를 원함.
-[참고] NLLB 모델도 동일한 "blobs 빈 캐시" 영향이 있는지 미검증.
-        현재 NLLB는 ct2 변환본 폴더를 직접 로드(nllb_model_dir)하므로 영향이 적을 것으로 보이나 확인 필요.
-
-[완료] 3-4. UI/UX 긴급 개선 및 실행 불가 상태 복구 (2026-05-31)
-  어디: papastop.py
-  무엇/어떻게:
-   · 자막 만들기 설정 패널의 중복 grid/괄호 오류를 정리해 앱이 다시 실행되도록 수정.
-   · 파일 목록 Treeview에 실제 status 열을 추가해 "상태" 표시가 깨지지 않도록 수정.
-   · 파일 선택 영역을 "파일 1개 찾기 / 폴더 전체 찾기" 버튼 중심으로 단순화.
-   · 작업 선택을 3열 배치로 줄여 기본 창 높이를 낮춤.
-   · 작업 종류에 맞춰 진행 단계 목록이 바뀌도록 _progress_steps_for_task(), _set_progress_steps() 추가.
-   · 번역 덮어쓰기 사용 시 확인창을 추가하고, 자막 제작 후 자동 번역은 생성 원본 SRT를 덮어쓰지 않도록 수정.
-  검증:
-   · python -m py_compile papastop.py 통과.
-   · python -m unittest discover -s tests -v: 14개 테스트 통과.
-   · python papastop.py --self-test logs\uiux-dev-self-test.json 통과, window_size 1277x811 확인.
-
-
-------------------------------------------------------------
-■ 4. 이번 작업에서 변경된 파일 요약
-------------------------------------------------------------
- - papastop.py        : 데이터 폴더명(.papastop_data), CUDA/NLLB 외부 경로, Whisper 폴더 직접 로드.
- - build_package.ps1  : onefile 전환 + .papastop_data 분리 빌드.
- - (폴더) .papastop_cache → .papastop_data 이름 변경(데이터 보존).
- - Rule_ToDo.txt      : (신규) 이 인수인계 파일.
-
-
-------------------------------------------------------------
-■ 5. 막혔을 때 참고 (다음 AI를 위한 힌트)
-------------------------------------------------------------
- - GPU(cublas) 미동작 시: prepare_cuda_library_path()가 .papastop_data\nvidia\<구성>\bin 을 PATH에
-   등록해야 함. Windows는 os.add_dll_directory()만으로 부족하고 PATH 등록이 필수.
- - 모델 경로 문제 시: prepare_model_cache_environment()가 HF_HUB_CACHE를 APP_CACHE_DIR/huggingface/hub 로
-   setdefault 설정. 시스템 환경변수에 HF_HOME/HF_HUB_CACHE가 이미 있으면 이를 덮을 수 있으니 주의.
- - self-test 실행: PapaStop.exe --self-test <출력경로.json>  (windowed라 콘솔 대신 파일로 출력).
-   단 self-test는 transcribe를 하지 않으므로 실제 GPU 추론(cublas 로딩)은 GUI 실사용으로 확인해야 함.
- - 빌드: build_package.ps1 (엔진 이미 설치 시 -SkipInstall). EXE만 갱신하려면 PyInstaller를 직접 실행.

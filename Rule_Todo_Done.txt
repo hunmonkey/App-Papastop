@@ -1,0 +1,113 @@
+============================================================
+AI 작업 인수인계용 진행 기록 / To-Do Done
+============================================================
+
+이 파일은 AI가 작성한 Rule_ToDo.txt 파일에서 완료된 작업을 아카이빙 하는 파일입니다.
+기존의 내용은 지우지 말고 최하단에 '------------------------------------------------------------' 문구를 삽입한 이후 이 아래줄에 이어서 기록합니다.
+
+
+------------------------------------------------------------
+■ 완료 사항
+------------------------------------------------------------
+
+[완료] 2-1. 데이터 폴더 방식 전환  (2026-05-31)
+  어디: papastop.py
+  무엇/어떻게:
+   · APP_CACHE_DIR 폴더명을 ".papastop_cache" → ".papastop_data" 로 변경.
+   · prepare_cuda_library_path(): EXE에서 _MEIPASS 번들 대신 외부 APP_CACHE_DIR/"nvidia"에서 CUDA를 찾도록 변경.
+   · nllb_model_dir(): EXE 번들(_MEIPASS) 분기를 제거하고 항상 외부 폴더(NLLB_MODEL_DIR) 사용.
+   · Whisper는 원래부터 외부 HF 캐시(.papastop_data/huggingface)를 쓰므로 변경 없음.
+   · 개발 폴더 .papastop_cache → .papastop_data 로 이름 변경(데이터 보존).
+  검증: _MEIPASS 잔존 참조 없음 확인. is_frozen_app은 다른 곳에서 계속 사용되어 유지.
+
+[완료] 2-2. 빌드 스크립트 onefile 전환  (2026-05-31)
+  어디: build_package.ps1
+  무엇/어떻게:
+   · PyInstaller 옵션 --onedir → --onefile.
+   · nvidia/NLLB를 EXE에 넣던 옵션 제거 (--collect-all nvidia.* 4줄, NLLB --add-data 1줄).
+   · 빌드 후 dist\.papastop_data\ 구성: .venv의 nvidia, 개발 .papastop_data의 NLLB·huggingface를 비압축 복사.
+
+[완료] 2-3. 1차 빌드 및 검증  (2026-05-31)
+  결과: PapaStop.exe 315MB + .papastop_data 생성.
+  self-test 통과: frozen=true, app_dir=dist, 엔진 import 모두 ok, GPU(RTX 5070 Ti) 감지.
+  정리: dist\PapaStop\ (이전 onedir 빌드 잔재 4.1GB) 삭제. Whisper 모델 4개는 유지(황재훈 님 요청).
+
+[완료] 2-4. Whisper "모델이 있는데 재다운로드" 버그 수정  (2026-05-31)
+  증상: UI에 "✓ 모델 받음"인데 자막 제작 시 다시 다운로드(이더넷 수신 급증, 모델 준비에서 멈춤).
+  원인: HuggingFace 캐시의 blobs(파일 색인) 폴더가 비어 있음(원본 개발 폴더·EXE 둘 다).
+        faster-whisper(huggingface_hub)는 인터넷 연결 시 blobs 기준으로 캐시 무결성을 검사하는데
+        비어 있어 "불완전"으로 판단 → 재다운로드. 반면 whisper_model_is_downloaded()는 model.bin만
+        확인해 "있음"으로 표시 → 둘이 어긋났음.
+  어디: papastop.py
+  어떻게:
+   · local_whisper_model_path(model_size) 추가 — 받아둔 snapshots/<버전> 폴더 경로를 반환(없으면 None).
+   · whisper_model_is_downloaded() 를 위 함수 기반으로 단순화.
+   · load_whisper_model(): 로컬 폴더가 있으면 모델 '이름' 대신 '폴더 경로'를 WhisperModel()에 전달.
+     → faster-whisper가 os.path.isdir 분기(transcribe.py)로 폴더를 직접 로드하여 인터넷 검증·재다운로드를
+       건너뜀(오프라인에서도 동작). 근거: faster_whisper/transcribe.py 의 model_size_or_path 처리.
+  검증: 개발 환경에서 폴더 경로 로드 = 4.5초, 다운로드 0 확인. EXE 재빌드 후 self-test 재통과.
+  참고: 이번엔 코드만 바뀌어 데이터 재복사 없이 PyInstaller만 직접 실행해 EXE만 갱신함.
+
+[완료] 2-5. 최종 GUI 검증 (2026-05-31)
+  무엇/어떻게: 황재훈 님이 dist\PapaStop.exe 실행 후 자막 제작 테스트 완료.
+  검증: GitHub 푸시 요청에 따라, 재다운로드 버그 수정 및 GPU 정상 동작 확인된 것으로 간주.
+
+------------------------------------------------------------
+[완료] 1-1. PapaStop 중복 실행 방지 추가 (2026-05-31 14:40:09)
+  어디: papastop.py
+  무엇/어떻게:
+   · acquire_single_instance_lock() 추가: Windows mutex로 PapaStop 실행 잠금을 잡음.
+   · release_single_instance_lock() 추가: 앱 종료 시 잠금 핸들을 정리함.
+   · show_already_running_message() 추가: 이미 실행 중이면 새 창 대신 안내 메시지를 표시함.
+   · main()에서 self-test는 기존처럼 먼저 처리하고, 일반 실행에만 단일 실행 잠금을 적용함.
+  검증:
+   · python -m py_compile papastop.py 통과.
+   · python -m unittest discover -s tests -v: 14개 테스트 통과.
+   · 같은 프로세스에서 acquire_single_instance_lock()을 두 번 호출해 first=True, second=False 확인.
+   · python papastop.py --self-test logs\single-instance-self-test.json 통과.
+
+------------------------------------------------------------
+[완료] 1-1. 자막 생성 실시간 미리보기 탭 추가 (2026-05-31 14:48:57)
+  어디: papastop.py
+  무엇/어떻게:
+   · 오른쪽 탭 영역에 "자막 생성" 탭을 추가함.
+   · transcribe_media()에 on_subtitle_preview 콜백을 추가해 자막 조각이 생길 때마다 현재까지의 SRT 텍스트를 UI로 보냄.
+   · make_subtitle()에서 파일별 자막 생성 시작 시 미리보기 내용을 비우고, 생성 중인 SRT 텍스트를 실시간 갱신함.
+   · _set_subtitle_preview()를 추가해 읽기 전용 텍스트 영역에 SRT 내용을 표시함.
+  검증:
+   · python -m py_compile papastop.py 통과.
+   · python -m unittest discover -s tests -v: 14개 테스트 통과.
+   · python papastop.py --self-test logs\subtitle-preview-self-test.json 통과.
+   · _set_subtitle_preview()에 SRT 예시 문자열을 넣어 preview_ok=True 확인.
+
+------------------------------------------------------------
+[완료] 1-1. PapaStop 현대적 카드형 UI 재정리 (2026-05-31 14:58:28)
+  어디: papastop.py
+  무엇/어떻게:
+   · 오래된 LabelFrame 박스 구조를 제거하고 흰색 카드형 패널(_build_card)로 교체함.
+   · 앱 배경, 카드 배경, 얇은 경계선, 버튼, 표, 탭, 진행바 색상을 통일된 밝은 톤으로 정리함.
+   · 작업 선택 라디오 버튼을 버튼형 선택지로 바꿔 낡은 기본 라디오 느낌을 줄임.
+   · 실행 버튼은 카드 밖의 넓은 주요 버튼으로 배치해 시선이 바로 가도록 조정함.
+   · 진행 상황/자막 생성/PC 장치/작업 기록 탭 내부의 중복 카드 제목을 제거해 화면 높이를 줄임.
+  검증:
+   · python -m py_compile papastop.py 통과.
+   · python -m unittest discover -s tests -v: 14개 테스트 통과.
+   · python papastop.py --self-test logs\modern-card-ui-self-test.json 통과, window_size 1210x855 확인.
+
+------------------------------------------------------------
+[완료] 1-1. 예상 완료 시간 표시 추가 (2026-05-31 15:04:00)
+  어디: papastop.py, tests/test_subtitle_utils.py
+  무엇/어떻게:
+   · format_duration_short() 추가: 남은 시간을 "초/분 초/시간 분" 형태로 짧게 표시함.
+   · eta_var와 work_started_at 추가: 작업 시작 시각과 예상 완료 안내 문구를 관리함.
+   · 진행 상황 탭의 진행바 아래에 "예상 완료" 라벨을 추가함.
+   · progress 이벤트가 들어올 때 현재 진행률과 경과 시간으로 남은 시간과 완료 예상 시각을 계산함.
+   · 진행률이 낮거나 진행률 없는 짧은 확인 작업은 "계산 중/대기 중"으로 자연스럽게 표시되도록 처리함.
+   · format_duration_short() 단위 테스트를 추가함.
+  검증:
+   · python -m py_compile papastop.py 통과.
+   · python -m unittest discover -s tests -v: 15개 테스트 통과.
+   · python papastop.py --self-test logs\eta-self-test.json 통과.
+   · _update_eta() 직접 호출로 남은 시간/완료 상태 표시 확인.
+
+
