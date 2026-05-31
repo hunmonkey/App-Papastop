@@ -55,7 +55,7 @@ Write-Host "Building PapaStop package (single EXE)..."
 # 설치 없이 포터블로 실행됩니다. 모델만 교체하거나 EXE만 교체하는 업그레이드가 가능합니다.
 $DataDir = Join-Path $AppDir "dist\.papastop_data"
 $NvidiaSrc = Join-Path $AppDir ".venv\Lib\site-packages\nvidia"
-$NllbSrc = Join-Path $AppDir ".papastop_data\nllb-200-distilled-1.3B-ct2"
+$NllbSrc = Join-Path $AppDir ".papastop_data\nllb-200-3.3B-ct2"
 $WhisperSrc = Join-Path $AppDir ".papastop_data\huggingface"
 
 Write-Host "Assembling external data folder (.papastop_data)..."
@@ -64,8 +64,12 @@ New-Item -ItemType Directory -Force $DataDir | Out-Null
 Write-Host "  - Copying CUDA libraries (nvidia)..."
 Copy-Item $NvidiaSrc (Join-Path $DataDir "nvidia") -Recurse -Force
 
-Write-Host "  - Copying NLLB translation model..."
-Copy-Item $NllbSrc (Join-Path $DataDir "nllb-200-distilled-1.3B-ct2") -Recurse -Force
+if (Test-Path $NllbSrc) {
+    Write-Host "  - Copying NLLB translation model (3.3B)..."
+    Copy-Item $NllbSrc (Join-Path $DataDir "nllb-200-3.3B-ct2") -Recurse -Force
+} else {
+    Write-Host "  - [skip] NLLB 3.3B model not prepared yet (run the app's 'NLLB 모델 준비' first to bundle it)."
+}
 
 if (Test-Path $WhisperSrc) {
     Write-Host "  - Copying downloaded Whisper models..."
