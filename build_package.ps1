@@ -25,12 +25,12 @@ if (-not $SkipInstall) {
     & $VenvPython -m pip install --upgrade pyinstaller
 }
 
-Write-Host "Building PapaStop package..."
+Write-Host "Building PapaStop package (single EXE)..."
 & $VenvPython -m PyInstaller `
     --noconfirm `
     --clean `
     --windowed `
-    --onedir `
+    --onefile `
     --name PapaStop `
     --collect-all faster_whisper `
     --collect-all argostranslate `
@@ -41,17 +41,38 @@ Write-Host "Building PapaStop package..."
     --collect-all huggingface_hub `
     --collect-all av `
     --collect-all sentencepiece `
-    --collect-all nvidia.cublas `
-    --collect-all nvidia.cudnn `
-    --collect-all nvidia.cuda_runtime `
-    --collect-all nvidia.cuda_nvrtc `
     --collect-all transformers `
     --exclude-module tests `
     --exclude-module stanza.tests `
     --exclude-module torch.utils.tensorboard `
     --exclude-module numpy.f2py.tests `
     --add-data "README.md;." `
-    --add-data ".papastop_cache/nllb-200-distilled-1.3B-ct2;nllb-200-distilled-1.3B-ct2" `
     .\papastop.py
 
-Write-Host "Package created: dist\PapaStop\PapaStop.exe"
+# === EXE 옆 비압축 데이터 폴더(.papastop_data) 구성 ===
+# 무겁고 자주 바뀌는 CUDA 라이브러리와 번역 모델은 EXE에 넣지 않고 옆 폴더에 둡니다.
+# 배포할 때 dist\PapaStop.exe 와 dist\.papastop_data 를 같은 위치(또는 USB)에 함께 두면
+# 설치 없이 포터블로 실행됩니다. 모델만 교체하거나 EXE만 교체하는 업그레이드가 가능합니다.
+$DataDir = Join-Path $AppDir "dist\.papastop_data"
+$NvidiaSrc = Join-Path $AppDir ".venv\Lib\site-packages\nvidia"
+$NllbSrc = Join-Path $AppDir ".papastop_data\nllb-200-distilled-1.3B-ct2"
+$WhisperSrc = Join-Path $AppDir ".papastop_data\huggingface"
+
+Write-Host "Assembling external data folder (.papastop_data)..."
+New-Item -ItemType Directory -Force $DataDir | Out-Null
+
+Write-Host "  - Copying CUDA libraries (nvidia)..."
+Copy-Item $NvidiaSrc (Join-Path $DataDir "nvidia") -Recurse -Force
+
+Write-Host "  - Copying NLLB translation model..."
+Copy-Item $NllbSrc (Join-Path $DataDir "nllb-200-distilled-1.3B-ct2") -Recurse -Force
+
+if (Test-Path $WhisperSrc) {
+    Write-Host "  - Copying downloaded Whisper models..."
+    Copy-Item $WhisperSrc (Join-Path $DataDir "huggingface") -Recurse -Force
+}
+
+Write-Host ""
+Write-Host "Package created:"
+Write-Host "  EXE   : dist\PapaStop.exe"
+Write-Host "  Data  : dist\.papastop_data\  (keep this next to the EXE)"

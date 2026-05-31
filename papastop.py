@@ -32,7 +32,9 @@ def app_dir() -> Path:
 
 APP_DIR = app_dir()
 REQUIREMENTS_PATH = APP_DIR / "requirements.txt"
-APP_CACHE_DIR = APP_DIR / ".papastop_cache"
+# 모델·CUDA 라이브러리 등 무거운 데이터를 EXE 옆에 비압축으로 두는 외부 폴더입니다.
+# (EXE는 코드만 담아 가볍게 유지하고, 자주 바뀌는 모델은 이 폴더에서 교체합니다.)
+APP_CACHE_DIR = APP_DIR / ".papastop_data"
 HF_CACHE_DIR = APP_CACHE_DIR / "huggingface"
 
 ENGINE_PACKAGES = {
@@ -181,9 +183,10 @@ def prepare_cuda_library_path() -> None:
     except ImportError:
         pass
 
-    if is_frozen_app():
-        meipass = Path(getattr(sys, "_MEIPASS", APP_DIR))
-        roots.extend([meipass / "nvidia", APP_DIR / "_internal" / "nvidia", APP_DIR / "nvidia"])
+    # EXE 배포에서는 nvidia 라이브러리를 exe 옆 .papastop_data\nvidia 폴더에 비압축으로 둡니다.
+    external_nvidia = APP_CACHE_DIR / "nvidia"
+    if external_nvidia.is_dir():
+        roots.append(external_nvidia)
 
     bin_dirs: list[str] = []
     for root in roots:
@@ -842,11 +845,7 @@ def translate_srt_file(
 
 
 def nllb_model_dir() -> Path:
-    if is_frozen_app():
-        meipass = Path(getattr(sys, "_MEIPASS", APP_DIR))
-        bundled = meipass / NLLB_MODEL_DIR.name
-        if bundled.is_dir():
-            return bundled
+    # 개발 환경과 EXE 배포 모두 exe 옆 .papastop_data 폴더의 모델을 사용합니다.
     return NLLB_MODEL_DIR
 
 
@@ -958,16 +957,26 @@ def whisper_model_repo(model_size: str) -> str | None:
     return _MODELS.get(model_size)
 
 
-def whisper_model_is_downloaded(model_size: str) -> bool:
+def local_whisper_model_path(model_size: str) -> Path | None:
+    """캐시에 받아둔 Whisper 모델 폴더(snapshots/<버전>) 경로를 돌려줍니다(없으면 None).
+    faster-whisper에 모델 이름 대신 이 폴더 경로를 주면 인터넷 검증을 건너뛰고
+    (오프라인에서도) 바로 로드하므로, 이미 받은 모델을 다시 받는 문제를 막습니다."""
     repo = whisper_model_repo(model_size)
     if not repo:
-        return False
+        return None
     prepare_model_cache_environment()
     cache = Path(os.environ.get("HF_HUB_CACHE", str(HF_CACHE_DIR / "hub")))
     snapshots = cache / ("models--" + repo.replace("/", "--")) / "snapshots"
     if not snapshots.is_dir():
-        return False
-    return any(snapshots.glob("*/model.bin"))
+        return None
+    for snapshot in sorted(snapshots.glob("*")):
+        if (snapshot / "model.bin").is_file():
+            return snapshot
+    return None
+
+
+def whisper_model_is_downloaded(model_size: str) -> bool:
+    return local_whisper_model_path(model_size) is not None
 
 
 def download_whisper_model(model_size: str, on_line: Callable[[str], None]) -> None:
@@ -997,6 +1006,15 @@ def load_whisper_model(
     from faster_whisper import WhisperModel
 
     compute_arg = "default" if compute_type == "auto" else compute_type
+
+    local_path = local_whisper_model_path(model_size)
+    if local_path is not None:
+        # 받아둔 모델은 폴더 경로로 직접 로드합니다.
+        # (모델 이름으로 주면 faster-whisper가 인터넷에서 캐시 무결성을 다시 확인하다가
+        #  이미 있는 모델을 또 받을 수 있습니다. 폴더 경로면 그 과정을 건너뜁니다.)
+        on_line(f"준비된 모델을 사용합니다: {model_size}")
+        return WhisperModel(str(local_path), device=device, compute_type=compute_arg)
+
     on_line(f"모델을 준비합니다: {model_size}")
     on_line("처음 쓰는 모델은 자동으로 다운로드됩니다. 영상 파일이 큰 경우 시간이 걸립니다.")
     return WhisperModel(model_size, device=device, compute_type=compute_arg)
@@ -1160,23 +1178,29 @@ class PapaStopApp(tk.Tk):
         self.max_line_chars_var = tk.IntVar(value=42)
         self.auto_translate_var = tk.BooleanVar(value=False)
         self.auto_translate_to_var = tk.StringVar(value=language_display("ko"))
+        self.expert_mode_var = tk.BooleanVar(value=False)
         self.translate_from_var = tk.StringVar(value=language_display("en"))
         self.translate_to_var = tk.StringVar(value=language_display("ko"))
         self.translate_engine_var = tk.StringVar(value=TRANSLATION_ENGINES["argos"])
         self.nllb_status_var = tk.StringVar(value="")
+        self.translate_overwrite_var = tk.BooleanVar(value=False)
         self.translate_output_path_var = tk.StringVar()
         self.convert_format_var = tk.StringVar(value="vtt")
         self.convert_output_path_var = tk.StringVar()
         self.status_var = tk.StringVar(value="대기 중")
         self.progress_var = tk.DoubleVar(value=0)
+        self.task_var = tk.StringVar(value="make")  # 'make', 'extract', 'translate', 'convert', 'engine'
 
         self._configure_style()
         self._build_ui()
         self.after(100, self._process_events)
         self.after(250, self.refresh_hardware)
+        self.after(350, self._check_and_prompt_for_initial_setup)
         self.after(450, self.refresh_engines)
         self.after(650, self.refresh_model_status)
         self.after(750, self.refresh_nllb_status)
+        self.task_var.trace_add("write", self._on_task_changed)
+        self.translate_overwrite_var.trace_add("write", self._on_overwrite_changed)
 
     def _configure_style(self) -> None:
         style = ttk.Style(self)
@@ -1218,25 +1242,24 @@ class PapaStopApp(tk.Tk):
 
         self._build_file_panel(left)
 
-        left_tabs = ttk.Notebook(left)
-        left_tabs.pack(fill=tk.BOTH, expand=True)
+        self._build_task_selection_panel(left)
 
-        engine_tab = ttk.Frame(left_tabs, padding=(0, 8, 0, 0))
-        make_tab = ttk.Frame(left_tabs, padding=(0, 8, 0, 0))
-        translate_tab = ttk.Frame(left_tabs, padding=(0, 8, 0, 0))
-        convert_tab = ttk.Frame(left_tabs, padding=(0, 8, 0, 0))
-        left_tabs.add(engine_tab, text="엔진")
-        left_tabs.add(make_tab, text="자막 제작")
-        left_tabs.add(translate_tab, text="번역 저장")
-        left_tabs.add(convert_tab, text="자막 변환")
+        self.settings_container = ttk.Frame(left)
+        self.settings_container.pack(fill=tk.X, expand=True, pady=(0, 10))
 
-        self._build_engine_panel(engine_tab)
-        self._build_transcribe_panel(make_tab)
-        self._build_translate_panel(translate_tab)
-        self._build_convert_panel(convert_tab)
+        # 각 작업 패널을 만들고 인스턴스 변수에 저장합니다.
+        # 각 _build_*_panel 메서드는 이제 pack()을 호출하지 않고 프레임을 반환합니다.
+        self.transcribe_frame = self._build_transcribe_panel(self.settings_container)
+        self.extract_frame = self._build_extract_panel(self.settings_container)
+        self.translate_frame = self._build_translate_panel(self.settings_container)
+        self.convert_frame = self._build_convert_panel(self.settings_container)
+        self.engine_frame = self._build_engine_panel(self.settings_container)
+
+        self._build_action_panel(left)
 
         self._build_progress_panel(right)
 
+        # 오른쪽 패널 (PC 장치, 작업 기록)은 그대로 유지합니다.
         right_tabs = ttk.Notebook(right)
         right_tabs.pack(fill=tk.BOTH, expand=True)
 
@@ -1248,6 +1271,9 @@ class PapaStopApp(tk.Tk):
         self._build_hardware_panel(hardware_tab)
         self._build_log_panel(log_tab)
 
+        # 앱 시작 시 기본 작업 패널을 보여줍니다.
+        self._on_task_changed()
+
     def _label_with_help(self, parent: ttk.Frame, text: str, help_text: str) -> ttk.Frame:
         frame = ttk.Frame(parent)
         ttk.Label(frame, text=text).pack(side=tk.LEFT)
@@ -1257,42 +1283,42 @@ class PapaStopApp(tk.Tk):
         return frame
 
     def _build_file_panel(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="파일", style="Panel.TLabelframe")
-        frame.pack(fill=tk.X, pady=(0, 10))
+        frame = ttk.LabelFrame(parent, text="1. 파일 선택", style="Panel.TLabelframe")
+        frame.pack(fill=tk.X, pady=(0, 12))
         frame.columnconfigure(0, weight=1)
 
-        ttk.Label(frame, text="영상 또는 음성 파일").grid(row=0, column=0, sticky=tk.W)
-        media_row = ttk.Frame(frame)
-        media_row.grid(row=1, column=0, sticky=tk.EW, pady=(4, 10))
-        media_row.columnconfigure(0, weight=1)
-        ttk.Entry(media_row, textvariable=self.media_path_var).grid(row=0, column=0, sticky=tk.EW)
-        ttk.Button(media_row, text="찾기", command=self.choose_media_file).grid(row=0, column=1, padx=(6, 0))
-
-        ttk.Label(frame, text="동영상 폴더").grid(row=2, column=0, sticky=tk.W)
-        folder_row = ttk.Frame(frame)
-        folder_row.grid(row=3, column=0, sticky=tk.EW, pady=(4, 10))
-        folder_row.columnconfigure(0, weight=1)
-        ttk.Entry(folder_row, textvariable=self.media_folder_var).grid(row=0, column=0, sticky=tk.EW)
-        ttk.Button(folder_row, text="폴더", command=self.choose_media_folder).grid(row=0, column=1, padx=(6, 0))
+        ttk.Label(frame, text="자막을 만들 영상/음성을 선택하세요").grid(row=0, column=0, sticky=tk.W)
+        source_row = ttk.Frame(frame)
+        source_row.grid(row=1, column=0, sticky=tk.EW, pady=(4, 8))
+        source_row.columnconfigure(0, weight=1)
+        source_row.columnconfigure(1, weight=1)
+        ttk.Button(source_row, text="파일 1개 찾기", command=self.choose_media_file).grid(
+            row=0, column=0, sticky=tk.EW, padx=(0, 3)
+        )
+        ttk.Button(source_row, text="폴더 전체 찾기", command=self.choose_media_folder).grid(
+            row=0, column=1, sticky=tk.EW, padx=(3, 0)
+        )
 
         table_frame = ttk.Frame(frame)
-        table_frame.grid(row=4, column=0, sticky=tk.EW, pady=(0, 10))
+        table_frame.grid(row=2, column=0, sticky=tk.EW, pady=(0, 8))
         table_frame.columnconfigure(0, weight=1)
 
         self.media_tree = ttk.Treeview(
             table_frame,
-            columns=("selected", "name", "ext", "size"),
+            columns=("selected", "name", "ext", "size", "status"),
             show="headings",
-            height=3,
+            height=2,
         )
-        self.media_tree.heading("selected", text="체크박스")
+        self.media_tree.heading("selected", text="선택")
         self.media_tree.heading("name", text="파일명")
         self.media_tree.heading("ext", text="확장자")
         self.media_tree.heading("size", text="파일용량")
+        self.media_tree.heading("status", text="상태")
         self.media_tree.column("selected", width=70, stretch=False, anchor=tk.CENTER)
-        self.media_tree.column("name", width=220, stretch=True)
+        self.media_tree.column("name", width=180, stretch=True)
         self.media_tree.column("ext", width=70, stretch=False, anchor=tk.CENTER)
         self.media_tree.column("size", width=90, stretch=False, anchor=tk.E)
+        self.media_tree.column("status", width=80, stretch=False, anchor=tk.CENTER)
         self.media_tree.grid(row=0, column=0, sticky=tk.EW)
         self.media_tree.bind("<Button-1>", self._on_media_tree_click)
 
@@ -1301,54 +1327,99 @@ class PapaStopApp(tk.Tk):
         self.media_tree.configure(yscrollcommand=media_scrollbar.set)
 
         selection_row = ttk.Frame(frame)
-        selection_row.grid(row=5, column=0, sticky=tk.EW, pady=(0, 6))
+        selection_row.grid(row=3, column=0, sticky=tk.EW, pady=(0, 6))
         selection_row.columnconfigure(0, weight=1)
         selection_row.columnconfigure(1, weight=1)
         ttk.Button(selection_row, text="전체 선택", command=self.select_all_media_files).grid(row=0, column=0, sticky=tk.EW, padx=(0, 3))
         ttk.Button(selection_row, text="전체 해제", command=self.clear_media_file_selection).grid(row=0, column=1, sticky=tk.EW, padx=(3, 0))
 
-        ttk.Label(frame, text="저장 폴더").grid(row=6, column=0, sticky=tk.W)
+        ttk.Label(frame, text="저장 폴더").grid(row=4, column=0, sticky=tk.W)
         output_row = ttk.Frame(frame)
-        output_row.grid(row=7, column=0, sticky=tk.EW, pady=(4, 0))
+        output_row.grid(row=5, column=0, sticky=tk.EW, pady=(4, 0))
         output_row.columnconfigure(0, weight=1)
         ttk.Entry(output_row, textvariable=self.output_dir_var).grid(row=0, column=0, sticky=tk.EW)
         ttk.Button(output_row, text="폴더", command=self.choose_output_dir).grid(row=0, column=1, padx=(6, 0))
 
-    def _build_engine_panel(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="엔진", style="Panel.TLabelframe")
+    def _build_task_selection_panel(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="2. 작업 선택", style="Panel.TLabelframe")
         frame.pack(fill=tk.X, pady=(0, 10))
         frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(2, weight=1)
+
+        tasks = {
+            "자막 만들기": "make",
+            "영상 속 자막 추출": "extract",
+            "기존 자막 번역": "translate",
+            "자막 형식 변환": "convert",
+            "엔진 관리": "engine",
+        }
+
+        for index, (text, value) in enumerate(tasks.items()):
+            ttk.Radiobutton(
+                frame,
+                text=text,
+                variable=self.task_var,
+                value=value
+            ).grid(row=index // 3, column=index % 3, sticky=tk.W, padx=10, pady=2)
+
+    def _build_engine_panel(self, parent: ttk.Frame) -> ttk.Frame:
+        frame = ttk.LabelFrame(parent, text="3. 세부 설정 (엔진 관리)", style="Panel.TLabelframe")
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
 
         self.engine_tree = ttk.Treeview(frame, columns=("value",), show="tree headings", height=6)
         self.engine_tree.heading("#0", text="항목")
         self.engine_tree.heading("value", text="상태")
         self.engine_tree.column("#0", width=150, stretch=False)
-        self.engine_tree.column("value", width=220, stretch=True)
+        self.engine_tree.column("value", width=240, stretch=True)
         self.engine_tree.grid(row=0, column=0, columnspan=2, sticky=tk.EW)
 
-        ttk.Button(frame, text="엔진 확인", command=self.refresh_engines).grid(row=1, column=0, sticky=tk.EW, pady=(8, 0))
+        ttk.Button(frame, text="엔진 확인", command=self.refresh_engines).grid(
+            row=1, column=0, sticky=tk.EW, pady=(8, 0), padx=(0, 3)
+        )
         ttk.Button(
             frame,
             text="엔진 설치",
             command=self.install_engines,
             style="Accent.TButton",
-        ).grid(row=1, column=1, sticky=tk.EW, padx=(6, 0), pady=(8, 0))
+        ).grid(row=1, column=1, sticky=tk.EW, padx=(3, 0), pady=(8, 0))
+        return frame
 
-    def _build_transcribe_panel(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="자막 만들기", style="Panel.TLabelframe")
-        frame.pack(fill=tk.X, pady=(0, 10))
+    def _build_extract_panel(self, parent: ttk.Frame) -> ttk.Frame:
+        frame = ttk.LabelFrame(parent, text="3. 세부 설정 (자막 추출)", style="Panel.TLabelframe")
+        # 이 작업은 별도 설정이 필요 없습니다.
+        # '파일' 패널에서 선택한 영상/폴더에 대해 작업이 실행됩니다.
+        ttk.Label(
+            frame,
+            text="선택한 영상 파일에 내장된 SRT 형식 자막을 추출합니다.\n"
+                 "별도 설정 없이 아래 '작업 시작' 버튼을 누르세요.",
+            wraplength=380,
+            justify=tk.LEFT,
+        ).pack(pady=20, padx=10)
+        return frame
+
+    def _build_transcribe_panel(self, parent: ttk.Frame) -> ttk.Frame:
+        frame = ttk.LabelFrame(parent, text="3. 세부 설정 (자막 만들기)", style="Panel.TLabelframe")
 
         for column in range(2):
             frame.columnconfigure(column, weight=1)
 
+        mode_switch = ttk.Checkbutton(
+            frame,
+            text="전문가 모드 (고급 설정 표시)",
+            variable=self.expert_mode_var,
+            command=self._on_mode_changed,
+        )
+        mode_switch.grid(row=0, column=0, columnspan=2, sticky=tk.E, pady=(0, 10))
+
         self._label_with_help(
             frame,
-            "Whisper 모델",
-            "소리를 글자로 바꾸는 인공지능 모델입니다. tiny/base는 빠르고, small 이상은 더 정확합니다. "
-            "large-v3-turbo는 large급 정확도에 더 빠르고, distil-large-v3는 영어에 특화된 고속 모델입니다.",
-        ).grid(row=0, column=0, sticky=tk.W)
+            "자막 품질",
+            "소리를 글자로 바꾸는 모델입니다. base는 첫 테스트에 좋고, large 계열은 더 정확하지만 시간이 더 걸립니다.",
+        ).grid(row=1, column=0, sticky=tk.W)
         model_frame = ttk.Frame(frame)
-        model_frame.grid(row=1, column=0, sticky=tk.EW, pady=(4, 8), padx=(0, 6))
+        model_frame.grid(row=2, column=0, sticky=tk.EW, pady=(4, 8), padx=(0, 6))
         model_frame.columnconfigure(0, weight=1)
         model_combo = ttk.Combobox(
             model_frame,
@@ -1365,68 +1436,75 @@ class PapaStopApp(tk.Tk):
             row=1, column=0, columnspan=2, sticky=tk.W, pady=(2, 0)
         )
 
-        ttk.Label(frame, text="원본 언어").grid(row=0, column=1, sticky=tk.W)
+        ttk.Label(frame, text="원본 언어").grid(row=1, column=1, sticky=tk.W)
         ttk.Combobox(
             frame,
             textvariable=self.source_lang_var,
             values=language_values(allow_auto=True),
             state="readonly",
-        ).grid(row=1, column=1, sticky=tk.EW, pady=(4, 8))
+        ).grid(row=2, column=1, sticky=tk.EW, pady=(4, 8))
 
-        self._label_with_help(
+        self.device_label = self._label_with_help(
             frame,
             "사용 장치",
             "자막을 만들 때 CPU 또는 그래픽카드 GPU 중 무엇을 쓸지 정합니다. NVIDIA 그래픽카드가 있으면 cuda가 빠를 수 있습니다.",
-        ).grid(row=2, column=0, sticky=tk.W)
-        ttk.Combobox(
+        )
+        self.device_label.grid(row=3, column=0, sticky=tk.W)
+        self.device_combo = ttk.Combobox(
             frame,
             textvariable=self.device_var,
             values=device_values(),
             state="readonly",
-        ).grid(row=3, column=0, sticky=tk.EW, pady=(4, 8), padx=(0, 6))
+        )
+        self.device_combo.grid(row=4, column=0, sticky=tk.EW, pady=(4, 8), padx=(0, 6))
 
-        self._label_with_help(
+        self.compute_label = self._label_with_help(
             frame,
             "계산 방식",
             "계산을 얼마나 가볍게 할지 정합니다. int8은 가볍고 CPU에 유리하며, float16은 GPU에서 빠른 편입니다.",
-        ).grid(row=2, column=1, sticky=tk.W)
-        ttk.Combobox(
+        )
+        self.compute_label.grid(row=3, column=1, sticky=tk.W)
+        self.compute_combo = ttk.Combobox(
             frame,
             textvariable=self.compute_var,
             values=("auto", "int8", "float16", "float32"),
             state="readonly",
-        ).grid(row=3, column=1, sticky=tk.EW, pady=(4, 8))
+        )
+        self.compute_combo.grid(row=4, column=1, sticky=tk.EW, pady=(4, 8))
 
-        self._label_with_help(
+        self.beam_label = self._label_with_help(
             frame,
             "정확도 단계",
             "문장을 고를 때 몇 가지 후보를 비교할지 정합니다. 숫자가 높으면 더 꼼꼼하지만 느려질 수 있습니다.",
-        ).grid(row=4, column=0, sticky=tk.W)
-        ttk.Spinbox(frame, from_=1, to=10, textvariable=self.beam_var).grid(
-            row=5,
+        )
+        self.beam_label.grid(row=5, column=0, sticky=tk.W)
+        self.beam_spinbox = ttk.Spinbox(frame, from_=1, to=10, textvariable=self.beam_var)
+        self.beam_spinbox.grid(
+            row=6,
             column=0,
             sticky=tk.EW,
             pady=(4, 10),
             padx=(0, 6),
         )
 
-        self._label_with_help(
+        self.max_line_chars_label = self._label_with_help(
             frame,
             "한 줄 최대 글자",
             "자막 한 줄이 이 글자 수를 넘으면 자동으로 줄을 나눕니다. 0이면 줄바꿈하지 않습니다.",
-        ).grid(row=4, column=1, sticky=tk.W)
-        ttk.Spinbox(frame, from_=0, to=100, textvariable=self.max_line_chars_var).grid(
-            row=5, column=1, sticky=tk.EW, pady=(4, 10)
         )
+        self.max_line_chars_label.grid(row=5, column=1, sticky=tk.W)
+        self.max_line_chars_spinbox = ttk.Spinbox(frame, from_=0, to=100, textvariable=self.max_line_chars_var)
+        self.max_line_chars_spinbox.grid(row=6, column=1, sticky=tk.EW, pady=(4, 10))
 
-        ttk.Button(
+        self.recommend_button = ttk.Button(
             frame,
             text="권장 설정 적용",
             command=self.apply_recommended_settings,
-        ).grid(row=6, column=0, columnspan=2, sticky=tk.EW)
+        )
+        self.recommend_button.grid(row=7, column=0, columnspan=2, sticky=tk.EW)
 
         translate_row = ttk.Frame(frame)
-        translate_row.grid(row=7, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
+        translate_row.grid(row=8, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
         translate_row.columnconfigure(1, weight=1)
         auto_translate_check = ttk.Checkbutton(
             translate_row,
@@ -1447,28 +1525,12 @@ class PapaStopApp(tk.Tk):
             width=12,
         ).grid(row=0, column=1, sticky=tk.E, padx=(8, 0))
 
-        ttk.Button(
-            frame,
-            text="자막 만들기",
-            command=self.make_subtitle,
-            style="Accent.TButton",
-        ).grid(row=8, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
+        self._on_mode_changed()
 
-        ttk.Button(
-            frame,
-            text="영상 속 기존 자막 추출",
-            command=self.extract_embedded_subtitle,
-        ).grid(row=9, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
+        return frame
 
-        ttk.Button(
-            frame,
-            text="작업 중지",
-            command=self.stop_current_work,
-        ).grid(row=10, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
-
-    def _build_translate_panel(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="번역 저장", style="Panel.TLabelframe")
-        frame.pack(fill=tk.X)
+    def _build_translate_panel(self, parent: ttk.Frame) -> ttk.Frame:
+        frame = ttk.LabelFrame(parent, text="3. 세부 설정 (번역 저장)", style="Panel.TLabelframe")
         frame.columnconfigure(0, weight=1)
 
         ttk.Label(frame, text="번역할 SRT 파일").grid(row=0, column=0, sticky=tk.W)
@@ -1527,19 +1589,25 @@ class PapaStopApp(tk.Tk):
         translate_output_row = ttk.Frame(frame)
         translate_output_row.grid(row=4, column=0, columnspan=2, sticky=tk.EW, pady=(4, 8))
         translate_output_row.columnconfigure(0, weight=1)
-        ttk.Entry(translate_output_row, textvariable=self.translate_output_path_var).grid(row=0, column=0, sticky=tk.EW)
-        ttk.Button(translate_output_row, text="이름", command=self.choose_translate_output_file).grid(
+        self.translate_output_entry = ttk.Entry(translate_output_row, textvariable=self.translate_output_path_var)
+        self.translate_output_entry.grid(row=0, column=0, sticky=tk.EW)
+        self.translate_output_button = ttk.Button(translate_output_row, text="이름", command=self.choose_translate_output_file)
+        self.translate_output_button.grid(
             row=0,
             column=1,
             padx=(6, 0),
         )
 
-        ttk.Button(
+        overwrite_check = ttk.Checkbutton(
             frame,
-            text="번역 자막 저장",
-            command=self.translate_subtitle,
-            style="Accent.TButton",
-        ).grid(row=5, column=0, columnspan=2, sticky=tk.EW)
+            text="번역 결과를 원본 SRT 파일에 덮어쓰기",
+            variable=self.translate_overwrite_var,
+        )
+        overwrite_check.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+        ToolTip(
+            overwrite_check,
+            "이 옵션을 켜면 '번역 저장 이름' 설정은 무시되고, 번역할 원본 SRT 파일을 덮어씁니다.",
+        )
 
         ttk.Button(
             frame,
@@ -1547,9 +1615,10 @@ class PapaStopApp(tk.Tk):
             command=self.translate_subtitle_folder,
         ).grid(row=6, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
 
-    def _build_convert_panel(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="자막 변환 저장", style="Panel.TLabelframe")
-        frame.pack(fill=tk.X)
+        return frame
+
+    def _build_convert_panel(self, parent: ttk.Frame) -> ttk.Frame:
+        frame = ttk.LabelFrame(parent, text="3. 세부 설정 (자막 변환)", style="Panel.TLabelframe")
         frame.columnconfigure(0, weight=1)
 
         ttk.Label(frame, text="변환할 SRT 파일").grid(row=0, column=0, sticky=tk.W)
@@ -1582,11 +1651,20 @@ class PapaStopApp(tk.Tk):
             padx=(6, 0),
         )
 
-        ttk.Button(
+        return frame
+
+    def _build_action_panel(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="4. 실행", style="Panel.TLabelframe")
+        frame.pack(fill=tk.X, pady=(0, 10))
+        frame.columnconfigure(0, weight=1)
+
+        self.action_button = ttk.Button(
             frame,
-            text="자막 변환 저장",
-            command=self.convert_subtitle,
-        ).grid(row=5, column=0, columnspan=2, sticky=tk.EW)
+            text="작업 시작",
+            command=self.start_work,
+            style="Accent.TButton",
+        )
+        self.action_button.grid(row=0, column=0, sticky=tk.EW)
 
     def _build_progress_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="진행 상황", style="Panel.TLabelframe")
@@ -1607,14 +1685,7 @@ class PapaStopApp(tk.Tk):
         self.step_tree.column("status", width=120, stretch=False)
         self.step_tree.grid(row=1, column=0, sticky=tk.EW, pady=(8, 0))
 
-        for step_id, label in (
-            ("file", "파일 선택"),
-            ("engine", "엔진 확인"),
-            ("model", "모델 준비"),
-            ("audio", "음향 분석"),
-            ("subtitle", "자막 저장"),
-            ("translate", "번역 저장"),
-        ):
+        for step_id, label in self._progress_steps_for_task(self.task_var.get()):
             self.step_tree.insert("", tk.END, iid=step_id, text=label, values=("대기",))
 
     def _build_hardware_panel(self, parent: ttk.Frame) -> None:
@@ -1747,7 +1818,7 @@ class PapaStopApp(tk.Tk):
                 "",
                 tk.END,
                 iid=iid,
-                values=("☑", media_path.name, media_path.suffix.lower(), size_label),
+                values=("☑", media_path.name, media_path.suffix.lower(), size_label, ""),
             )
 
     def _on_media_tree_click(self, event: tk.Event) -> None:
@@ -1836,6 +1907,50 @@ class PapaStopApp(tk.Tk):
 
         self._run_worker(work)
 
+    def start_work(self) -> None:
+        task = self.task_var.get()
+        if task == "make":
+            self.make_subtitle()
+        elif task == "extract":
+            self.extract_embedded_subtitle()
+        elif task == "translate":
+            self.translate_subtitle()
+        elif task == "convert":
+            self.convert_subtitle()
+        elif task == "engine":
+            messagebox.showinfo(APP_NAME, "엔진 관리는 패널 안의 '엔진 설치' 또는 '엔진 확인' 버튼을 눌러주세요.")
+
+    def _on_task_changed(self, *args) -> None:
+        # 모든 설정 패널 숨기기
+        if not hasattr(self, "transcribe_frame"):
+            return  # UI가 아직 완전히 빌드되지 않음
+        self.transcribe_frame.pack_forget()
+        self.extract_frame.pack_forget()
+        self.translate_frame.pack_forget()
+        self.convert_frame.pack_forget()
+        self.engine_frame.pack_forget()
+
+        task = self.task_var.get()
+
+        # 선택된 작업에 맞는 패널 보여주기 및 실행 버튼 텍스트 변경
+        if task == "make":
+            self.transcribe_frame.pack(fill=tk.X, expand=True)
+            self.action_button.config(text="자막 만들기", state=tk.NORMAL)
+        elif task == "extract":
+            self.extract_frame.pack(fill=tk.X, expand=True)
+            self.action_button.config(text="영상 속 자막 추출", state=tk.NORMAL)
+        elif task == "translate":
+            self.translate_frame.pack(fill=tk.X, expand=True)
+            self.action_button.config(text="번역 자막 저장", state=tk.NORMAL)
+        elif task == "convert":
+            self.convert_frame.pack(fill=tk.X, expand=True)
+            self.action_button.config(text="자막 변환 저장", state=tk.NORMAL)
+        elif task == "engine":
+            self.engine_frame.pack(fill=tk.X, expand=True)
+            self.action_button.config(text="위의 엔진 버튼을 사용하세요", state=tk.DISABLED)
+
+        self._set_progress_steps(task)
+
     def stop_current_work(self) -> None:
         if not self.busy:
             self._append_log("진행 중인 작업이 없습니다.")
@@ -1877,12 +1992,86 @@ class PapaStopApp(tk.Tk):
 
         self._run_worker(work)
 
+    def _check_and_prompt_for_initial_setup(self) -> None:
+        """앱 시작 시 필수 엔진이 없으면 사용자에게 설치를 안내합니다."""
+        # EXE 패키지는 엔진이 포함되어 있으므로 이 검사를 건너뜁니다.
+        if is_frozen_app():
+            return
+
+        # 핵심 엔진인 faster-whisper가 있는지 확인합니다.
+        if has_module("faster_whisper"):
+            return
+
+        # 엔진이 없으면 사용자에게 설치 여부를 묻습니다.
+        response = messagebox.askyesno(
+            APP_NAME,
+            "PapaStop을 사용하려면 초기 설정이 필요합니다.\n\n"
+            "필수 자막/번역 엔진을 지금 설치하시겠습니까?\n"
+            "(인터넷 연결이 필요하며, 수 분 정도 걸릴 수 있습니다.)",
+        )
+
+        if response:
+            self.install_engines()
+
+    def _on_mode_changed(self, *args) -> None:
+        """'전문가 모드' 상태에 따라 고급 설정 위젯의 표시 여부를 변경합니다."""
+        if not hasattr(self, "device_label"):
+            return  # UI가 아직 완전히 빌드되지 않음
+
+        is_expert = self.expert_mode_var.get()
+
+        expert_widgets = [
+            self.device_label,
+            self.device_combo,
+            self.compute_label,
+            self.compute_combo,
+            self.beam_label,
+            self.beam_spinbox,
+            self.max_line_chars_label,
+            self.max_line_chars_spinbox,
+            self.recommend_button,
+        ]
+
+        for widget in expert_widgets:
+            if is_expert:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+    def _on_overwrite_changed(self, *args) -> None:
+        """번역 덮어쓰기 옵션이 바뀌면 관련 UI 상태를 업데이트합니다."""
+        if not hasattr(self, "translate_output_entry"):
+            return  # UI가 아직 완전히 빌드되지 않음
+        state = tk.DISABLED if self.translate_overwrite_var.get() else tk.NORMAL
+        self.translate_output_entry.config(state=state)
+        self.translate_output_button.config(state=state)
+
+    def _update_media_tree_with_results(self, results: dict[str, tuple[str, str]]) -> None:
+        """작업 결과를 파일 목록 Treeview에 시각적으로 반영합니다."""
+        for iid, (status, message) in results.items():
+            if not self.media_tree.exists(iid):
+                continue
+            if status == "success":
+                self.media_tree.set(iid, "selected", "✅")
+                self.media_tree.set(iid, "status", "성공")
+            elif status == "error":
+                self.media_tree.set(iid, "selected", "❌")
+                self.media_tree.set(iid, "status", "오류")
+
     def make_subtitle(self) -> None:
         try:
             jobs = self._selected_media_jobs()
         except ValueError as exc:
             messagebox.showwarning(APP_NAME, str(exc))
             return
+
+        # 작업 시작 전, 대상 파일들의 상태를 '대기 중'으로 초기화합니다.
+        path_to_iid = {v: k for k, v in self.media_table_paths.items()}
+        for media_path, _ in jobs:
+            iid = path_to_iid.get(media_path)
+            if iid and self.media_tree.exists(iid):
+                self.media_tree.set(iid, "selected", "☑")
+                self.media_tree.set(iid, "status", "대기 중...")
 
         auto_translate = bool(self.auto_translate_var.get())
         translate_to = language_code_from_display(self.auto_translate_to_var.get())
@@ -1891,7 +2080,11 @@ class PapaStopApp(tk.Tk):
 
         def work() -> None:
             self._emit("status", "자막 만드는 중")
+            if not auto_translate:
+                self._emit("step", ("translate", "사용 안 함"))
             self._emit("step", ("model", "진행 중"))
+            path_to_iid = {v: k for k, v in self.media_table_paths.items()}
+            job_results: dict[str, tuple[str, str]] = {}
             saved_paths: list[Path] = []
             translated_paths: list[Path] = []
             errors: list[str] = []
@@ -1909,6 +2102,7 @@ class PapaStopApp(tk.Tk):
 
             for index, (media_path, output_dir) in enumerate(jobs, start=1):
                 ensure_not_cancelled(self.cancel_event.is_set)
+                iid = path_to_iid.get(media_path)
                 self._emit("log", f"[{index}/{total}] 자막 생성 시작: {media_path.name}")
                 try:
                     output_path, detected_language = transcribe_media(
@@ -1927,6 +2121,8 @@ class PapaStopApp(tk.Tk):
                     )
                     saved_paths.append(output_path)
                     self._emit("subtitle_path", str(output_path))
+                    if iid:
+                        job_results[iid] = ("success", f"{output_path.name} 생성 완료")
 
                     if auto_translate:
                         from_code = source_lang if source_lang != "auto" else detected_language
@@ -1978,6 +2174,8 @@ class PapaStopApp(tk.Tk):
                 except Exception as exc:
                     errors.append(f"{media_path.name}: {exc}")
                     self._emit("log", f"오류: {media_path.name} - {exc}")
+                    if iid:
+                        job_results[iid] = ("error", str(exc))
 
             if not saved_paths and errors:
                 raise RuntimeError("선택한 파일에서 자막을 만들지 못했습니다.\n" + "\n".join(errors[:3]))
@@ -1985,6 +2183,7 @@ class PapaStopApp(tk.Tk):
             self._emit("step", ("audio", "완료"))
             self._emit("step", ("subtitle", "완료"))
             self._emit("status", "대기 중")
+            self._emit("job_results", job_results)
             message = f"자막 {len(saved_paths)}개를 저장했습니다."
             if translated_paths:
                 message += f"\n번역 자막 {len(translated_paths)}개도 저장했습니다."
@@ -2030,12 +2229,28 @@ class PapaStopApp(tk.Tk):
         source_code = language_code_from_display(self.translate_from_var.get())
         target_code = language_code_from_display(self.translate_to_var.get())
         engine = translation_engine_code(self.translate_engine_var.get())
-        target_path = self._subtitle_target_path(
-            source_path,
-            self.translate_output_path_var.get(),
-            target_code,
-            "srt",
-        )
+        overwrite = bool(self.translate_overwrite_var.get())
+        if source_code == target_code:
+            messagebox.showwarning(APP_NAME, "원본 언어와 번역 언어가 같습니다.")
+            return
+
+        if overwrite:
+            target_path = source_path
+        else:
+            target_path = self._subtitle_target_path(
+                source_path,
+                self.translate_output_path_var.get(),
+                target_code,
+                "srt",
+            )
+
+        if overwrite and not messagebox.askyesno(
+            APP_NAME,
+            "원본 SRT 파일 내용을 번역 결과로 바꿉니다.\n"
+            "원본 파일을 따로 보관하지 않았다면 되돌리기 어렵습니다.\n\n"
+            "계속하시겠습니까?",
+        ):
+            return
 
         def work() -> None:
             self._emit("status", "번역 저장 중")
@@ -2064,6 +2279,7 @@ class PapaStopApp(tk.Tk):
         source_code = language_code_from_display(self.translate_from_var.get())
         target_code = language_code_from_display(self.translate_to_var.get())
         engine = translation_engine_code(self.translate_engine_var.get())
+        overwrite = bool(self.translate_overwrite_var.get())
         if source_code == target_code:
             messagebox.showwarning(APP_NAME, "원본 언어와 번역 언어가 같습니다.")
             return
@@ -2077,6 +2293,14 @@ class PapaStopApp(tk.Tk):
             messagebox.showinfo(APP_NAME, "폴더에서 번역할 SRT 파일을 찾지 못했습니다.")
             return
 
+        if overwrite and not messagebox.askyesno(
+            APP_NAME,
+            f"폴더 안의 SRT 파일 {len(srt_files)}개를 번역 결과로 바꿉니다.\n"
+            "원본 파일을 따로 보관하지 않았다면 되돌리기 어렵습니다.\n\n"
+            "계속하시겠습니까?",
+        ):
+            return
+
         def work() -> None:
             self._emit("status", "폴더 일괄 번역 중")
             self._emit("step", ("translate", "진행 중"))
@@ -2087,7 +2311,10 @@ class PapaStopApp(tk.Tk):
             for index, srt_path in enumerate(srt_files, start=1):
                 ensure_not_cancelled(self.cancel_event.is_set)
                 self._emit("log", f"[{index}/{total}] 번역 시작: {srt_path.name}")
-                target_path = srt_path.with_name(f"{srt_path.stem}.{target_code}.srt")
+                if overwrite:
+                    target_path = srt_path
+                else:
+                    target_path = srt_path.with_name(f"{srt_path.stem}.{target_code}.srt")
                 try:
                     translate_srt_file(
                         source_path=srt_path,
@@ -2287,6 +2514,8 @@ class PapaStopApp(tk.Tk):
                 self.status_var.set("오류 발생")
                 self._append_log(f"오류: {payload}")
                 messagebox.showerror(APP_NAME, str(payload))
+            elif kind == "job_results":
+                self._update_media_tree_with_results(payload)  # type: ignore[arg-type]
 
         self.after(100, self._process_events)
 
@@ -2305,6 +2534,46 @@ class PapaStopApp(tk.Tk):
 
         for key, value in values.items():
             tree.insert("", tk.END, text=key, values=(value,))
+
+    def _progress_steps_for_task(self, task: str) -> tuple[tuple[str, str], ...]:
+        steps_by_task: dict[str, tuple[tuple[str, str], ...]] = {
+            "make": (
+                ("file", "파일 선택"),
+                ("engine", "자막 도구 확인"),
+                ("model", "자막 품질 준비"),
+                ("audio", "소리 분석"),
+                ("subtitle", "자막 저장"),
+                ("translate", "번역 저장"),
+            ),
+            "extract": (
+                ("file", "파일 선택"),
+                ("engine", "영상 도구 확인"),
+                ("subtitle", "기존 자막 저장"),
+            ),
+            "translate": (
+                ("file", "SRT 파일 선택"),
+                ("engine", "번역 도구 확인"),
+                ("translate", "번역 저장"),
+            ),
+            "convert": (
+                ("file", "SRT 파일 선택"),
+                ("subtitle", "변환 파일 저장"),
+            ),
+            "engine": (
+                ("engine", "엔진 확인/설치"),
+            ),
+        }
+        return steps_by_task.get(task, steps_by_task["make"])
+
+    def _set_progress_steps(self, task: str) -> None:
+        if not hasattr(self, "step_tree"):
+            return
+
+        for item in self.step_tree.get_children():
+            self.step_tree.delete(item)
+
+        for step_id, label in self._progress_steps_for_task(task):
+            self.step_tree.insert("", tk.END, iid=step_id, text=label, values=("대기",))
 
     def _set_step(self, step_id: str, status: str) -> None:
         if self.step_tree.exists(step_id):
