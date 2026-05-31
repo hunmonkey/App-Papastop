@@ -44,6 +44,15 @@ WHISPER_MODEL_LABELS = {
     "large-v3-turbo": "고정확도 빠름 (large-v3-turbo)",
 }
 
+SOURCE_LANG_AUTO = "auto"
+SOURCE_LANG_ORDER = ("auto", "en", "ja", "zh")
+SOURCE_LANG_LABELS = {
+    "auto": "자동 감지",
+    "en": "영어",
+    "ja": "일본어",
+    "zh": "중국어",
+}
+
 MEDIA_EXTS = [
     "*.mp4",
     "*.mkv",
@@ -871,6 +880,11 @@ def default_recording_path(output_dir: Path | None = None) -> Path:
     return folder / f"screen-{time.strftime('%Y%m%d-%H%M%S')}.mkv"
 
 
+def default_live_srt_path(output_dir: Path | None = None) -> Path:
+    folder = output_dir if output_dir is not None else PAPASTOP_DATA / "subtitles"
+    return folder / f"live-{time.strftime('%Y%m%d-%H%M%S')}.ko.srt"
+
+
 def build_lossless_screen_capture_command(ffmpeg: str, output_path: Path, fps: int) -> list[str]:
     return [
         ffmpeg,
@@ -1057,10 +1071,14 @@ class ASREngine:
     def __init__(self, model_name: str = DEFAULT_WHISPER_MODEL, resource_mode: str = DEFAULT_RESOURCE_MODE):
         self.model_name = model_name
         self.resource_mode = normalize_resource_mode(resource_mode)
+        self.source_language = SOURCE_LANG_AUTO
         self._model = None
         self._batched_model = None
         self._load_lock = threading.Lock()
         self._resource_summary = build_resource_settings(self.resource_mode).summary
+
+    def set_source_language(self, code: str | None) -> None:
+        self.source_language = code if code in SOURCE_LANG_LABELS else SOURCE_LANG_AUTO
 
     def set_model(self, model_name: str) -> None:
         chosen = model_name if model_name in WHISPER_MODEL_LABELS else DEFAULT_WHISPER_MODEL
@@ -1184,8 +1202,9 @@ class ASREngine:
             raise OperationCancelled("취소되었습니다.")
 
         settings = build_resource_settings(self.resource_mode)
+        forced_language = None if self.source_language == SOURCE_LANG_AUTO else self.source_language
         transcribe_kwargs = {
-            "language": None,
+            "language": forced_language,
             "beam_size": settings.asr_beam_size,
             "vad_filter": True,
             "condition_on_previous_text": False,
@@ -1550,6 +1569,11 @@ class LiveCaptionService:
         self._ffmpeg_process: subprocess.Popen | None = None
         self._source_url: str | None = None
         self._loopback_recorder: object | None = None
+        self._srt_path: Path | None = None
+        self._srt_rows: list[SubtitleSegment] = []
+        self._srt_emitted = False
+        self._dropped_chunks = 0
+        self._lag_warned_at = 0.0
 
     def _is_running(self) -> bool:
         return (
@@ -1562,6 +1586,7 @@ class LiveCaptionService:
         emit: Callable[[str, object], None],
         stop_event: threading.Event,
         internet_url: str | None = None,
+        save_srt_path: Path | None = None,
     ) -> None:
         if self._is_running():
             raise RuntimeError("실시간 자막 기능이 이미 실행 중입니다.")
@@ -1571,6 +1596,13 @@ class LiveCaptionService:
         self._chunk_queue = queue.Queue(maxsize=8)
         self._temp_dir = Path(tempfile.mkdtemp(prefix="papastop_live_"))
         self._source_url = internet_url.strip() if internet_url else None
+        self._srt_path = save_srt_path
+        self._srt_rows = []
+        self._srt_emitted = False
+        self._dropped_chunks = 0
+        self._lag_warned_at = 0.0
+        if self._srt_path is not None:
+            self._srt_path.parent.mkdir(parents=True, exist_ok=True)
 
         if self._source_url:
             capture_target = self._capture_from_url
@@ -1663,6 +1695,8 @@ class LiveCaptionService:
         except queue.Full:
             try:
                 self._chunk_queue.get_nowait()
+                if item[0] is not None:
+                    self._dropped_chunks += 1
             except queue.Empty:
                 pass
             try:
@@ -1851,6 +1885,7 @@ class LiveCaptionService:
             if stop_event.is_set():
                 break
 
+            work_started_at = time.monotonic()
             try:
                 segments, source_language = self.asr.transcribe(
                     chunk_path,
@@ -1863,9 +1898,13 @@ class LiveCaptionService:
                     )
                     if len(translated) != len(segments):
                         translated = translated + ["" for _ in range(len(segments) - len(translated))]
-                    lines = [t.strip() or s.text.strip() for s, t in zip(segments, translated) if (t or s.text).strip()]
+                    pairs = [(s, (t.strip() or s.text.strip())) for s, t in zip(segments, translated) if (t or s.text).strip()]
+                    lines = [text for _, text in pairs]
                     if lines:
                         emit("live_caption", "\n".join(lines[-2:]))
+                    if self._srt_path is not None and pairs:
+                        self._append_live_srt(chunk_index, pairs, emit)
+                self._report_processing_lag(time.monotonic() - work_started_at, emit)
             except OperationCancelled:
                 emit("log", "실시간 번역이 취소되었습니다.")
             except Exception as exc:
@@ -1876,6 +1915,50 @@ class LiveCaptionService:
                         chunk_path.unlink(missing_ok=True)
                     except OSError:
                         pass
+
+    def _report_processing_lag(self, elapsed: float, emit: Callable[[str, object], None]) -> None:
+        # 한 청크 분석 시간이 입력 간격보다 길면 따라가지 못해 일부 구간을 건너뛴다.
+        if elapsed <= self.chunk_seconds * 1.15:
+            return
+        now = time.monotonic()
+        if now - self._lag_warned_at < 10.0:
+            return
+        self._lag_warned_at = now
+        message = (
+            f"⏱ 실시간 분석이 느립니다: 분석 {elapsed:.1f}초 > 입력 간격 {self.chunk_seconds:.1f}초. "
+            "따라가지 못해 일부 구간을 건너뜁니다"
+        )
+        if self._dropped_chunks:
+            message += f" (지금까지 건너뜀 {self._dropped_chunks}구간)"
+        message += ". 더 빠른 모델(예: tiny/base)이나 균형 모드를 권장합니다."
+        emit("live_status", message)
+        emit("log", message)
+
+    def _append_live_srt(
+        self,
+        chunk_index: int,
+        pairs: list[tuple[SubtitleSegment, str]],
+        emit: Callable[[str, object], None],
+    ) -> None:
+        if self._srt_path is None:
+            return
+        offset = chunk_index * self.chunk_seconds
+        for segment, text in pairs:
+            self._srt_rows.append(
+                SubtitleSegment(
+                    start=segment.start + offset,
+                    end=segment.end + offset,
+                    text=text,
+                )
+            )
+        try:
+            write_srt(self._srt_rows, self._srt_path)
+        except OSError as exc:
+            emit("error", f"실시간 자막 저장 오류: {exc}")
+            return
+        if not self._srt_emitted:
+            self._srt_emitted = True
+            emit("live_subtitle_output", str(self._srt_path))
 
 
 class ScreenRecorderService:
@@ -2310,10 +2393,10 @@ class PapaStopApp(tk.Tk):
         self.file_tab_container, self.file_tab = self._create_scrollable_tab(nb)
         self.live_tab = ttk.Frame(nb)
         self.record_tab = ttk.Frame(nb)
-        nb.add(self.system_tab, text="시스템 사양")
         nb.add(self.file_tab_container, text="파일 자막")
         nb.add(self.live_tab, text="실시간 자막")
         nb.add(self.record_tab, text="화면 녹화")
+        nb.add(self.system_tab, text="시스템 사양")
 
         self.system_cpu_var = tk.StringVar(value="확인 중 ...")
         self.system_ram_var = tk.StringVar(value="확인 중 ...")
@@ -2368,6 +2451,7 @@ class PapaStopApp(tk.Tk):
         self.file_status_var = tk.StringVar(value="대기 중")
         self.batch_status_var = tk.StringVar(value="0개 파일")
         self.whisper_model_var = tk.StringVar(value=WHISPER_MODEL_LABELS[DEFAULT_WHISPER_MODEL])
+        self.source_lang_var = tk.StringVar(value=SOURCE_LANG_LABELS[SOURCE_LANG_AUTO])
         self.translation_profile_var = tk.StringVar(value=TRANSLATION_PROFILE_LABELS["auto"])
         self.live_url_var = tk.StringVar()
         self.live_source_var = tk.StringVar(value=LIVE_SOURCE_SPEAKER)
@@ -2423,6 +2507,16 @@ class PapaStopApp(tk.Tk):
             command=self._prepare_asr_model,
         )
         self.prepare_asr_btn.pack(side="left", padx=6)
+        ttk.Label(file_row3, text="원본 언어").pack(side="left", padx=(18, 0))
+        self.file_source_lang_combo = ttk.Combobox(
+            file_row3,
+            textvariable=self.source_lang_var,
+            values=[SOURCE_LANG_LABELS[key] for key in SOURCE_LANG_ORDER],
+            state="readonly",
+            width=12,
+        )
+        self.file_source_lang_combo.bind("<<ComboboxSelected>>", self._on_source_lang_selected)
+        self.file_source_lang_combo.pack(side="left", padx=8)
 
         file_row4 = ttk.Frame(self.file_tab)
         file_row4.pack(fill="x", pady=6)
@@ -2524,6 +2618,7 @@ class PapaStopApp(tk.Tk):
         self.live_status_var = tk.StringVar(value="대기 중")
         self.live_preview_var = tk.StringVar(value="실시간 한국어 자막이 여기에 표시됩니다.")
         self.show_overlay_var = tk.BooleanVar(value=True)
+        self.live_save_srt_var = tk.BooleanVar(value=True)
 
         source_frame = ttk.LabelFrame(self.live_tab, text="실시간 소리 입력")
         source_frame.pack(fill="x", padx=4, pady=(0, 8))
@@ -2543,6 +2638,16 @@ class PapaStopApp(tk.Tk):
             variable=self.live_source_var,
             value=LIVE_SOURCE_URL,
         ).pack(side="left")
+        ttk.Label(live_row0, text="원본 언어").pack(side="left", padx=(18, 0))
+        self.live_source_lang_combo = ttk.Combobox(
+            live_row0,
+            textvariable=self.source_lang_var,
+            values=[SOURCE_LANG_LABELS[key] for key in SOURCE_LANG_ORDER],
+            state="readonly",
+            width=12,
+        )
+        self.live_source_lang_combo.bind("<<ComboboxSelected>>", self._on_source_lang_selected)
+        self.live_source_lang_combo.pack(side="left", padx=8)
 
         live_row_url = ttk.Frame(source_frame)
         live_row_url.pack(fill="x", padx=8, pady=(0, 8))
@@ -2567,6 +2672,13 @@ class PapaStopApp(tk.Tk):
             onvalue=True,
             offvalue=False,
         ).pack(side="left")
+        ttk.Checkbutton(
+            live_row2,
+            text="자막 파일(.srt)로도 저장",
+            variable=self.live_save_srt_var,
+            onvalue=True,
+            offvalue=False,
+        ).pack(side="left", padx=(18, 0))
 
         ttk.Label(self.live_tab, text="실시간 자막 미리보기:").pack(anchor="w", pady=(12, 2))
         self.live_preview = tk.Message(
@@ -2763,6 +2875,9 @@ class PapaStopApp(tk.Tk):
                 self.live_preview_var.set(text)
                 if self.overlay is not None:
                     self.overlay.set_text(text)
+            elif kind == "live_subtitle_output":
+                self.last_output = Path(str(payload))
+                self._append_log(f"실시간 자막을 저장하는 중: {self.last_output}")
             elif kind == "busy_file":
                 self._set_file_busy(bool(payload))
             elif kind == "busy_live":
@@ -2989,6 +3104,21 @@ class PapaStopApp(tk.Tk):
         model_name = self._whisper_model_from_selection()
         self.asr.set_model(model_name)
         self._append_log(f"음성 인식 모델을 바꿨습니다: {self.asr.model_label(model_name)}")
+
+    def _source_lang_id_from_label(self, label: str) -> str:
+        for key, value in SOURCE_LANG_LABELS.items():
+            if value == label:
+                return key
+        return SOURCE_LANG_AUTO
+
+    def _on_source_lang_selected(self, _event: object | None = None) -> None:
+        if self._is_file_running or self._is_live_running:
+            self.source_lang_var.set(SOURCE_LANG_LABELS.get(self.asr.source_language, SOURCE_LANG_LABELS[SOURCE_LANG_AUTO]))
+            messagebox.showwarning(APP_NAME, "현재 작업이 끝난 뒤 원본 언어를 바꿔 주세요.")
+            return
+        code = self._source_lang_id_from_label(self.source_lang_var.get())
+        self.asr.set_source_language(code)
+        self._append_log(f"원본 언어: {SOURCE_LANG_LABELS.get(code, code)}")
 
     def _prepare_asr_model(self) -> None:
         if self._is_file_running or self._is_live_running or self._is_record_running:
@@ -3465,12 +3595,15 @@ class PapaStopApp(tk.Tk):
             self.overlay = LiveSubtitleOverlay(self)
             self.overlay.lift()
 
+        save_srt_path = default_live_srt_path() if self.live_save_srt_var.get() else None
+
         def worker() -> None:
             try:
                 self.live_service.start(
                     self._emit,
                     self.live_cancel_event,
                     internet_url=live_url if live_source == LIVE_SOURCE_URL else None,
+                    save_srt_path=save_srt_path,
                 )
             except Exception as exc:
                 self._emit("error", str(exc))
