@@ -583,11 +583,32 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
 
 
-def render_srt(rows: Iterable[tuple[float, float, str]]) -> str:
+def wrap_subtitle_text(text: str, max_chars: int) -> str:
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+
+    if " " in text:
+        lines: list[str] = []
+        current = ""
+        for word in text.split(" "):
+            if current and len(current) + 1 + len(word) > max_chars:
+                lines.append(current)
+                current = word
+            else:
+                current = f"{current} {word}".strip()
+        if current:
+            lines.append(current)
+        return "\n".join(lines)
+
+    return "\n".join(text[i : i + max_chars] for i in range(0, len(text), max_chars))
+
+
+def render_srt(rows: Iterable[tuple[float, float, str]], max_line_chars: int = 42) -> str:
     blocks: list[str] = []
 
     for index, (start, end, text) in enumerate(rows, start=1):
-        clean_text = re.sub(r"[ \t]+", " ", text).strip()
+        clean_text = wrap_subtitle_text(text, max_line_chars)
         blocks.append(
             "\n".join(
                 [
@@ -985,6 +1006,7 @@ def transcribe_media(
     on_line: Callable[[str], None],
     on_progress: Callable[[float], None],
     should_stop: Callable[[], bool] | None = None,
+    max_line_chars: int = 42,
 ) -> tuple[Path, str]:
     ensure_not_cancelled(should_stop)
     validate_media_for_transcription(media_path)
@@ -1029,7 +1051,7 @@ def transcribe_media(
         raise RuntimeError("소리에서 자막으로 만들 문장을 찾지 못했습니다.")
 
     output_path = output_dir / f"{media_path.stem}.srt"
-    output_path.write_text(render_srt(rows), encoding="utf-8")
+    output_path.write_text(render_srt(rows, max_line_chars), encoding="utf-8")
     on_progress(100)
     on_line(f"자막 저장 완료: {output_path}")
     return output_path, detected_language
@@ -1130,6 +1152,7 @@ class PapaStopApp(tk.Tk):
         self.device_var = tk.StringVar(value=DEVICE_OPTIONS["auto"])
         self.compute_var = tk.StringVar(value="auto")
         self.beam_var = tk.IntVar(value=5)
+        self.max_line_chars_var = tk.IntVar(value=42)
         self.auto_translate_var = tk.BooleanVar(value=False)
         self.auto_translate_to_var = tk.StringVar(value=language_display("ko"))
         self.translate_from_var = tk.StringVar(value=language_display("en"))
@@ -1378,6 +1401,15 @@ class PapaStopApp(tk.Tk):
             sticky=tk.EW,
             pady=(4, 10),
             padx=(0, 6),
+        )
+
+        self._label_with_help(
+            frame,
+            "한 줄 최대 글자",
+            "자막 한 줄이 이 글자 수를 넘으면 자동으로 줄을 나눕니다. 0이면 줄바꿈하지 않습니다.",
+        ).grid(row=4, column=1, sticky=tk.W)
+        ttk.Spinbox(frame, from_=0, to=100, textvariable=self.max_line_chars_var).grid(
+            row=5, column=1, sticky=tk.EW, pady=(4, 10)
         )
 
         ttk.Button(
@@ -1849,6 +1881,7 @@ class PapaStopApp(tk.Tk):
                             ((item_index - 1) + (value / 100) * subtitle_weight) / total * 100,
                         ),
                         should_stop=self.cancel_event.is_set,
+                        max_line_chars=int(self.max_line_chars_var.get()),
                     )
                     saved_paths.append(output_path)
                     self._emit("subtitle_path", str(output_path))
