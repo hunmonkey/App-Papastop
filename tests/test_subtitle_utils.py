@@ -7,6 +7,7 @@ from papastop import (
     convert_srt_text,
     convert_subtitle_file,
     ensure_subtitle_extension,
+    float_audio_to_pcm16_bytes,
     format_timestamp,
     format_duration_short,
     format_file_size,
@@ -15,6 +16,7 @@ from papastop import (
     language_display,
     media_files_in_folder,
     OperationCancelled,
+    offset_subtitle_rows,
     parse_srt_blocks,
     recommend_transcribe_settings,
     render_srt,
@@ -114,6 +116,29 @@ class SubtitleUtilityTests(unittest.TestCase):
         self.assertEqual(format_duration_short(5), "5초")
         self.assertEqual(format_duration_short(65), "1분 5초")
         self.assertEqual(format_duration_short(3661), "1시간 1분")
+
+    def test_float_audio_to_pcm16_bytes(self):
+        import numpy as np
+
+        payload, channels, frames = float_audio_to_pcm16_bytes(
+            np.array(
+                [
+                    [-2.0, 0.0],
+                    [0.5, 1.0],
+                ],
+                dtype=np.float32,
+            )
+        )
+
+        self.assertEqual(channels, 2)
+        self.assertEqual(frames, 2)
+        self.assertEqual(len(payload), 8)
+
+    def test_offset_subtitle_rows(self):
+        self.assertEqual(
+            offset_subtitle_rows([(1.0, 2.5, "Hello")], 8.0),
+            [(9.0, 10.5, "Hello")],
+        )
 
     def test_media_files_in_folder(self):
         with tempfile.TemporaryDirectory() as temp_dir:

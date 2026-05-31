@@ -35,6 +35,7 @@ Write-Host "Building PapaStop package (single EXE)..."
     --collect-all faster_whisper `
     --collect-all argostranslate `
     --collect-all imageio_ffmpeg `
+    --collect-all soundcard `
     --collect-all ctranslate2 `
     --collect-all tokenizers `
     --collect-all onnxruntime `
