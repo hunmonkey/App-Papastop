@@ -1,7 +1,12 @@
 faster-whisper
+ctranslate2
 argostranslate
 imageio-ffmpeg
 soundcard
 transformers
+sentencepiece
+sacremoses
 numpy
 torch
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

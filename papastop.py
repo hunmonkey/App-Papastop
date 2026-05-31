@@ -1,11 +1,14 @@
 ﻿from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import platform
 import queue
 import re
 import shutil
 import subprocess
+import sys
 import hashlib
 import tempfile
 import threading
@@ -76,14 +79,19 @@ NLLB_LANGUAGE_MAP = {
     "ru": "rus_Cyrl",
 }
 
-NLLB_FAST_MODEL = "facebook/nllb-200-distilled-600M"
+NLLB_FAST_MODEL = "facebook/nllb-200-distilled-1.3B"
 NLLB_ACCURATE_MODEL = "facebook/nllb-200-3.3B"
+NLLB_TOKENIZER_MODEL = NLLB_ACCURATE_MODEL
+NLLB_CT2_MODEL_DIRS = {
+    NLLB_FAST_MODEL: PAPASTOP_DATA / "nllb-200-distilled-1.3B-ct2",
+    NLLB_ACCURATE_MODEL: PAPASTOP_DATA / "nllb-200-3.3B-ct2",
+}
 
 TRANSLATION_PROFILE_ORDER = ("auto", "fast", "balanced", "accurate")
 TRANSLATION_PROFILE_LABELS = {
     "auto": "자동 (NLLB 우선, 실패 시 Argos)",
     "fast": "빠름 (Argos 번역)",
-    "balanced": "균형 (NLLB distilled)",
+    "balanced": "균형 (NLLB 1.3B)",
     "accurate": "정확도 우선 (NLLB 3.3B)",
 }
 TRANSLATION_PROFILE_ORDER_STEPS = {
@@ -93,12 +101,37 @@ TRANSLATION_PROFILE_ORDER_STEPS = {
     "accurate": (("nllb", NLLB_ACCURATE_MODEL), ("nllb", NLLB_FAST_MODEL)),
 }
 
+DEFAULT_RESOURCE_MODE = "max"
+RESOURCE_MODE_ORDER = ("max", "balanced")
+RESOURCE_MODE_LABELS = {
+    "max": "최대 성능 (CPU/GPU 적극 사용)",
+    "balanced": "균형 (PC 여유 남김)",
+}
+
 
 @dataclass
 class SubtitleSegment:
     start: float
     end: float
     text: str
+
+
+@dataclass(frozen=True)
+class ResourceSettings:
+    mode: str
+    cpu_count: int
+    cpu_threads: int
+    num_workers: int
+    asr_device: str
+    asr_compute_type: str
+    asr_batch_size: int
+    asr_beam_size: int
+    translation_ct2_device: str
+    translation_ct2_compute_type: str
+    translation_device: int
+    translation_batch_size: int
+    translation_dtype: str | None
+    summary: str
 
 
 class OperationCancelled(RuntimeError):
@@ -134,6 +167,666 @@ def run_command(command: list[str], on_line: Callable[[str], None] | None = None
 
     if process.wait() != 0:
         raise RuntimeError(f"명령 실행에 실패했습니다: {' '.join(command)}")
+
+
+def format_duration_short(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "계산 중"
+
+    seconds = int(max(0, round(float(seconds))))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours}시간 {minutes}분"
+    if minutes:
+        return f"{minutes}분 {seconds}초"
+    return f"{seconds}초"
+
+
+def build_eta_text(progress: float, started_at: float | None, now: float | None = None) -> str:
+    if started_at is None:
+        return "예상 시간: 대기 중"
+
+    progress = max(0.0, min(100.0, float(progress)))
+    if progress >= 100:
+        return "예상 시간: 완료"
+    if progress < 3:
+        return "예상 시간: 계산 중"
+
+    now = time.time() if now is None else now
+    elapsed = max(0.0, now - started_at)
+    if elapsed <= 0:
+        return "예상 시간: 계산 중"
+
+    remaining = elapsed * (100.0 - progress) / progress
+    finish_time = time.strftime("%H:%M", time.localtime(now + remaining))
+    return f"예상 시간: 약 {format_duration_short(remaining)} 남음 · 완료 예상 {finish_time}"
+
+
+def normalize_resource_mode(mode: str | None) -> str:
+    return mode if mode in RESOURCE_MODE_LABELS else DEFAULT_RESOURCE_MODE
+
+
+_CUDA_DLL_CONFIGURED = False
+_CUDA_DLL_HANDLES: list[object] = []
+
+
+def configure_cuda_dll_paths() -> None:
+    global _CUDA_DLL_CONFIGURED
+    if _CUDA_DLL_CONFIGURED or os.name != "nt":
+        return
+
+    candidates: list[Path] = []
+    try:
+        import nvidia
+
+        nvidia_root = Path(nvidia.__file__).resolve().parent
+        candidates.extend(
+            [
+                nvidia_root / "cublas" / "bin",
+                nvidia_root / "cudnn" / "bin",
+                nvidia_root / "cuda_runtime" / "bin",
+                nvidia_root / "cuda_nvrtc" / "bin",
+            ]
+        )
+    except Exception:
+        pass
+
+    site_root = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
+    candidates.extend(
+        [
+            site_root / "cublas" / "bin",
+            site_root / "cudnn" / "bin",
+            site_root / "cuda_runtime" / "bin",
+            site_root / "cuda_nvrtc" / "bin",
+        ]
+    )
+
+    path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    for path in candidates:
+        if not path.exists():
+            continue
+        path_text = str(path)
+        if hasattr(os, "add_dll_directory"):
+            try:
+                _CUDA_DLL_HANDLES.append(os.add_dll_directory(path_text))
+            except Exception:
+                pass
+        if path_text not in path_parts:
+            path_parts.insert(0, path_text)
+
+    os.environ["PATH"] = os.pathsep.join(path_parts)
+    _CUDA_DLL_CONFIGURED = True
+
+
+def get_ctranslate2_cuda_available() -> bool:
+    configure_cuda_dll_paths()
+    try:
+        import ctranslate2
+
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+def get_ctranslate2_compute_types(device: str) -> set[str]:
+    configure_cuda_dll_paths()
+    try:
+        import ctranslate2
+
+        return set(ctranslate2.get_supported_compute_types(device))
+    except Exception:
+        return set()
+
+
+def get_torch_cuda_available() -> bool:
+    if not has_module("torch"):
+        return False
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def get_primary_cuda_vram_bytes() -> int | None:
+    if has_module("torch"):
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return int(torch.cuda.get_device_properties(0).total_memory)
+        except Exception:
+            pass
+
+    nvidia_smi = find_nvidia_smi()
+    if nvidia_smi is None:
+        return None
+
+    try:
+        completed = subprocess.run(
+            [
+                nvidia_smi,
+                "--query-gpu=memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=windows_creation_flags(),
+            timeout=5,
+        )
+    except Exception:
+        return None
+
+    if completed.returncode != 0:
+        return None
+
+    for line in completed.stdout.splitlines():
+        memory_mib = _optional_int(line.strip())
+        if memory_mib is not None:
+            return memory_mib * 1024 * 1024
+    return None
+
+
+def get_nvidia_memory_used_mib() -> int | None:
+    nvidia_smi = find_nvidia_smi()
+    if nvidia_smi is None:
+        return None
+
+    try:
+        completed = subprocess.run(
+            [
+                nvidia_smi,
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=windows_creation_flags(),
+            timeout=5,
+        )
+    except Exception:
+        return None
+
+    if completed.returncode != 0:
+        return None
+
+    for line in completed.stdout.splitlines():
+        memory_mib = _optional_int(line.strip())
+        if memory_mib is not None:
+            return memory_mib
+    return None
+
+
+def configure_runtime_threads(cpu_threads: int) -> None:
+    cpu_threads = max(1, int(cpu_threads))
+    for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[key] = str(cpu_threads)
+
+    if not has_module("torch"):
+        return
+
+    try:
+        import torch
+
+        torch.set_num_threads(cpu_threads)
+        try:
+            torch.set_num_interop_threads(max(1, min(4, cpu_threads)))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def build_resource_settings(mode: str | None = None) -> ResourceSettings:
+    selected_mode = normalize_resource_mode(mode)
+    cpu_count = max(1, os.cpu_count() or 1)
+    if selected_mode == "max":
+        cpu_threads = cpu_count
+        num_workers = max(1, min(4, cpu_count // 2 or 1))
+        asr_beam_size = 8
+    else:
+        cpu_threads = max(1, cpu_count - 2)
+        num_workers = 1
+        asr_beam_size = 5
+
+    vram_bytes = get_primary_cuda_vram_bytes()
+    asr_cuda = get_ctranslate2_cuda_available()
+    torch_cuda = get_torch_cuda_available()
+
+    asr_device = "cuda" if asr_cuda else "cpu"
+    if asr_device == "cuda":
+        cuda_types = get_ctranslate2_compute_types("cuda")
+        if "float16" in cuda_types and (vram_bytes is None or vram_bytes >= 6 * 1024**3):
+            asr_compute_type = "float16"
+        elif "int8_float16" in cuda_types:
+            asr_compute_type = "int8_float16"
+        elif cuda_types:
+            asr_compute_type = sorted(cuda_types)[0]
+        else:
+            asr_compute_type = "default"
+    else:
+        cpu_types = get_ctranslate2_compute_types("cpu")
+        asr_compute_type = "int8" if "int8" in cpu_types else "default"
+
+    if asr_device == "cuda":
+        if vram_bytes is not None and vram_bytes >= 12 * 1024**3:
+            asr_batch_size = 16 if selected_mode == "max" else 8
+        else:
+            asr_batch_size = 8 if selected_mode == "max" else 4
+    else:
+        asr_batch_size = 4 if selected_mode == "max" else 2
+
+    translation_ct2_device = "cuda" if asr_cuda else "cpu"
+    if translation_ct2_device == "cuda":
+        cuda_types = get_ctranslate2_compute_types("cuda")
+        if "float16" in cuda_types and (vram_bytes is None or vram_bytes >= 8 * 1024**3):
+            translation_ct2_compute_type = "float16"
+        elif "int8_float16" in cuda_types:
+            translation_ct2_compute_type = "int8_float16"
+        else:
+            translation_ct2_compute_type = "default"
+    else:
+        cpu_types = get_ctranslate2_compute_types("cpu")
+        translation_ct2_compute_type = "int8" if "int8" in cpu_types else "default"
+
+    translation_device = 0 if torch_cuda else -1
+    if translation_device >= 0:
+        translation_dtype = "float16"
+        translation_batch_size = 16 if selected_mode == "max" and vram_bytes and vram_bytes >= 12 * 1024**3 else 8
+    else:
+        translation_dtype = None
+        translation_batch_size = 4 if selected_mode == "max" else 2
+    if translation_ct2_device == "cuda":
+        translation_batch_size = 16 if selected_mode == "max" and vram_bytes and vram_bytes >= 12 * 1024**3 else 8
+
+    summary_parts = [
+        f"CPU {cpu_threads}/{cpu_count}스레드",
+        f"자막 {asr_device.upper()} {asr_compute_type}, 배치 {asr_batch_size}",
+        f"번역 CT2 {translation_ct2_device.upper()} {translation_ct2_compute_type}, 배치 {translation_batch_size}",
+    ]
+    if asr_device == "cuda" and translation_device < 0 and has_module("torch"):
+        summary_parts.append("PyTorch CUDA 없음")
+
+    return ResourceSettings(
+        mode=selected_mode,
+        cpu_count=cpu_count,
+        cpu_threads=cpu_threads,
+        num_workers=num_workers,
+        asr_device=asr_device,
+        asr_compute_type=asr_compute_type,
+        asr_batch_size=asr_batch_size,
+        asr_beam_size=asr_beam_size,
+        translation_ct2_device=translation_ct2_device,
+        translation_ct2_compute_type=translation_ct2_compute_type,
+        translation_device=translation_device,
+        translation_batch_size=translation_batch_size,
+        translation_dtype=translation_dtype,
+        summary=" | ".join(summary_parts),
+    )
+
+
+def format_bytes_as_gib(total_bytes: int | None) -> str:
+    if total_bytes is None or total_bytes <= 0:
+        return "알 수 없음"
+    return f"{total_bytes / (1024 ** 3):.1f} GB"
+
+
+def get_cpu_name() -> str:
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+            ) as key:
+                value, _ = winreg.QueryValueEx(key, "ProcessorNameString")
+                if str(value).strip():
+                    return str(value).strip()
+        except Exception:
+            pass
+
+    for candidate in (platform.processor(), os.environ.get("PROCESSOR_IDENTIFIER", "")):
+        if candidate and candidate.strip():
+            return candidate.strip()
+    return "알 수 없음"
+
+
+def get_total_ram_bytes() -> int | None:
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatus()
+            status.dwLength = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullTotalPhys)
+        except Exception:
+            pass
+
+    if hasattr(os, "sysconf"):
+        try:
+            pages = os.sysconf("SC_PHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            return int(pages * page_size)
+        except Exception:
+            return None
+    return None
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except Exception:
+        return None
+    return number if number > 0 else None
+
+
+def find_nvidia_smi() -> str | None:
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi is None and os.name == "nt":
+        candidate = Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32" / "nvidia-smi.exe"
+        if candidate.exists():
+            nvidia_smi = str(candidate)
+    return nvidia_smi
+
+
+def parse_nvidia_smi_csv(output: str) -> list[tuple[str, int, str]]:
+    rows: list[tuple[str, int, str]] = []
+    for line in output.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 3:
+            continue
+
+        name = parts[0]
+        memory_mib = _optional_int(parts[1])
+        driver_version = parts[2]
+        if not name or memory_mib is None:
+            continue
+        rows.append((name, memory_mib * 1024 * 1024, driver_version))
+    return rows
+
+
+def format_vga_spec(name: object, adapter_ram: object = None, driver_version: object = None) -> str:
+    display_name = str(name or "").strip() or "알 수 없음"
+    details: list[str] = []
+    ram_bytes = _optional_int(adapter_ram)
+    if ram_bytes is not None:
+        details.append(f"VRAM {format_bytes_as_gib(ram_bytes)}")
+    if driver_version:
+        details.append(f"드라이버 {str(driver_version).strip()}")
+    if details:
+        return f"{display_name} ({', '.join(details)})"
+    return display_name
+
+
+def _run_powershell_json(script: str, timeout: float = 8.0) -> object | None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        return None
+
+    try:
+        completed = subprocess.run(
+            [powershell, "-NoProfile", "-Command", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=windows_creation_flags(),
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+
+    output = completed.stdout.strip()
+    if completed.returncode != 0 or not output:
+        return None
+
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError:
+        return None
+
+
+def get_cim_video_controllers() -> list[dict[str, object]]:
+    if os.name != "nt":
+        return []
+
+    data = _run_powershell_json(
+        "Get-CimInstance Win32_VideoController | "
+        "Select-Object Name,AdapterRAM,DriverVersion | "
+        "ConvertTo-Json -Compress"
+    )
+    if data is None:
+        return []
+
+    items = data if isinstance(data, list) else [data]
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _driver_versions_by_gpu_name() -> dict[str, object]:
+    result: dict[str, object] = {}
+    for item in get_cim_video_controllers():
+        name = str(item.get("Name") or "").strip().lower()
+        if name and item.get("DriverVersion"):
+            result[name] = item.get("DriverVersion")
+    return result
+
+
+def _matching_driver_version(name: str, driver_versions: dict[str, object]) -> object | None:
+    normalized_name = name.strip().lower()
+    for driver_name, version in driver_versions.items():
+        if normalized_name == driver_name or normalized_name in driver_name or driver_name in normalized_name:
+            return version
+    return None
+
+
+def get_nvidia_smi_vga_specs() -> list[str]:
+    nvidia_smi = find_nvidia_smi()
+    if nvidia_smi is None:
+        return []
+
+    try:
+        completed = subprocess.run(
+            [
+                nvidia_smi,
+                "--query-gpu=name,memory.total,driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=windows_creation_flags(),
+            timeout=5,
+        )
+    except Exception:
+        return []
+
+    if completed.returncode != 0:
+        return []
+
+    return [
+        format_vga_spec(name, memory_bytes, driver_version)
+        for name, memory_bytes, driver_version in parse_nvidia_smi_csv(completed.stdout)
+    ]
+
+
+def get_dxgi_vga_specs() -> list[str]:
+    if os.name != "nt":
+        return []
+
+    try:
+        import ctypes
+        import uuid
+        from ctypes import wintypes
+    except Exception:
+        return []
+
+    class GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", wintypes.DWORD),
+            ("Data2", wintypes.WORD),
+            ("Data3", wintypes.WORD),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class DXGIAdapterDesc1(ctypes.Structure):
+        _fields_ = [
+            ("Description", wintypes.WCHAR * 128),
+            ("VendorId", wintypes.UINT),
+            ("DeviceId", wintypes.UINT),
+            ("SubSysId", wintypes.UINT),
+            ("Revision", wintypes.UINT),
+            ("DedicatedVideoMemory", ctypes.c_size_t),
+            ("DedicatedSystemMemory", ctypes.c_size_t),
+            ("SharedSystemMemory", ctypes.c_size_t),
+            ("AdapterLuid", LUID),
+            ("Flags", wintypes.UINT),
+        ]
+
+    def make_guid(value: str) -> GUID:
+        parsed = uuid.UUID(value)
+        return GUID(
+            parsed.time_low,
+            parsed.time_mid,
+            parsed.time_hi_version,
+            (ctypes.c_ubyte * 8).from_buffer_copy(parsed.bytes[8:]),
+        )
+
+    factory = ctypes.c_void_p()
+    iid_factory_1 = make_guid("770aae78-f26f-4dba-a829-253c83d1b387")
+    try:
+        hr = ctypes.windll.dxgi.CreateDXGIFactory1(ctypes.byref(iid_factory_1), ctypes.byref(factory))
+    except Exception:
+        return []
+    if hr != 0 or not factory.value:
+        return []
+
+    specs: list[str] = []
+    driver_versions = _driver_versions_by_gpu_name()
+    try:
+        factory_vtable = ctypes.cast(factory, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        enum_adapters_1 = ctypes.WINFUNCTYPE(
+            ctypes.c_long,
+            ctypes.c_void_p,
+            wintypes.UINT,
+            ctypes.POINTER(ctypes.c_void_p),
+        )(factory_vtable[12])
+
+        index = 0
+        while True:
+            adapter = ctypes.c_void_p()
+            hr = enum_adapters_1(factory, index, ctypes.byref(adapter))
+            if (hr & 0xFFFFFFFF) == 0x887A0002:
+                break
+            if hr != 0 or not adapter.value:
+                break
+
+            adapter_vtable = ctypes.cast(adapter, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+            try:
+                get_desc_1 = ctypes.WINFUNCTYPE(
+                    ctypes.c_long,
+                    ctypes.c_void_p,
+                    ctypes.POINTER(DXGIAdapterDesc1),
+                )(adapter_vtable[10])
+                desc = DXGIAdapterDesc1()
+                desc_hr = get_desc_1(adapter, ctypes.byref(desc))
+                if desc_hr == 0 and not (desc.Flags & 2):
+                    specs.append(
+                        format_vga_spec(
+                            desc.Description,
+                            int(desc.DedicatedVideoMemory),
+                            _matching_driver_version(desc.Description, driver_versions),
+                        )
+                    )
+            finally:
+                release_adapter = ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)(adapter_vtable[2])
+                release_adapter(adapter)
+
+            index += 1
+    finally:
+        factory_vtable = ctypes.cast(factory, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        release_factory = ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)(factory_vtable[2])
+        release_factory(factory)
+
+    return specs
+
+
+def get_cim_vga_specs() -> list[str]:
+    specs: list[str] = []
+    for item in get_cim_video_controllers():
+        spec = format_vga_spec(
+            item.get("Name"),
+            item.get("AdapterRAM"),
+            item.get("DriverVersion"),
+        )
+        if spec != "알 수 없음":
+            specs.append(spec)
+    return specs
+
+
+def _gpu_key(spec: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", spec.split("(", 1)[0].lower())
+
+
+def merge_vga_specs(primary: list[str], secondary: list[str]) -> list[str]:
+    merged = list(primary)
+    seen = {_gpu_key(spec) for spec in merged}
+    for spec in secondary:
+        key = _gpu_key(spec)
+        if not key or key in seen:
+            continue
+        merged.append(spec)
+        seen.add(key)
+    return merged
+
+
+def get_vga_specs() -> list[str]:
+    nvidia_specs = get_nvidia_smi_vga_specs()
+    dxgi_specs = get_dxgi_vga_specs()
+    if nvidia_specs:
+        return merge_vga_specs(nvidia_specs, dxgi_specs)
+    if dxgi_specs:
+        return dxgi_specs
+
+    return get_cim_vga_specs()
+
+
+def collect_system_specs() -> dict[str, str]:
+    vga_specs = get_vga_specs()
+    return {
+        "cpu": get_cpu_name(),
+        "ram": format_bytes_as_gib(get_total_ram_bytes()),
+        "vga": "\n".join(vga_specs) if vga_specs else "알 수 없음",
+    }
 
 
 def find_ffmpeg() -> str | None:
@@ -361,10 +1054,13 @@ def write_pcm16_to_wav(pcm_bytes: bytes, sample_rate: int, output_path: Path) ->
 
 
 class ASREngine:
-    def __init__(self, model_name: str = DEFAULT_WHISPER_MODEL):
+    def __init__(self, model_name: str = DEFAULT_WHISPER_MODEL, resource_mode: str = DEFAULT_RESOURCE_MODE):
         self.model_name = model_name
+        self.resource_mode = normalize_resource_mode(resource_mode)
         self._model = None
+        self._batched_model = None
         self._load_lock = threading.Lock()
+        self._resource_summary = build_resource_settings(self.resource_mode).summary
 
     def set_model(self, model_name: str) -> None:
         chosen = model_name if model_name in WHISPER_MODEL_LABELS else DEFAULT_WHISPER_MODEL
@@ -373,6 +1069,17 @@ class ASREngine:
                 return
             self.model_name = chosen
             self._model = None
+            self._batched_model = None
+
+    def set_resource_mode(self, mode: str | None) -> None:
+        chosen = normalize_resource_mode(mode)
+        with self._load_lock:
+            if chosen == self.resource_mode:
+                return
+            self.resource_mode = chosen
+            self._model = None
+            self._batched_model = None
+            self._resource_summary = build_resource_settings(self.resource_mode).summary
 
     def prepare_model(self, model_name: str | None = None) -> None:
         if model_name:
@@ -383,8 +1090,13 @@ class ASREngine:
         target = model_name or self.model_name
         return WHISPER_MODEL_LABELS.get(target, target)
 
-    def _load_model(self):
+    def resource_summary(self) -> str:
+        return self._resource_summary
+
+    def _load_model(self, on_line: Callable[[str], None] | None = None):
         if self._model is not None:
+            if on_line:
+                on_line(f"위스퍼 모델 사용 중: {self.resource_summary()}")
             return
 
         if not has_module("faster_whisper"):
@@ -395,13 +1107,68 @@ class ASREngine:
                 return
 
             from faster_whisper import WhisperModel
-            import torch
 
             ensure_cache_dirs()
+            configure_cuda_dll_paths()
+            settings = build_resource_settings(self.resource_mode)
+            configure_runtime_threads(settings.cpu_threads)
+            gpu_memory_before = get_nvidia_memory_used_mib() if settings.asr_device == "cuda" else None
+            if on_line:
+                on_line(
+                    f"위스퍼 모델을 {settings.asr_device.upper()}에 올리는 중입니다 "
+                    f"({settings.asr_compute_type}, 배치 {settings.asr_batch_size}) ..."
+                )
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            compute_type = "float16" if device == "cuda" else "int8"
-            self._model = WhisperModel(self.model_name, device=device, compute_type=compute_type)
+            try:
+                self._model = WhisperModel(
+                    self.model_name,
+                    device=settings.asr_device,
+                    device_index=0,
+                    compute_type=settings.asr_compute_type,
+                    cpu_threads=settings.cpu_threads,
+                    num_workers=settings.num_workers,
+                    download_root=str(HF_HOME / "hub"),
+                )
+                if settings.asr_device == "cuda":
+                    from faster_whisper import BatchedInferencePipeline
+
+                    self._batched_model = BatchedInferencePipeline(self._model)
+                else:
+                    self._batched_model = None
+                self._resource_summary = settings.summary
+                if on_line:
+                    gpu_memory_after = get_nvidia_memory_used_mib() if settings.asr_device == "cuda" else None
+                    if gpu_memory_before is not None and gpu_memory_after is not None:
+                        on_line(
+                            "GPU 메모리 변화: "
+                            f"{gpu_memory_before}MiB -> {gpu_memory_after}MiB "
+                            f"(+{gpu_memory_after - gpu_memory_before}MiB)"
+                        )
+                    on_line(f"위스퍼 모델 로딩 완료: {self.resource_summary()}")
+            except Exception as exc:
+                if settings.asr_device != "cuda":
+                    raise
+                if settings.mode == "max":
+                    raise RuntimeError(
+                        "GPU 위스퍼 모델을 시작하지 못했습니다. 최대 성능 모드에서는 CPU로 몰래 전환하지 않습니다. "
+                        f"CUDA 드라이버, ctranslate2, 모델 파일 상태를 확인해 주세요. 원인: {exc}"
+                    )
+                cpu_threads = settings.cpu_threads
+                self._model = WhisperModel(
+                    self.model_name,
+                    device="cpu",
+                    compute_type="int8",
+                    cpu_threads=cpu_threads,
+                    num_workers=settings.num_workers,
+                    download_root=str(HF_HOME / "hub"),
+                )
+                self._batched_model = None
+                self._resource_summary = (
+                    f"GPU 시작 실패로 CPU 전환 | CPU {cpu_threads}/{settings.cpu_count}스레드 | "
+                    "자막 CPU int8"
+                )
+                if on_line:
+                    on_line(self._resource_summary)
 
     def transcribe(
         self,
@@ -410,19 +1177,25 @@ class ASREngine:
         should_stop: Callable[[], bool] | None = None,
         on_segment: Callable[[SubtitleSegment], None] | None = None,
     ) -> tuple[list[SubtitleSegment], str]:
-        self._load_model()
+        self._load_model(on_line=on_line)
         assert self._model is not None
 
         if should_stop is not None and should_stop():
             raise OperationCancelled("취소되었습니다.")
 
-        segments, info = self._model.transcribe(
-            str(audio_path),
-            language=None,
-            beam_size=5,
-            vad_filter=True,
-            condition_on_previous_text=False,
-        )
+        settings = build_resource_settings(self.resource_mode)
+        transcribe_kwargs = {
+            "language": None,
+            "beam_size": settings.asr_beam_size,
+            "vad_filter": True,
+            "condition_on_previous_text": False,
+        }
+        if self._batched_model is not None:
+            transcribe_kwargs["batch_size"] = settings.asr_batch_size
+            transcribe_kwargs["without_timestamps"] = False
+            segments, info = self._batched_model.transcribe(str(audio_path), **transcribe_kwargs)
+        else:
+            segments, info = self._model.transcribe(str(audio_path), **transcribe_kwargs)
 
         detected_language = getattr(info, "language", "auto")
         rows: list[SubtitleSegment] = []
@@ -443,22 +1216,40 @@ class ASREngine:
                 on_segment(subtitle_segment)
 
         if on_line:
+            on_line(f"자원 사용: {self.resource_summary()}")
             on_line(f"감지된 언어: {detected_language}, 자막 줄 수={len(rows)}")
 
         return rows, detected_language
 
 
 class TranslationEngine:
-    def __init__(self, preferred: str = "auto"):
+    def __init__(self, preferred: str = "auto", resource_mode: str = DEFAULT_RESOURCE_MODE):
         self.preferred = preferred
+        self.resource_mode = normalize_resource_mode(resource_mode)
         self._nllb_pipelines: dict[str, object] = {}
+        self._nllb_ct2_translators: dict[str, object] = {}
+        self._nllb_tokenizer = None
         self._pipeline_lock = threading.Lock()
         self._prepare_lock = threading.Lock()
+        self._resource_summary = build_resource_settings(self.resource_mode).summary
 
     def set_profile(self, profile: str) -> None:
         if profile not in TRANSLATION_PROFILE_ORDER_STEPS:
             profile = "auto"
         self.preferred = profile
+
+    def set_resource_mode(self, mode: str | None) -> None:
+        chosen = normalize_resource_mode(mode)
+        with self._pipeline_lock:
+            if chosen == self.resource_mode:
+                return
+            self.resource_mode = chosen
+            self._nllb_pipelines.clear()
+            self._nllb_ct2_translators.clear()
+            self._resource_summary = build_resource_settings(self.resource_mode).summary
+
+    def resource_summary(self) -> str:
+        return self._resource_summary
 
     def _profile_steps(self, profile: str | None = None) -> tuple[tuple[str, str | None], ...]:
         selected = profile or self.preferred
@@ -481,7 +1272,58 @@ class TranslationEngine:
                 else:
                     raise RuntimeError(f"알 수 없는 번역 방식입니다: {engine}")
 
-    def _load_nllb(self, model_name: str):
+    def _nllb_ct2_path(self, model_name: str) -> Path | None:
+        path = NLLB_CT2_MODEL_DIRS.get(model_name)
+        if path is None:
+            return None
+        required = ("config.json", "model.bin", "shared_vocabulary.json")
+        return path if all((path / name).exists() for name in required) else None
+
+    def _load_nllb_tokenizer(self):
+        if self._nllb_tokenizer is not None:
+            return self._nllb_tokenizer
+
+        if not has_module("transformers"):
+            raise RuntimeError("transformers가 설치되어 있지 않습니다.")
+
+        from transformers import AutoTokenizer
+
+        ensure_cache_dirs()
+        self._nllb_tokenizer = AutoTokenizer.from_pretrained(
+            NLLB_TOKENIZER_MODEL,
+            cache_dir=str(HF_HOME / "hub"),
+        )
+        return self._nllb_tokenizer
+
+    def _load_nllb_ct2(self, model_name: str):
+        model_path = self._nllb_ct2_path(model_name)
+        if model_path is None:
+            return None
+
+        cached = self._nllb_ct2_translators.get(model_name)
+        if cached is not None:
+            return cached
+
+        configure_cuda_dll_paths()
+        if not has_module("ctranslate2"):
+            return None
+
+        import ctranslate2
+
+        settings = build_resource_settings(self.resource_mode)
+        configure_runtime_threads(settings.cpu_threads)
+        translator = ctranslate2.Translator(
+            str(model_path),
+            device=settings.translation_ct2_device,
+            compute_type=settings.translation_ct2_compute_type,
+            intra_threads=settings.cpu_threads,
+            inter_threads=settings.num_workers,
+        )
+        self._nllb_ct2_translators[model_name] = translator
+        self._resource_summary = settings.summary
+        return translator
+
+    def _load_nllb_pipeline(self, model_name: str):
         if not has_module("transformers"):
             raise RuntimeError("transformers가 설치되어 있지 않습니다.")
 
@@ -500,25 +1342,65 @@ class TranslationEngine:
             import torch
 
             ensure_cache_dirs()
-            device = 0 if torch.cuda.is_available() else -1
-            pipeline_obj = pipeline(
-                "translation",
-                model=model_name,
-                device=device,
-            )
+            settings = build_resource_settings(self.resource_mode)
+            configure_runtime_threads(settings.cpu_threads)
+            pipeline_kwargs = {
+                "model": model_name,
+                "device": settings.translation_device,
+            }
+            if settings.translation_dtype == "float16":
+                pipeline_kwargs["torch_dtype"] = torch.float16
+            try:
+                pipeline_obj = pipeline("translation", **pipeline_kwargs)
+            except TypeError:
+                pipeline_kwargs.pop("torch_dtype", None)
+                pipeline_obj = pipeline("translation", **pipeline_kwargs)
             self._nllb_pipelines[model_name] = pipeline_obj
+            self._resource_summary = settings.summary
             return pipeline_obj
+
+    def _load_nllb(self, model_name: str) -> tuple[str, object]:
+        ct2_translator = self._load_nllb_ct2(model_name)
+        if ct2_translator is not None:
+            self._load_nllb_tokenizer()
+            return "ct2", ct2_translator
+        return "pipeline", self._load_nllb_pipeline(model_name)
 
     def _translate_nllb(self, texts: list[str], source_code: str, model_name: str) -> list[str]:
         if not texts:
             return []
-        pipeline = self._load_nllb(model_name)
+        backend, loaded = self._load_nllb(model_name)
+
+        if backend == "ct2":
+            tokenizer = self._load_nllb_tokenizer()
+            tokenizer.src_lang = nllb_lang(source_code)
+            source_tokens = [tokenizer.convert_ids_to_tokens(tokenizer.encode(text)) for text in texts]
+            settings = build_resource_settings(self.resource_mode)
+            results = loaded.translate_batch(  # type: ignore[attr-defined]
+                source_tokens,
+                target_prefix=[["kor_Hang"] for _ in source_tokens],
+                beam_size=4 if self.preferred != "accurate" else 5,
+                max_decoding_length=300,
+                max_batch_size=settings.translation_batch_size,
+            )
+
+            translated: list[str] = []
+            for item in results:
+                tokens = list(item.hypotheses[0]) if item.hypotheses else []
+                if tokens and tokens[0] == "kor_Hang":
+                    tokens = tokens[1:]
+                token_ids = tokenizer.convert_tokens_to_ids(tokens)
+                translated.append(tokenizer.decode(token_ids, skip_special_tokens=True).strip())
+            return translated
+
+        pipeline = loaded
 
         results = pipeline(
             texts,
             src_lang=nllb_lang(source_code),
             tgt_lang="kor_Hang",
             max_length=300,
+            batch_size=build_resource_settings(self.resource_mode).translation_batch_size,
         )
 
         translated: list[str] = []
@@ -620,6 +1502,7 @@ class FileSubtitleWorkflow:
 
             on_progress(55)
             on_line("한국어로 번역하는 중 ...")
+            on_line(f"번역 자원 사용: {self.translator.resource_summary()}")
             translated = self.translator.translate_texts([s.text for s in segments], source_language)
             if len(translated) != len(segments):
                 translated = translated + ["" for _ in range(len(segments) - len(translated))]
@@ -1180,6 +2063,7 @@ class ScreenRecorderService:
             self._cleanup()
             emit("busy_record", False)
             emit("status", "대기 중")
+            emit("eta_status", "대기 중")
 
     def _finish_video_process(self, timeout: float) -> int | None:
         process = self._video_process
@@ -1347,8 +2231,7 @@ class PapaStopApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("980x700")
-        self.minsize(900, 680)
+        self._configure_main_window()
 
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
 
@@ -1372,22 +2255,112 @@ class PapaStopApp(tk.Tk):
         self._is_record_running = False
         self._is_asr_preparing = False
         self._is_translation_preparing = False
+        self.progress_started_at: float | None = None
 
         self._build_ui()
         self._refresh_status()
+        self._refresh_system_specs()
         self.after(80, self._process_events)
+
+    def _configure_main_window(self) -> None:
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        width = min(1120, max(980, screen_w - 80))
+        height = min(860, max(680, screen_h - 100))
+        x = max(0, (screen_w - width) // 2)
+        y = max(0, (screen_h - height) // 3)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.minsize(min(900, width), min(620, height))
+
+    def _create_scrollable_tab(self, notebook: ttk.Notebook) -> tuple[ttk.Frame, ttk.Frame]:
+        outer = ttk.Frame(notebook)
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def resize_scroll_area(_event: object | None = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def resize_inner_width(event: tk.Event) -> None:
+            canvas.itemconfigure(window_id, width=event.width)
+
+        def on_mousewheel(event: tk.Event) -> None:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        inner.bind("<Configure>", resize_scroll_area)
+        canvas.bind("<Configure>", resize_inner_width)
+        canvas.bind("<Enter>", lambda _event: canvas.bind_all("<MouseWheel>", on_mousewheel))
+        canvas.bind("<Leave>", lambda _event: canvas.unbind_all("<MouseWheel>"))
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        return outer, inner
 
     def _build_ui(self) -> None:
         root = self
-        nb = ttk.Notebook(root)
-        nb.pack(fill="both", expand=True, padx=12, pady=12)
+        root.grid_columnconfigure(0, weight=1)
+        root.grid_rowconfigure(0, weight=3)
+        root.grid_rowconfigure(1, weight=2)
 
-        self.file_tab = ttk.Frame(nb)
+        nb = ttk.Notebook(root)
+        nb.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
+
+        self.system_tab = ttk.Frame(nb)
+        self.file_tab_container, self.file_tab = self._create_scrollable_tab(nb)
         self.live_tab = ttk.Frame(nb)
         self.record_tab = ttk.Frame(nb)
-        nb.add(self.file_tab, text="파일 자막")
+        nb.add(self.system_tab, text="시스템 사양")
+        nb.add(self.file_tab_container, text="파일 자막")
         nb.add(self.live_tab, text="실시간 자막")
         nb.add(self.record_tab, text="화면 녹화")
+
+        self.system_cpu_var = tk.StringVar(value="확인 중 ...")
+        self.system_ram_var = tk.StringVar(value="확인 중 ...")
+        self.system_vga_var = tk.StringVar(value="확인 중 ...")
+        self.resource_mode_var = tk.StringVar(value=RESOURCE_MODE_LABELS[DEFAULT_RESOURCE_MODE])
+        self.resource_plan_var = tk.StringVar(value=build_resource_settings(DEFAULT_RESOURCE_MODE).summary)
+
+        system_frame = ttk.LabelFrame(self.system_tab, text="현재 PC 사양")
+        system_frame.pack(fill="x", padx=4, pady=(0, 8))
+
+        def add_system_row(label: str, variable: tk.StringVar) -> None:
+            row = ttk.Frame(system_frame)
+            row.pack(fill="x", padx=8, pady=6)
+            ttk.Label(row, text=label, width=12).pack(side="left", anchor="n")
+            tk.Message(
+                row,
+                textvariable=variable,
+                width=760,
+                bg=self.cget("bg"),
+                anchor="w",
+                justify="left",
+            ).pack(side="left", fill="x", expand=True)
+
+        add_system_row("CPU", self.system_cpu_var)
+        add_system_row("RAM", self.system_ram_var)
+        add_system_row("VGA", self.system_vga_var)
+
+        resource_row = ttk.Frame(system_frame)
+        resource_row.pack(fill="x", padx=8, pady=6)
+        ttk.Label(resource_row, text="자원 사용", width=12).pack(side="left", anchor="n")
+        self.resource_mode_combo = ttk.Combobox(
+            resource_row,
+            textvariable=self.resource_mode_var,
+            values=[RESOURCE_MODE_LABELS[key] for key in RESOURCE_MODE_ORDER],
+            state="readonly",
+            width=30,
+        )
+        self.resource_mode_combo.bind("<<ComboboxSelected>>", self._on_resource_mode_selected)
+        self.resource_mode_combo.current(RESOURCE_MODE_ORDER.index(DEFAULT_RESOURCE_MODE))
+        self.resource_mode_combo.pack(side="left", padx=(0, 8))
+        ttk.Label(resource_row, textvariable=self.resource_plan_var).pack(side="left", fill="x", expand=True)
+
+        ttk.Button(
+            self.system_tab,
+            text="사양 새로고침",
+            command=self._refresh_system_specs,
+        ).pack(anchor="w", padx=4, pady=6)
 
         # File tab
         self.file_path_var = tk.StringVar()
@@ -1481,7 +2454,7 @@ class PapaStopApp(tk.Tk):
         listbox_area.pack(side="left", fill="both", expand=True)
         self.file_listbox = tk.Listbox(
             listbox_area,
-            height=7,
+            height=5,
             selectmode="extended",
             exportselection=False,
         )
@@ -1537,7 +2510,7 @@ class PapaStopApp(tk.Tk):
         preview_frame.pack(fill="both", expand=True, pady=(8, 0))
         preview_area = ttk.Frame(preview_frame)
         preview_area.pack(fill="both", expand=True, padx=6, pady=6)
-        self.file_preview_text = tk.Text(preview_area, height=6, wrap="word")
+        self.file_preview_text = tk.Text(preview_area, height=4, wrap="word")
         preview_scroll = ttk.Scrollbar(preview_area, orient="vertical", command=self.file_preview_text.yview)
         self.file_preview_text.configure(yscrollcommand=preview_scroll.set)
         self.file_preview_text.pack(side="left", fill="both", expand=True)
@@ -1666,20 +2639,37 @@ class PapaStopApp(tk.Tk):
 
         # Bottom common
         common = ttk.LabelFrame(root, text="진행 상황과 작업 기록")
-        common.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        common.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
 
         self.progress_var = tk.DoubleVar(value=0)
         self.status_var = tk.StringVar(value="대기 중")
+        self.eta_var = tk.StringVar(value="예상 시간: 대기 중")
 
         ttk.Label(common, textvariable=self.status_var).pack(anchor="w", padx=8, pady=(6, 0))
+        ttk.Label(common, textvariable=self.eta_var).pack(anchor="w", padx=8, pady=(2, 0))
         self.progress = ttk.Progressbar(common, variable=self.progress_var, maximum=100)
         self.progress.pack(fill="x", padx=8, pady=6)
 
-        self.log_text = tk.Text(common, height=14, wrap="word")
+        self.log_text = tk.Text(common, height=8, wrap="word")
         self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
         self.log_text.configure(state="disabled")
 
         self._append_log("앱을 시작했습니다.")
+
+    def _begin_timed_progress(self) -> None:
+        self.progress_started_at = time.time()
+        self.progress_var.set(0)
+        self.eta_var.set("예상 시간: 계산 중")
+
+    def _update_eta(self, progress: float) -> None:
+        self.eta_var.set(build_eta_text(progress, self.progress_started_at))
+
+    def _set_eta_status(self, text: str) -> None:
+        self.eta_var.set(f"예상 시간: {text}")
+
+    def _refresh_resource_plan_label(self) -> None:
+        self.resource_plan_var.set(build_resource_settings(self._resource_mode_from_selection()).summary)
+
     def _append_log(self, msg: object) -> None:
         if self.log_text is None:
             return
@@ -1687,6 +2677,19 @@ class PapaStopApp(tk.Tk):
         self.log_text.insert("end", f"{time.strftime('%H:%M:%S')} {msg}\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    def _refresh_system_specs(self) -> None:
+        self.system_cpu_var.set("확인 중 ...")
+        self.system_ram_var.set("확인 중 ...")
+        self.system_vga_var.set("확인 중 ...")
+
+        def worker() -> None:
+            try:
+                self._emit("system_specs", collect_system_specs())
+            except Exception as exc:
+                self._emit("log", f"시스템 사양 확인 실패: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _clear_file_preview(self) -> None:
         self.file_preview_lines.clear()
@@ -1722,6 +2725,12 @@ class PapaStopApp(tk.Tk):
 
             if kind == "log":
                 self._append_log(payload)
+            elif kind == "system_specs":
+                specs = payload if isinstance(payload, dict) else {}
+                self.system_cpu_var.set(str(specs.get("cpu", "알 수 없음")))
+                self.system_ram_var.set(str(specs.get("ram", "알 수 없음")))
+                self.system_vga_var.set(str(specs.get("vga", "알 수 없음")))
+                self._refresh_resource_plan_label()
             elif kind == "status":
                 self.status_var.set(str(payload))
             elif kind == "file_status":
@@ -1737,7 +2746,12 @@ class PapaStopApp(tk.Tk):
             elif kind == "record_status":
                 self.record_status_var.set(str(payload))
             elif kind == "progress":
-                self.progress_var.set(float(payload))
+                progress = float(payload)
+                self.progress_var.set(progress)
+                self._update_eta(progress)
+            elif kind == "eta_status":
+                self.progress_started_at = None
+                self._set_eta_status(str(payload))
             elif kind == "output_path":
                 self.last_output = Path(str(payload))
                 self.output_path_var.set(str(self.last_output))
@@ -1757,10 +2771,16 @@ class PapaStopApp(tk.Tk):
                 self._set_record_busy(bool(payload))
             elif kind == "error":
                 self._append_log(payload)
+                if self.progress_started_at is not None:
+                    self.progress_started_at = None
+                    self._set_eta_status("계산 불가")
                 if self._is_live_running or self._is_file_running or self._is_record_running:
                     messagebox.showerror(APP_NAME, str(payload))
             elif kind == "done":
                 self._append_log(payload)
+                if self.progress_started_at is not None or self.progress_var.get() >= 100:
+                    self.progress_started_at = None
+                    self._set_eta_status("완료")
                 messagebox.showinfo(APP_NAME, str(payload))
             elif kind == "subtitle_output":
                 path = Path(str(payload))
@@ -1804,6 +2824,19 @@ class PapaStopApp(tk.Tk):
         if self._is_translation_preparing:
             self.prepare_translation_btn.configure(state="disabled")
             self.start_file_btn.configure(state="disabled")
+        self._refresh_resource_mode_control_state()
+
+    def _refresh_resource_mode_control_state(self) -> None:
+        if not hasattr(self, "resource_mode_combo"):
+            return
+        busy = (
+            self._is_file_running
+            or self._is_live_running
+            or self._is_record_running
+            or self._is_asr_preparing
+            or self._is_translation_preparing
+        )
+        self.resource_mode_combo.configure(state="disabled" if busy else "readonly")
 
     def _set_asr_preparing(self, preparing: bool) -> None:
         self._is_asr_preparing = preparing
@@ -1822,6 +2855,7 @@ class PapaStopApp(tk.Tk):
             self.start_file_btn.configure(state="disabled")
             self.start_live_btn.configure(state="disabled")
             self.start_record_btn.configure(state="disabled")
+        self._refresh_resource_mode_control_state()
 
     def _set_translation_preparing(self, preparing: bool) -> None:
         self._is_translation_preparing = preparing
@@ -1839,6 +2873,7 @@ class PapaStopApp(tk.Tk):
             self.start_file_btn.configure(state="disabled")
             self.start_live_btn.configure(state="disabled")
             self.start_record_btn.configure(state="disabled")
+        self._refresh_resource_mode_control_state()
 
     def _set_live_busy(self, busy: bool) -> None:
         self._is_live_running = busy
@@ -1847,6 +2882,7 @@ class PapaStopApp(tk.Tk):
         if not busy and self.overlay is not None:
             self.overlay.close()
             self.overlay = None
+        self._refresh_resource_mode_control_state()
 
     def _set_record_busy(self, busy: bool) -> None:
         self._is_record_running = busy
@@ -1859,6 +2895,7 @@ class PapaStopApp(tk.Tk):
             widget.configure(state=state)
         if self._is_asr_preparing or self._is_translation_preparing:
             self.start_record_btn.configure(state="disabled")
+        self._refresh_resource_mode_control_state()
 
     def _select_record_output(self) -> None:
         initial_path = Path(self.record_output_var.get().strip() or str(default_recording_path()))
@@ -1902,7 +2939,38 @@ class PapaStopApp(tk.Tk):
         tools.append("ffmpeg: " + ("정상" if find_ffmpeg() else "없음"))
         tools.append("음성 인식 모델: " + self.asr.model_label())
         tools.append("번역 방식: " + self.translator.profile_label())
+        tools.append("자원 사용: " + build_resource_settings(self._resource_mode_from_selection()).summary)
         self._append_log(" | ".join(tools))
+
+    def _resource_mode_id_from_label(self, label: str) -> str:
+        for key, value in RESOURCE_MODE_LABELS.items():
+            if value == label:
+                return key
+        return DEFAULT_RESOURCE_MODE
+
+    def _resource_mode_from_selection(self) -> str:
+        return self._resource_mode_id_from_label(self.resource_mode_var.get())
+
+    def _apply_resource_mode_from_selection(self) -> None:
+        mode = self._resource_mode_from_selection()
+        self.asr.set_resource_mode(mode)
+        self.translator.set_resource_mode(mode)
+        self._refresh_resource_plan_label()
+
+    def _on_resource_mode_selected(self, _event: object | None = None) -> None:
+        if (
+            self._is_file_running
+            or self._is_live_running
+            or self._is_asr_preparing
+            or self._is_translation_preparing
+        ):
+            current = self.asr.resource_mode
+            self.resource_mode_var.set(RESOURCE_MODE_LABELS.get(current, RESOURCE_MODE_LABELS[DEFAULT_RESOURCE_MODE]))
+            messagebox.showwarning(APP_NAME, "현재 작업이 끝난 뒤 자원 사용 방식을 바꿔 주세요.")
+            return
+
+        self._apply_resource_mode_from_selection()
+        self._append_log(f"자원 사용 방식을 바꿨습니다: {self.asr.resource_summary()}")
 
     def _whisper_model_id_from_label(self, label: str) -> str:
         for key, value in WHISPER_MODEL_LABELS.items():
@@ -1930,6 +2998,7 @@ class PapaStopApp(tk.Tk):
 
         model_name = self._whisper_model_from_selection()
         self.asr.set_model(model_name)
+        self._apply_resource_mode_from_selection()
         self._set_asr_preparing(True)
         self._emit("log", f"위스퍼 모델을 미리 다운로드하는 중입니다: {self.asr.model_label(model_name)}")
 
@@ -1938,7 +3007,13 @@ class PapaStopApp(tk.Tk):
                 self.asr.prepare_model(model_name)
                 self._emit(
                     "asr_prepare_done",
-                    {"ok": True, "message": f"위스퍼 모델 준비 완료: {self.asr.model_label(model_name)}"},
+                    {
+                        "ok": True,
+                        "message": (
+                            f"위스퍼 모델 준비 완료: {self.asr.model_label(model_name)} | "
+                            f"{self.asr.resource_summary()}"
+                        ),
+                    },
                 )
             except Exception as exc:
                 self._emit("error", str(exc))
@@ -1975,6 +3050,7 @@ class PapaStopApp(tk.Tk):
 
         profile = self._translation_profile_from_selection()
         self.translator.set_profile(profile)
+        self._apply_resource_mode_from_selection()
         self._set_translation_preparing(True)
         self._emit("log", f"번역 모델을 준비하는 중입니다: {self.translator.profile_label()}")
 
@@ -1983,7 +3059,13 @@ class PapaStopApp(tk.Tk):
                 self.translator.prepare_profile(profile)
                 self._emit(
                     "translation_prepare_done",
-                    {"ok": True, "message": f"번역 모델 준비 완료: {self.translator.profile_label(profile)}"},
+                    {
+                        "ok": True,
+                        "message": (
+                            f"번역 모델 준비 완료: {self.translator.profile_label(profile)} | "
+                            f"{self.translator.resource_summary()}"
+                        ),
+                    },
                 )
             except Exception as exc:
                 self._emit("error", str(exc))
@@ -2121,6 +3203,7 @@ class PapaStopApp(tk.Tk):
             return
 
         self.asr.set_model(self._whisper_model_from_selection())
+        self._apply_resource_mode_from_selection()
 
         media_sources = self._collect_batch_sources()
         if not media_sources:
@@ -2159,7 +3242,7 @@ class PapaStopApp(tk.Tk):
 
         self.file_cancel_event.clear()
         self._set_file_busy(True)
-        self.progress_var.set(0)
+        self._begin_timed_progress()
         self._clear_file_preview()
         self.batch_status_var.set(f"1/{total} 시작 중")
         self._batch_outputs = output_paths
@@ -2217,6 +3300,7 @@ class PapaStopApp(tk.Tk):
 
                 if self.file_cancel_event.is_set():
                     self._emit("progress", (saved_count / total) * 100)
+                    self._emit("eta_status", "중지됨")
                     self._emit("file_status", f"취소됨 ({saved_count}/{total})")
                     self._emit("status", "취소됨")
                 else:
@@ -2306,6 +3390,9 @@ class PapaStopApp(tk.Tk):
 
         self.record_cancel_event = threading.Event()
         self.record_cancel_event.clear()
+        self.progress_started_at = None
+        self.progress_var.set(0)
+        self._set_eta_status("녹화 중에는 표시하지 않음")
         self._emit("busy_record", True)
         self._emit("record_status", "시작 중 ...")
         self._emit("status", "화면 녹화 중")
@@ -2321,6 +3408,7 @@ class PapaStopApp(tk.Tk):
                 )
             except Exception as exc:
                 self._emit("error", str(exc))
+                self._emit("eta_status", "대기 중")
                 self._emit("busy_record", False)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -2344,6 +3432,7 @@ class PapaStopApp(tk.Tk):
             return
 
         self.asr.set_model(self._whisper_model_from_selection())
+        self._apply_resource_mode_from_selection()
 
         live_source = self.live_source_var.get()
         live_url = self.live_url_var.get().strip() if live_source == LIVE_SOURCE_URL else ""
@@ -2365,6 +3454,9 @@ class PapaStopApp(tk.Tk):
 
         self.live_cancel_event = threading.Event()
         self.live_cancel_event.clear()
+        self.progress_started_at = None
+        self.progress_var.set(0)
+        self._set_eta_status("실시간 작업은 표시하지 않음")
         self._emit("busy_live", True)
         self._emit("live_status", "연결 중 ...")
         self._emit("status", "실시간 자막")
@@ -2382,6 +3474,7 @@ class PapaStopApp(tk.Tk):
                 )
             except Exception as exc:
                 self._emit("error", str(exc))
+                self._emit("eta_status", "대기 중")
                 self._emit("busy_live", False)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -2398,6 +3491,7 @@ class PapaStopApp(tk.Tk):
         self._emit("busy_live", False)
         self._emit("live_status", "대기 중")
         self._emit("status", "대기 중")
+        self._emit("eta_status", "대기 중")
 
     def _open_output(self) -> None:
         if self.last_output is None or not self.last_output.exists():

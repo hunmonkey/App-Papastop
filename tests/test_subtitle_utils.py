@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -9,12 +10,19 @@ from papastop import (
     ASREngine,
     OperationCancelled,
     SubtitleSegment,
+    build_eta_text,
+    build_resource_settings,
     build_subtitle_overwrite_prompt,
     clean_text_for_srt,
     default_srt_path,
+    format_bytes_as_gib,
+    format_duration_short,
     format_srt_time,
+    format_vga_spec,
     is_http_media_source,
+    merge_vga_specs,
     nllb_lang,
+    parse_nvidia_smi_csv,
     save_float_audio_to_wav,
     source_stem,
     source_stem_from_url,
@@ -24,7 +32,7 @@ from papastop import (
 
 
 class FakeASREngine(ASREngine):
-    def _load_model(self):
+    def _load_model(self, on_line=None):
         self._model = SimpleNamespace(
             transcribe=lambda *_args, **_kwargs: (
                 [
@@ -104,6 +112,48 @@ class SubtitleUtilityTests(unittest.TestCase):
     def test_operation_cancelled(self):
         with self.assertRaises(OperationCancelled):
             raise OperationCancelled("cancelled")
+
+    def test_system_spec_formatters(self):
+        self.assertEqual(format_bytes_as_gib(8 * 1024**3), "8.0 GB")
+        self.assertEqual(format_bytes_as_gib(None), "알 수 없음")
+        self.assertEqual(
+            format_vga_spec("NVIDIA RTX", 12 * 1024**3, "1.2.3"),
+            "NVIDIA RTX (VRAM 12.0 GB, 드라이버 1.2.3)",
+        )
+
+    def test_nvidia_smi_parser_and_vga_merge(self):
+        parsed = parse_nvidia_smi_csv("NVIDIA RTX, 16303, 610.47\n")
+
+        self.assertEqual(parsed, [("NVIDIA RTX", 16303 * 1024 * 1024, "610.47")])
+        self.assertEqual(
+            merge_vga_specs(
+                ["NVIDIA RTX (VRAM 15.9 GB, 드라이버 610.47)"],
+                ["NVIDIA RTX (VRAM 15.6 GB)", "Intel UHD (VRAM 1.0 GB)"],
+            ),
+            ["NVIDIA RTX (VRAM 15.9 GB, 드라이버 610.47)", "Intel UHD (VRAM 1.0 GB)"],
+        )
+
+    def test_eta_text_uses_progress_speed(self):
+        self.assertEqual(format_duration_short(65), "1분 5초")
+        self.assertEqual(build_eta_text(0, 1000, 1060), "예상 시간: 계산 중")
+        self.assertIn("약 1분 0초 남음", build_eta_text(50, 1000, 1060))
+        self.assertEqual(build_eta_text(100, 1000, 1060), "예상 시간: 완료")
+
+    def test_max_resource_settings_use_gpu_and_all_cpu_threads(self):
+        with (
+            mock.patch("papastop.os.cpu_count", return_value=8),
+            mock.patch("papastop.get_primary_cuda_vram_bytes", return_value=16 * 1024**3),
+            mock.patch("papastop.get_ctranslate2_cuda_available", return_value=True),
+            mock.patch("papastop.get_ctranslate2_compute_types", return_value={"float16", "int8_float16"}),
+            mock.patch("papastop.get_torch_cuda_available", return_value=False),
+            mock.patch("papastop.has_module", return_value=True),
+        ):
+            settings = build_resource_settings("max")
+
+        self.assertEqual(settings.cpu_threads, 8)
+        self.assertEqual(settings.asr_device, "cuda")
+        self.assertEqual(settings.asr_compute_type, "float16")
+        self.assertEqual(settings.translation_device, -1)
 
     def test_asr_transcribe_emits_segments_for_preview(self):
         engine = FakeASREngine()
