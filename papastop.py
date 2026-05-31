@@ -437,10 +437,10 @@ def build_resource_settings(mode: str | None = None) -> ResourceSettings:
     translation_ct2_device = "cuda" if asr_cuda else "cpu"
     if translation_ct2_device == "cuda":
         cuda_types = get_ctranslate2_compute_types("cuda")
-        if "float16" in cuda_types and (vram_bytes is None or vram_bytes >= 8 * 1024**3):
-            translation_ct2_compute_type = "float16"
-        elif "int8_float16" in cuda_types:
+        if "int8_float16" in cuda_types:
             translation_ct2_compute_type = "int8_float16"
+        elif "float16" in cuda_types:
+            translation_ct2_compute_type = "float16"
         else:
             translation_ct2_compute_type = "default"
     else:
