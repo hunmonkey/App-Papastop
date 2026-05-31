@@ -1,161 +1,130 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
 
 from papastop import (
-    SubtitleBlock,
-    convert_srt_text,
-    convert_subtitle_file,
-    ensure_subtitle_extension,
-    float_audio_to_pcm16_bytes,
-    format_timestamp,
-    format_duration_short,
-    format_file_size,
-    ensure_not_cancelled,
-    language_code_from_display,
-    language_display,
-    media_files_in_folder,
+    ASREngine,
     OperationCancelled,
-    offset_subtitle_rows,
-    parse_srt_blocks,
-    recommend_transcribe_settings,
-    render_srt,
-    render_srt_blocks,
+    SubtitleSegment,
+    build_subtitle_overwrite_prompt,
+    clean_text_for_srt,
+    default_srt_path,
+    format_srt_time,
+    is_http_media_source,
+    nllb_lang,
+    save_float_audio_to_wav,
+    source_stem,
+    source_stem_from_url,
+    write_pcm16_to_wav,
+    write_srt,
 )
 
 
-class SubtitleUtilityTests(unittest.TestCase):
-    def test_format_timestamp(self):
-        self.assertEqual(format_timestamp(0), "00:00:00,000")
-        self.assertEqual(format_timestamp(3661.25), "01:01:01,250")
-
-    def test_render_srt(self):
-        rendered = render_srt([(0, 1.5, "  Hello   PapaStop  ")])
-        self.assertEqual(rendered, "1\n00:00:00,000 --> 00:00:01,500\nHello PapaStop\n")
-
-    def test_parse_and_render_blocks(self):
-        source = "1\n00:00:00,000 --> 00:00:01,000\nHello\n\n"
-        blocks = parse_srt_blocks(source)
-        self.assertEqual(blocks, [SubtitleBlock("1", "00:00:00,000 --> 00:00:01,000", ["Hello"])])
-        self.assertEqual(render_srt_blocks(blocks), "1\n00:00:00,000 --> 00:00:01,000\nHello\n")
-
-    def test_convert_srt_to_vtt(self):
-        source = "1\n00:00:00,000 --> 00:00:01,000\nHello\n"
-        self.assertEqual(convert_srt_text(source, "vtt"), "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n")
-
-    def test_convert_srt_to_text(self):
-        source = (
-            "1\n00:00:00,000 --> 00:00:01,000\nHello\nworld\n\n"
-            "2\n00:00:01,000 --> 00:00:02,000\nPapaStop\n"
-        )
-        self.assertEqual(convert_srt_text(source, "txt"), "Hello world\n\nPapaStop\n")
-
-    def test_convert_subtitle_file_adds_extension(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            source_path = temp_path / "sample.srt"
-            target_path = temp_path / "sample-converted"
-            source_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
-
-            saved_path = convert_subtitle_file(
-                source_path,
-                target_path,
-                "txt",
-                on_line=lambda _line: None,
-                on_progress=lambda _value: None,
-            )
-
-            self.assertEqual(saved_path, temp_path / "sample-converted.txt")
-            self.assertEqual(saved_path.read_text(encoding="utf-8"), "Hello\n")
-
-    def test_convert_subtitle_file_writes_vtt(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            source_path = temp_path / "sample.srt"
-            target_path = temp_path / "sample-web"
-            source_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
-
-            saved_path = convert_subtitle_file(
-                source_path,
-                target_path,
-                "vtt",
-                on_line=lambda _line: None,
-                on_progress=lambda _value: None,
-            )
-
-            self.assertEqual(saved_path, temp_path / "sample-web.vtt")
-            self.assertEqual(
-                saved_path.read_text(encoding="utf-8"),
-                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n",
-            )
-
-    def test_ensure_subtitle_extension(self):
-        self.assertEqual(ensure_subtitle_extension(Path("sample"), "vtt"), Path("sample.vtt"))
-        self.assertEqual(ensure_subtitle_extension(Path("sample.srt"), "srt"), Path("sample.srt"))
-
-    def test_recommend_gpu_settings(self):
-        settings, _reason = recommend_transcribe_settings(["NVIDIA Test GPU"])
-        self.assertEqual(settings["device"], "cuda")
-        self.assertEqual(settings["compute"], "float16")
-
-    def test_recommend_cpu_settings(self):
-        settings, _reason = recommend_transcribe_settings([])
-        self.assertEqual(settings["device"], "cpu")
-        self.assertEqual(settings["compute"], "int8")
-
-    def test_language_display_round_trip(self):
-        self.assertEqual(language_display("en"), "영어")
-        self.assertEqual(language_code_from_display("영어"), "en")
-        self.assertEqual(language_code_from_display("자동 감지"), "auto")
-
-    def test_format_file_size(self):
-        self.assertEqual(format_file_size(500), "500 B")
-        self.assertEqual(format_file_size(1536), "1.5 KB")
-
-    def test_format_duration_short(self):
-        self.assertEqual(format_duration_short(5), "5초")
-        self.assertEqual(format_duration_short(65), "1분 5초")
-        self.assertEqual(format_duration_short(3661), "1시간 1분")
-
-    def test_float_audio_to_pcm16_bytes(self):
-        import numpy as np
-
-        payload, channels, frames = float_audio_to_pcm16_bytes(
-            np.array(
+class FakeASREngine(ASREngine):
+    def _load_model(self):
+        self._model = SimpleNamespace(
+            transcribe=lambda *_args, **_kwargs: (
                 [
-                    [-2.0, 0.0],
-                    [0.5, 1.0],
+                    SimpleNamespace(start=0.0, end=1.0, text=" first line "),
+                    SimpleNamespace(start=1.0, end=2.0, text="second line"),
                 ],
-                dtype=np.float32,
+                SimpleNamespace(language="en"),
             )
         )
 
-        self.assertEqual(channels, 2)
-        self.assertEqual(frames, 2)
-        self.assertEqual(len(payload), 8)
 
-    def test_offset_subtitle_rows(self):
-        self.assertEqual(
-            offset_subtitle_rows([(1.0, 2.5, "Hello")], 8.0),
-            [(9.0, 10.5, "Hello")],
+class SubtitleUtilityTests(unittest.TestCase):
+    def test_format_srt_time(self):
+        self.assertEqual(format_srt_time(0.0), "00:00:00,000")
+        self.assertEqual(format_srt_time(3661.25), "01:01:01,250")
+
+    def test_clean_text_for_srt(self):
+        self.assertEqual(clean_text_for_srt("  Hello     world  "), "Hello world")
+
+    def test_write_srt_filters_empty_lines_and_indexes(self):
+        output = Path(tempfile.gettempdir()) / "papastop_test.srt"
+        segments = [
+            SubtitleSegment(0.0, 1.0, "  첫 번째  줄  "),
+            SubtitleSegment(1.5, 2.0, "   "),
+        ]
+        write_srt(segments, output)
+        try:
+            text = output.read_text(encoding="utf-8")
+            self.assertIn("1\n00:00:00,000 --> 00:00:01,000", text)
+            self.assertNotIn("\n2\n", text)
+            self.assertIn("첫 번째 줄", text)
+        finally:
+            if output.exists():
+                output.unlink()
+
+    def test_default_srt_path_url_and_file(self):
+        self.assertEqual(default_srt_path("https://example.com/sample.mp4").name, "sample.srt")
+        self.assertEqual(default_srt_path("https://example.com/stream", Path("out")).name, "stream.srt")
+        self.assertEqual(default_srt_path("movie_clip.mp4", Path("tmp_out")).name, "movie_clip.srt")
+
+    def test_subtitle_overwrite_prompt_names_existing_subtitles(self):
+        prompt = build_subtitle_overwrite_prompt([Path("movie.srt"), Path("clip.srt")])
+
+        self.assertIn("같은 이름의 자막 파일", prompt)
+        self.assertIn("movie.srt", prompt)
+        self.assertIn("clip.srt", prompt)
+        self.assertIn("덮어쓸까요?", prompt)
+
+    def test_is_http_media_source(self):
+        self.assertTrue(is_http_media_source("https://example.com/video"))
+        self.assertTrue(is_http_media_source("rtsp://camera.local/stream"))
+        self.assertFalse(is_http_media_source("C:\\\\music\\\\song.mp3"))
+
+    def test_source_stem_and_lang_map(self):
+        self.assertEqual(source_stem("/media/song.mp3"), "song")
+        self.assertEqual(source_stem("https://example.com/media/file.webm"), "file")
+        self.assertEqual(source_stem_from_url("https://example.com/media/file.webm?x=1"), "file")
+        self.assertEqual(source_stem_from_url("rtsp://host/stream"), "stream")
+        self.assertEqual(nllb_lang("EN-US"), "eng_Latn")
+        self.assertEqual(nllb_lang(None), "eng_Latn")
+
+    def test_write_pcm16_to_wav(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "pcm.wav"
+            write_pcm16_to_wav(b"\x00\x00\xff\xff", 16_000, output)
+            self.assertTrue(output.exists())
+            self.assertGreater(output.stat().st_size, 0)
+
+    def test_save_float_audio_to_wav(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "float.wav"
+            audio = np.array([[0.1, -0.2], [0.4, -0.4]], dtype=np.float32)
+            save_float_audio_to_wav(audio, 16_000, output)
+            self.assertTrue(output.exists())
+            self.assertGreater(output.stat().st_size, 0)
+
+    def test_operation_cancelled(self):
+        with self.assertRaises(OperationCancelled):
+            raise OperationCancelled("cancelled")
+
+    def test_asr_transcribe_emits_segments_for_preview(self):
+        engine = FakeASREngine()
+        preview_segments = []
+
+        segments, language = engine.transcribe(
+            Path("fake.wav"),
+            on_segment=preview_segments.append,
         )
 
-    def test_media_files_in_folder(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            mp4_path = temp_path / "video.mp4"
-            aac_path = temp_path / "sound.aac"
-            txt_path = temp_path / "note.txt"
-            mp4_path.write_bytes(b"mp4")
-            aac_path.write_bytes(b"aac")
-            txt_path.write_text("not media", encoding="utf-8")
+        self.assertEqual(language, "en")
+        self.assertEqual([segment.text for segment in segments], ["first line", "second line"])
+        self.assertEqual([segment.text for segment in preview_segments], ["first line", "second line"])
 
-            self.assertEqual(media_files_in_folder(temp_path), [aac_path, mp4_path])
+    def test_asr_model_selection_changes_model_label_without_download(self):
+        engine = ASREngine()
 
-    def test_ensure_not_cancelled(self):
-        with self.assertRaises(OperationCancelled):
-            ensure_not_cancelled(lambda: True)
-        ensure_not_cancelled(lambda: False)
+        engine.set_model("small")
+
+        self.assertEqual(engine.model_name, "small")
+        self.assertEqual(engine.model_label(), "균형 (small)")
 
 
 if __name__ == "__main__":

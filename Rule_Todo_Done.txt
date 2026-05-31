@@ -236,3 +236,18 @@ AI 작업 인수인계용 진행 기록 / To-Do Done
   검증:
    · .venv\Scripts\python.exe -m py_compile papastop.py 통과.
    · .venv\Scripts\python.exe -m unittest discover -s tests -v: 17개 테스트 통과.
+
+------------------------------------------------------------
+[완료] 1-1. 실시간 번역 시작 오류 0x800401f0 수정  (2026-05-31 18:48:12)
+  어디: papastop.py
+  무엇/어떻게:
+   · initialize_windows_audio_thread() 추가: soundcard import 이후 Windows 백그라운드 작업 스레드에서 소리 장치를 사용할 수 있도록 COM 초기화 보정.
+   · record_system_audio(), make_live_pc_audio_subtitle()에서 soundcard를 불러온 뒤 오디오 스레드 초기화 보정을 수행하도록 변경.
+   · record_audio_chunk_to_wav(), record_system_audio()에서 soundcard의 "data discontinuity in recording" 경고가 콘솔을 도배하지 않도록 억제.
+   · friendly_error_message() 추가: 0x800401f0 오류가 다시 발생해도 사용자에게 원인 설명이 포함된 메시지를 표시.
+  검증:
+   · .venv\Scripts\python.exe -m py_compile papastop.py 통과.
+   · .venv\Scripts\python.exe -m unittest discover -s tests -v: 17개 테스트 통과.
+   · 백그라운드 thread에서 soundcard 기본 스피커 감지 확인: 스피커(Realtek USB Audio).
+   · .venv\Scripts\python.exe papastop.py --self-test logs\audio-thread-self-test.json 통과.
+   · 실제 사이트 재생 중 실시간 번역 재시도는 사용자 재생 환경이 필요해 미검증.

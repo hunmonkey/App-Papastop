@@ -1,182 +1,69 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import importlib.util
-import json
 import os
-import platform
 import queue
 import re
 import shutil
 import subprocess
-import sys
+import hashlib
 import tempfile
 import threading
 import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
+from urllib.parse import urlparse
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 
 APP_NAME = "PapaStop"
-SINGLE_INSTANCE_MUTEX_NAME = "Local\\PapaStop_Hunmonkey_AppPapastop_SingleInstance"
-_single_instance_handle: int | None = None
+APP_ROOT = Path(__file__).resolve().parent
+PAPASTOP_DATA = APP_ROOT / ".papastop_data"
+HF_HOME = PAPASTOP_DATA / "huggingface"
 
+DEFAULT_WHISPER_MODEL = "base"
+DEFAULT_SAMPLE_RATE = 16_000
+DEFAULT_CHUNK_SECONDS = 5.0
+DEFAULT_RECORD_SAMPLE_RATE = 48_000
+DEFAULT_RECORD_FPS = 30
 
-def is_frozen_app() -> bool:
-    return bool(getattr(sys, "frozen", False))
-
-
-def acquire_single_instance_lock() -> bool:
-    """Windows에서 PapaStop 창이 한 번만 열리도록 실행 잠금을 잡습니다."""
-    global _single_instance_handle
-
-    if os.name != "nt":
-        return True
-
-    import ctypes
-
-    kernel32 = ctypes.windll.kernel32
-    handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
-    last_error = kernel32.GetLastError()
-    if not handle:
-        return False
-
-    if last_error == 183:  # ERROR_ALREADY_EXISTS
-        kernel32.CloseHandle(handle)
-        return False
-
-    _single_instance_handle = handle
-    return True
-
-
-def release_single_instance_lock() -> None:
-    global _single_instance_handle
-
-    if os.name != "nt" or not _single_instance_handle:
-        return
-
-    import ctypes
-
-    ctypes.windll.kernel32.CloseHandle(_single_instance_handle)
-    _single_instance_handle = None
-
-
-def show_already_running_message() -> None:
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        messagebox.showinfo(APP_NAME, "PapaStop이 이미 실행 중입니다.\n이미 열린 창을 사용해 주세요.")
-    finally:
-        root.destroy()
-
-
-def app_dir() -> Path:
-    if is_frozen_app():
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-APP_DIR = app_dir()
-REQUIREMENTS_PATH = APP_DIR / "requirements.txt"
-# 모델·CUDA 라이브러리 등 무거운 데이터를 EXE 옆에 비압축으로 두는 외부 폴더입니다.
-# (EXE는 코드만 담아 가볍게 유지하고, 자주 바뀌는 모델은 이 폴더에서 교체합니다.)
-APP_CACHE_DIR = APP_DIR / ".papastop_data"
-HF_CACHE_DIR = APP_CACHE_DIR / "huggingface"
-
-ENGINE_PACKAGES = {
-    "faster-whisper": "faster_whisper",
-    "argostranslate": "argostranslate",
-    "imageio-ffmpeg": "imageio_ffmpeg",
-    "soundcard": "soundcard",
+WHISPER_MODEL_ORDER = ("tiny", "base", "small", "medium", "large-v3", "large-v3-turbo")
+WHISPER_MODEL_LABELS = {
+    "tiny": "매우 빠름 (tiny)",
+    "base": "기본 (base)",
+    "small": "균형 (small)",
+    "medium": "정확도 높음 (medium)",
+    "large-v3": "최고 정확도 (large-v3)",
+    "large-v3-turbo": "고정확도 빠름 (large-v3-turbo)",
 }
 
-WHISPER_MODEL_REPOS = {
-    "tiny": "Systran/faster-whisper-tiny",
-    "base": "Systran/faster-whisper-base",
-    "small": "Systran/faster-whisper-small",
-    "medium": "Systran/faster-whisper-medium",
-    "large-v3": "Systran/faster-whisper-large-v3",
-    "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
-    "distil-large-v3": "Systran/faster-distil-whisper-large-v3",
-}
-
-# NVIDIA 그래픽카드가 있을 때만 추가로 설치하는 GPU 가속 라이브러리입니다.
-# faster-whisper(CTranslate2)가 GPU에서 추론하려면 cuda-runtime/cuBLAS/cuDNN이 필요합니다.
-CUDA_RUNTIME_PACKAGES = [
-    "nvidia-cuda-runtime-cu12",
-    "nvidia-cublas-cu12",
-    "nvidia-cudnn-cu12",
+MEDIA_EXTS = [
+    "*.mp4",
+    "*.mkv",
+    "*.avi",
+    "*.mov",
+    "*.wmv",
+    "*.flv",
+    "*.webm",
+    "*.m4v",
+    "*.mp3",
+    "*.wav",
+    "*.m4a",
+    "*.aac",
+    "*.flac",
 ]
+MEDIA_EXT_SET = {ext.lower().removeprefix("*.") for ext in MEDIA_EXTS}
 
-MEDIA_FILE_TYPES = [
-    (
-        "Video and audio files",
-        "*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm *.m4v *.mp3 *.wav *.m4a *.aac *.flac",
-    ),
-    ("All files", "*.*"),
-]
+LIVE_SOURCE_SPEAKER = "speaker"
+LIVE_SOURCE_URL = "url"
 
-MEDIA_EXTENSIONS = {
-    ".mp4",
-    ".mkv",
-    ".avi",
-    ".mov",
-    ".wmv",
-    ".flv",
-    ".webm",
-    ".m4v",
-    ".mp3",
-    ".wav",
-    ".m4a",
-    ".aac",
-    ".flac",
-}
+URL_SCHEMES = {"http", "https", "rtmp", "rtmps", "rtsp"}
 
-SUBTITLE_FILE_TYPES = [("SRT subtitle", "*.srt"), ("All files", "*.*")]
-SUBTITLE_SAVE_TYPES = [
-    ("SRT subtitle", "*.srt"),
-    ("WebVTT subtitle", "*.vtt"),
-    ("Text file", "*.txt"),
-    ("All files", "*.*"),
-]
-
-SUBTITLE_FORMATS = {
-    "srt": "SRT",
-    "vtt": "WebVTT",
-    "txt": "TXT",
-}
-
-LANGUAGES = {
-    "auto": "자동 감지",
-    "ko": "한국어",
-    "en": "영어",
-    "ja": "일본어",
-    "zh": "중국어",
-    "es": "스페인어",
-    "fr": "프랑스어",
-    "de": "독일어",
-    "it": "이탈리아어",
-    "pt": "포르투갈어",
-    "ru": "러시아어",
-}
-
-TRANSLATION_LANGUAGES = {key: value for key, value in LANGUAGES.items() if key != "auto"}
-
-# 번역 엔진: argos(가벼움·빠름), nllb(고품질·GPU)
-TRANSLATION_ENGINES = {
-    "argos": "Argos (가벼움·빠름)",
-    "nllb": "NLLB (고품질)",
-}
-
-# NLLB(ctranslate2) 모델 위치와 FLORES-200 언어 코드 매핑
-# 정확도 최우선: 증류판 1.3B 대신 정식 3.3B를 float16(16비트)로 사용합니다.
-NLLB_MODEL_NAME = "facebook/nllb-200-3.3B"
-NLLB_MODEL_DIR = APP_CACHE_DIR / "nllb-200-3.3B-ct2"
-NLLB_LANGUAGE_CODES = {
+NLLB_LANGUAGE_MAP = {
     "ko": "kor_Hang",
     "en": "eng_Latn",
     "ja": "jpn_Jpan",
@@ -189,12 +76,29 @@ NLLB_LANGUAGE_CODES = {
     "ru": "rus_Cyrl",
 }
 
+NLLB_FAST_MODEL = "facebook/nllb-200-distilled-600M"
+NLLB_ACCURATE_MODEL = "facebook/nllb-200-3.3B"
+
+TRANSLATION_PROFILE_ORDER = ("auto", "fast", "balanced", "accurate")
+TRANSLATION_PROFILE_LABELS = {
+    "auto": "자동 (NLLB 우선, 실패 시 Argos)",
+    "fast": "빠름 (Argos 번역)",
+    "balanced": "균형 (NLLB distilled)",
+    "accurate": "정확도 우선 (NLLB 3.3B)",
+}
+TRANSLATION_PROFILE_ORDER_STEPS = {
+    "auto": (("nllb", NLLB_FAST_MODEL), ("argos", None)),
+    "fast": (("argos", None),),
+    "balanced": (("nllb", NLLB_FAST_MODEL),),
+    "accurate": (("nllb", NLLB_ACCURATE_MODEL), ("nllb", NLLB_FAST_MODEL)),
+}
+
 
 @dataclass
-class SubtitleBlock:
-    index: str
-    timing: str
-    lines: list[str]
+class SubtitleSegment:
+    start: float
+    end: float
+    text: str
 
 
 class OperationCancelled(RuntimeError):
@@ -211,72 +115,7 @@ def windows_creation_flags() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def is_running_in_venv() -> bool:
-    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
-
-
-def install_target_label() -> str:
-    if is_frozen_app():
-        return "EXE 패키지 내부"
-    if is_running_in_venv():
-        return "프로젝트 전용 가상환경"
-    return "현재 Windows 사용자 Python 폴더"
-
-
-def prepare_model_cache_environment() -> None:
-    HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR / "home"))
-    os.environ.setdefault("HF_HUB_CACHE", str(HF_CACHE_DIR / "hub"))
-    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
-    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-
-
-def prepare_cuda_library_path() -> None:
-    """faster-whisper(CTranslate2)가 GPU에서 cuda-runtime/cuBLAS/cuDNN을 찾도록
-    설치된 nvidia 라이브러리 폴더를 DLL 검색 경로에 추가합니다.
-    Windows에서는 PATH 등록이 있어야 GPU 추론이 정상 동작합니다.
-    개발 환경(venv)과 EXE 패키지(frozen) 양쪽을 모두 지원합니다."""
-    roots: list[Path] = []
-
-    try:
-        import nvidia
-
-        roots.extend(Path(path) for path in getattr(nvidia, "__path__", []))
-    except ImportError:
-        pass
-
-    # EXE 배포에서는 nvidia 라이브러리를 exe 옆 .papastop_data\nvidia 폴더에 비압축으로 둡니다.
-    external_nvidia = APP_CACHE_DIR / "nvidia"
-    if external_nvidia.is_dir():
-        roots.append(external_nvidia)
-
-    bin_dirs: list[str] = []
-    for root in roots:
-        for component in ("cuda_runtime", "cublas", "cudnn", "cuda_nvrtc"):
-            bin_dir = str(root / component / "bin")
-            if (root / component / "bin").is_dir() and bin_dir not in bin_dirs:
-                bin_dirs.append(bin_dir)
-
-    if not bin_dirs:
-        return
-
-    current_path = os.environ.get("PATH", "")
-    missing = [bin_dir for bin_dir in bin_dirs if bin_dir not in current_path]
-    if missing:
-        os.environ["PATH"] = os.pathsep.join(missing) + os.pathsep + current_path
-
-    for bin_dir in bin_dirs:
-        try:
-            os.add_dll_directory(bin_dir)
-        except OSError:
-            pass
-
-
-def run_command(
-    command: list[str],
-    on_line: Callable[[str], None] | None = None,
-    cwd: Path | None = None,
-) -> int:
+def run_command(command: list[str], on_line: Callable[[str], None] | None = None, cwd: Path | None = None) -> None:
     process = subprocess.Popen(
         command,
         cwd=str(cwd) if cwd else None,
@@ -293,13 +132,14 @@ def run_command(
         if on_line:
             on_line(line.rstrip())
 
-    return process.wait()
+    if process.wait() != 0:
+        raise RuntimeError(f"명령 실행에 실패했습니다: {' '.join(command)}")
 
 
 def find_ffmpeg() -> str | None:
-    system_ffmpeg = shutil.which("ffmpeg")
-    if system_ffmpeg:
-        return system_ffmpeg
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
 
     if has_module("imageio_ffmpeg"):
         try:
@@ -312,18 +152,58 @@ def find_ffmpeg() -> str | None:
     return None
 
 
-def unique_timestamped_path(output_dir: Path, stem: str, suffix: str) -> Path:
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    candidate = output_dir / f"{stem}-{timestamp}{suffix}"
-    if not candidate.exists():
-        return candidate
+def ensure_cache_dirs() -> None:
+    HF_HOME.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_HOME", str(HF_HOME / "home"))
+    os.environ.setdefault("HF_HUB_CACHE", str(HF_HOME / "hub"))
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
-    for index in range(2, 1000):
-        numbered = output_dir / f"{stem}-{timestamp}-{index}{suffix}"
-        if not numbered.exists():
-            return numbered
 
-    raise RuntimeError("저장할 파일 이름을 만들지 못했습니다. 잠시 뒤 다시 시도해 주세요.")
+def format_srt_time(total_seconds: float) -> str:
+    milliseconds = max(0, int(round(total_seconds * 1000)))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def clean_text_for_srt(text: str) -> str:
+    fixed = re.sub(r"\s+", " ", text.strip())
+    return fixed
+
+
+def default_recording_path(output_dir: Path | None = None) -> Path:
+    folder = output_dir if output_dir is not None else PAPASTOP_DATA / "recordings"
+    return folder / f"screen-{time.strftime('%Y%m%d-%H%M%S')}.mkv"
+
+
+def build_lossless_screen_capture_command(ffmpeg: str, output_path: Path, fps: int) -> list[str]:
+    return [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "gdigrab",
+        "-framerate",
+        str(max(1, fps)),
+        "-draw_mouse",
+        "1",
+        "-i",
+        "desktop",
+        "-an",
+        "-c:v",
+        "ffv1",
+        "-level",
+        "3",
+        "-g",
+        "1",
+        "-pix_fmt",
+        "bgra",
+        str(output_path),
+    ]
 
 
 def float_audio_to_pcm16_bytes(audio: object) -> tuple[bytes, int, int]:
@@ -336,3449 +216,2207 @@ def float_audio_to_pcm16_bytes(audio: object) -> tuple[bytes, int, int]:
     if array.ndim == 1:
         array = array.reshape((-1, 1))
     elif array.ndim != 2:
-        raise RuntimeError("녹음된 소리 형식을 이해하지 못했습니다.")
+        raise RuntimeError(f"지원하지 않는 오디오 형식입니다: {array.ndim}차원")
 
-    clipped = np.clip(array, -1.0, 1.0)
-    pcm = (clipped * 32767).astype("<i2", copy=False)
-    frames, channels = pcm.shape
-    return pcm.tobytes(), int(channels), int(frames)
+    array = np.clip(array, -1.0, 1.0)
+    pcm = (array * 32767).astype("<i2", copy=False)
+    frames = int(pcm.shape[0])
+    channels = int(pcm.shape[1])
+    return pcm.tobytes(), channels, frames
 
 
-def record_audio_chunk_to_wav(
-    recorder: object,
-    output_path: Path,
-    duration_seconds: float,
-    should_stop: Callable[[], bool] | None = None,
-    sample_rate: int = 48000,
-) -> float:
-    frames_total = max(1, int(sample_rate * duration_seconds))
-    frames_per_chunk = max(1024, sample_rate // 2)
-    recorded_frames = 0
-    wav_file: wave.Wave_write | None = None
-    expected_channels: int | None = None
+def write_srt(segments: list[SubtitleSegment], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    for index, segment in enumerate(segments, start=1):
+        txt = clean_text_for_srt(segment.text)
+        if not txt:
+            continue
+        lines.append(str(index))
+        lines.append(f"{format_srt_time(segment.start)} --> {format_srt_time(segment.end)}")
+        lines.append(txt)
+        lines.append("")
 
-    try:
-        while recorded_frames < frames_total:
-            if should_stop and should_stop():
-                break
+    output_path.write_text("\n".join(lines), encoding="utf-8")
 
-            chunk_frames = min(frames_per_chunk, frames_total - recorded_frames)
-            data = recorder.record(numframes=chunk_frames)
-            pcm_bytes, channels, frame_count = float_audio_to_pcm16_bytes(data)
-            if frame_count == 0:
+
+def save_float_audio_to_wav(audio: object, sample_rate: int, output_path: Path) -> None:
+    pcm_bytes, channels, frames = float_audio_to_pcm16_bytes(audio)
+    if not pcm_bytes or frames == 0:
+        raise RuntimeError("비어 있는 오디오 조각입니다.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(output_path), "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+
+    if frames == 0:
+        raise RuntimeError("WAV 파일에 쓸 오디오가 없습니다.")
+
+
+def extract_audio(media_path: str, output_wav: Path, on_line: Callable[[str], None] | None = None) -> None:
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg가 없습니다. 설치한 뒤 다시 시도해 주세요.")
+
+    source = str(media_path)
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        source,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(DEFAULT_SAMPLE_RATE),
+        "-acodec",
+        "pcm_s16le",
+        str(output_wav),
+    ]
+    run_command(command, on_line=on_line)
+
+
+def nllb_lang(code: str | None) -> str:
+    if not code:
+        return "eng_Latn"
+    normalized = str(code).strip().lower().split("-")[0]
+    return NLLB_LANGUAGE_MAP.get(normalized, "eng_Latn")
+
+
+def is_http_media_source(source: str) -> bool:
+    parsed = urlparse(source.strip())
+    return bool(parsed.scheme and parsed.scheme.lower() in URL_SCHEMES and parsed.netloc)
+
+
+def source_stem_from_url(source: str) -> str:
+    parsed = urlparse(source.strip())
+    base = Path(parsed.path).stem
+    if base:
+        return base
+
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "_", parsed.netloc or "stream")
+    stamp = str(int(time.time()))
+    digest = hashlib.md5(source.encode("utf-8")).hexdigest()[:8]
+    return f"{safe_host}_{stamp}_{digest}"
+
+
+def source_stem(source: str) -> str:
+    if is_http_media_source(source):
+        return source_stem_from_url(source)
+    path = Path(source)
+    if not path.stem:
+        return "subtitle"
+    return path.stem
+
+
+def default_srt_path(source: str, output_dir: Path | None = None) -> Path:
+    stem_name = source_stem(source)
+    if output_dir is None:
+        if is_http_media_source(source):
+            return Path(f"{stem_name}.srt")
+        return Path(source).with_suffix(".srt")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if is_http_media_source(source):
+        return output_dir / f"{stem_name}.srt"
+    return output_dir / Path(source).with_suffix(".srt").name
+
+
+def build_subtitle_overwrite_prompt(paths: list[Path]) -> str:
+    shown = "\n".join(f"- {path.name}" for path in paths[:5])
+    hidden_count = max(0, len(paths) - 5)
+    hidden_text = f"\n...외 {hidden_count}개" if hidden_count else ""
+    return (
+        "같은 이름의 자막 파일이 이미 있습니다.\n\n"
+        f"{shown}{hidden_text}\n\n"
+        "덮어쓸까요?"
+    )
+
+
+def write_pcm16_to_wav(pcm_bytes: bytes, sample_rate: int, output_path: Path) -> None:
+    if not pcm_bytes:
+        raise RuntimeError("비어 있는 PCM 오디오 조각입니다.")
+
+    if len(pcm_bytes) % 2 != 0:
+        pcm_bytes = pcm_bytes[:-1]
+    if not pcm_bytes:
+        raise RuntimeError("비어 있는 PCM 오디오 조각입니다.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    frames = len(pcm_bytes) // 2
+    if frames <= 0:
+        raise RuntimeError("비어 있는 PCM 오디오 조각입니다.")
+
+    with wave.open(str(output_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+
+
+class ASREngine:
+    def __init__(self, model_name: str = DEFAULT_WHISPER_MODEL):
+        self.model_name = model_name
+        self._model = None
+        self._load_lock = threading.Lock()
+
+    def set_model(self, model_name: str) -> None:
+        chosen = model_name if model_name in WHISPER_MODEL_LABELS else DEFAULT_WHISPER_MODEL
+        with self._load_lock:
+            if chosen == self.model_name:
+                return
+            self.model_name = chosen
+            self._model = None
+
+    def prepare_model(self, model_name: str | None = None) -> None:
+        if model_name:
+            self.set_model(model_name)
+        self._load_model()
+
+    def model_label(self, model_name: str | None = None) -> str:
+        target = model_name or self.model_name
+        return WHISPER_MODEL_LABELS.get(target, target)
+
+    def _load_model(self):
+        if self._model is not None:
+            return
+
+        if not has_module("faster_whisper"):
+            raise RuntimeError("faster-whisper가 설치되어 있지 않습니다.")
+
+        with self._load_lock:
+            if self._model is not None:
+                return
+
+            from faster_whisper import WhisperModel
+            import torch
+
+            ensure_cache_dirs()
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            compute_type = "float16" if device == "cuda" else "int8"
+            self._model = WhisperModel(self.model_name, device=device, compute_type=compute_type)
+
+    def transcribe(
+        self,
+        audio_path: Path,
+        on_line=None,
+        should_stop: Callable[[], bool] | None = None,
+        on_segment: Callable[[SubtitleSegment], None] | None = None,
+    ) -> tuple[list[SubtitleSegment], str]:
+        self._load_model()
+        assert self._model is not None
+
+        if should_stop is not None and should_stop():
+            raise OperationCancelled("취소되었습니다.")
+
+        segments, info = self._model.transcribe(
+            str(audio_path),
+            language=None,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
+        )
+
+        detected_language = getattr(info, "language", "auto")
+        rows: list[SubtitleSegment] = []
+        for segment in segments:
+            if should_stop is not None and should_stop():
+                raise OperationCancelled("취소되었습니다.")
+
+            text = (segment.text or "").strip()
+            if not text:
+                continue
+            subtitle_segment = SubtitleSegment(
+                start=float(segment.start),
+                end=float(segment.end),
+                text=text,
+            )
+            rows.append(subtitle_segment)
+            if on_segment is not None:
+                on_segment(subtitle_segment)
+
+        if on_line:
+            on_line(f"감지된 언어: {detected_language}, 자막 줄 수={len(rows)}")
+
+        return rows, detected_language
+
+
+class TranslationEngine:
+    def __init__(self, preferred: str = "auto"):
+        self.preferred = preferred
+        self._nllb_pipelines: dict[str, object] = {}
+        self._pipeline_lock = threading.Lock()
+        self._prepare_lock = threading.Lock()
+
+    def set_profile(self, profile: str) -> None:
+        if profile not in TRANSLATION_PROFILE_ORDER_STEPS:
+            profile = "auto"
+        self.preferred = profile
+
+    def _profile_steps(self, profile: str | None = None) -> tuple[tuple[str, str | None], ...]:
+        selected = profile or self.preferred
+        return TRANSLATION_PROFILE_ORDER_STEPS.get(selected, TRANSLATION_PROFILE_ORDER_STEPS["auto"])
+
+    def prepare_profile(self, profile: str | None = None) -> None:
+        chosen = profile or self.preferred
+        if chosen not in TRANSLATION_PROFILE_ORDER_STEPS:
+            chosen = "auto"
+
+        with self._prepare_lock:
+            for engine, model_name in self._profile_steps(chosen):
+                if engine == "argos":
+                    if not has_module("argostranslate"):
+                        raise RuntimeError("Argos 번역 도구가 설치되어 있지 않습니다.")
+                    continue
+                if engine == "nllb":
+                    assert model_name is not None
+                    self._load_nllb(model_name)
+                else:
+                    raise RuntimeError(f"알 수 없는 번역 방식입니다: {engine}")
+
+    def _load_nllb(self, model_name: str):
+        if not has_module("transformers"):
+            raise RuntimeError("transformers가 설치되어 있지 않습니다.")
+
+        cached = self._nllb_pipelines.get(model_name)
+        if cached is not None:
+            return cached
+
+        with self._pipeline_lock:
+            cached = self._nllb_pipelines.get(model_name)
+            if cached is not None:
+                return cached
+
+            if not model_name:
+                raise RuntimeError("NLLB 모델 이름이 비어 있습니다.")
+            from transformers import pipeline
+            import torch
+
+            ensure_cache_dirs()
+            device = 0 if torch.cuda.is_available() else -1
+            pipeline_obj = pipeline(
+                "translation",
+                model=model_name,
+                device=device,
+            )
+            self._nllb_pipelines[model_name] = pipeline_obj
+            return pipeline_obj
+
+    def _translate_nllb(self, texts: list[str], source_code: str, model_name: str) -> list[str]:
+        if not texts:
+            return []
+        pipeline = self._load_nllb(model_name)
+
+        results = pipeline(
+            texts,
+            src_lang=nllb_lang(source_code),
+            tgt_lang="kor_Hang",
+            max_length=300,
+        )
+
+        translated: list[str] = []
+        for item in results:
+            if isinstance(item, dict):
+                translated.append(item.get("translation_text", "").strip())
+            elif isinstance(item, str):
+                translated.append(item.strip())
+            else:
+                translated.append(str(item).strip())
+
+        return translated
+
+    def _translate_argos(self, texts: list[str], source_code: str) -> list[str]:
+        if not has_module("argostranslate"):
+            raise RuntimeError("Argos 번역 도구가 설치되어 있지 않습니다.")
+        if not texts:
+            return []
+
+        import argostranslate.translate as argostranslate_translate
+
+        result: list[str] = []
+        target = "ko"
+        source = (source_code or "en").split("-")[0].lower()
+        for text in texts:
+            try:
+                result.append(argostranslate_translate.translate(text, source, target))
+            except Exception:
+                result.append(text)
+
+        return result
+
+    def translate_texts(self, texts: list[str], source_code: str) -> list[str]:
+        if not texts:
+            return []
+
+        for engine, model_name in self._profile_steps():
+            try:
+                if engine == "nllb":
+                    assert model_name is not None
+                    return self._translate_nllb(texts, source_code, model_name)
+                if engine == "argos":
+                    return self._translate_argos(texts, source_code)
+                raise RuntimeError(f"알 수 없는 번역 방식입니다: {engine}")
+            except Exception:
+                if self.preferred == "fast":
+                    raise
                 continue
 
-            if wav_file is None:
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                wav_file = wave.open(str(output_path), "wb")
-                wav_file.setnchannels(channels)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(sample_rate)
-                expected_channels = channels
-            elif channels != expected_channels:
-                raise RuntimeError("녹음 중 소리 채널 수가 바뀌어 WAV 파일을 저장하지 못했습니다.")
+        # fallback: no translation but keeps flow alive
+        return list(texts)
 
-            wav_file.writeframes(pcm_bytes)
-            recorded_frames += frame_count
-    finally:
-        if wav_file is not None:
-            wav_file.close()
-
-    return recorded_frames / sample_rate
+    def profile_label(self, profile: str | None = None) -> str:
+        target = profile or self.preferred
+        return TRANSLATION_PROFILE_LABELS.get(target, target)
 
 
-def transcribe_audio_chunk(
-    audio_path: Path,
-    model: object,
-    language_code: str,
-    beam_size: int,
-    should_stop: Callable[[], bool] | None = None,
-    precise: bool = False,
-) -> tuple[list[tuple[float, float, str]], str]:
-    ensure_not_cancelled(should_stop)
-    language_arg = None if language_code == "auto" else language_code
-    segments, info = model.transcribe(
-        str(audio_path),
-        language=language_arg,
-        beam_size=beam_size,
-        vad_filter=True,
-        condition_on_previous_text=False,
-        word_timestamps=precise,
-    )
-    detected_language = getattr(info, "language", None) or language_code or "audio"
-    rows: list[tuple[float, float, str]] = []
-    for segment in segments:
-        ensure_not_cancelled(should_stop)
-        start = float(segment.start)
-        end = float(segment.end)
-        if precise:
-            words = getattr(segment, "words", None) or []
-            word_starts = [w.start for w in words if w.start is not None]
-            word_ends = [w.end for w in words if w.end is not None]
-            if word_starts and word_ends:
-                start = float(word_starts[0])
-                end = float(word_ends[-1])
-        rows.append((start, end, str(segment.text)))
-    return rows, detected_language
+class FileSubtitleWorkflow:
+    def __init__(self, asr: ASREngine, translator: TranslationEngine):
+        self.asr = asr
+        self.translator = translator
 
+    def run(
+        self,
+        media_source: str,
+        output_srt: Path,
+        on_line: Callable[[str], None],
+        on_progress: Callable[[float], None],
+        should_stop: Callable[[], bool] | None = None,
+        on_segment: Callable[[SubtitleSegment], None] | None = None,
+    ) -> Path:
+        if should_stop is not None and should_stop():
+            raise OperationCancelled("취소되었습니다.")
 
-def offset_subtitle_rows(
-    rows: Iterable[tuple[float, float, str]],
-    offset_seconds: float,
-) -> list[tuple[float, float, str]]:
-    return [
-        (max(0.0, start + offset_seconds), max(0.0, end + offset_seconds), text)
-        for start, end, text in rows
-    ]
+        source = media_source.strip()
+        if not source:
+            raise RuntimeError("영상 또는 음성 파일을 선택해 주세요.")
 
+        with tempfile.TemporaryDirectory(prefix="papastop_file_") as temp_dir:
+            wav_path = Path(temp_dir) / "audio.wav"
+            on_progress(5)
+            on_line("오디오를 추출하는 중 ...")
+            extract_audio(source, wav_path, on_line=on_line)
 
-def record_system_audio(
-    output_dir: Path,
-    duration_seconds: int,
-    on_line: Callable[[str], None],
-    on_progress: Callable[[float], None],
-    should_stop: Callable[[], bool] | None = None,
-    sample_rate: int = 48000,
-) -> Path:
-    if duration_seconds <= 0:
-        raise RuntimeError("녹음 시간은 1초 이상으로 정해 주세요.")
-    if not has_module("soundcard"):
-        raise RuntimeError("PC 소리 녹음 도구(soundcard)가 설치되어 있지 않습니다. 먼저 엔진 설치를 눌러 주세요.")
+            if should_stop is not None and should_stop():
+                raise OperationCancelled("취소되었습니다.")
 
-    import soundcard as sc
-
-    ensure_not_cancelled(should_stop)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = unique_timestamped_path(output_dir, "pc-speaker", ".wav")
-
-    speaker = sc.default_speaker()
-    if speaker is None:
-        raise RuntimeError("기본 스피커를 찾지 못했습니다. Windows 소리 출력 장치를 먼저 확인해 주세요.")
-
-    on_line(f"기본 스피커 소리를 {duration_seconds}초 동안 녹음합니다: {speaker.name}")
-    on_line("브라우저 영상이나 PC 소리가 실제로 재생 중이어야 녹음됩니다.")
-
-    frames_total = sample_rate * duration_seconds
-    frames_per_chunk = max(1024, sample_rate // 2)
-    recorded_frames = 0
-    wav_file: wave.Wave_write | None = None
-    expected_channels: int | None = None
-
-    try:
-        loopback = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-        with loopback.recorder(samplerate=sample_rate) as recorder:
-            while recorded_frames < frames_total:
-                ensure_not_cancelled(should_stop)
-                chunk_frames = min(frames_per_chunk, frames_total - recorded_frames)
-                data = recorder.record(numframes=chunk_frames)
-                pcm_bytes, channels, frame_count = float_audio_to_pcm16_bytes(data)
-                if frame_count == 0:
-                    continue
-
-                if wav_file is None:
-                    wav_file = wave.open(str(output_path), "wb")
-                    wav_file.setnchannels(channels)
-                    wav_file.setsampwidth(2)
-                    wav_file.setframerate(sample_rate)
-                    expected_channels = channels
-                elif channels != expected_channels:
-                    raise RuntimeError("녹음 중 소리 채널 수가 바뀌어 WAV 파일을 저장하지 못했습니다.")
-
-                wav_file.writeframes(pcm_bytes)
-                recorded_frames += frame_count
-                on_progress(min(100, recorded_frames / frames_total * 100))
-    except OperationCancelled:
-        if wav_file is not None:
-            wav_file.close()
-            wav_file = None
-        try:
-            output_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-    finally:
-        if wav_file is not None:
-            wav_file.close()
-
-    if recorded_frames <= 0:
-        raise RuntimeError("녹음된 소리를 찾지 못했습니다. 영상이 재생 중인지와 Windows 출력 장치를 확인해 주세요.")
-
-    on_progress(100)
-    on_line(f"PC 소리 녹음 저장 완료: {output_path}")
-    return output_path
-
-
-def detect_nvidia_gpus() -> list[str]:
-    nvidia_smi = shutil.which("nvidia-smi")
-    if not nvidia_smi:
-        return []
-
-    try:
-        output = subprocess.check_output(
-            [
-                nvidia_smi,
-                "--query-gpu=name,memory.total,driver_version",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=windows_creation_flags(),
-            timeout=8,
-        )
-    except Exception:
-        return []
-
-    results: list[str] = []
-    for line in output.splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) < 2:
-            continue
-
-        name = parts[0]
-        memory_mb = parts[1]
-        driver = parts[2] if len(parts) >= 3 else ""
-
-        try:
-            memory_label = f"{float(memory_mb) / 1024:.1f} GB"
-        except ValueError:
-            memory_label = f"{memory_mb} MB"
-
-        label = f"{name} / {memory_label}"
-        if driver:
-            label += f" / 드라이버 {driver}"
-        results.append(label)
-
-    return results
-
-
-def check_engine_status(quick: bool = False) -> dict[str, str]:
-    status: dict[str, str] = {}
-
-    status["설치 위치"] = install_target_label()
-
-    for package_name, module_name in ENGINE_PACKAGES.items():
-        status[package_name] = "설치됨" if has_module(module_name) else "미설치"
-
-    if quick:
-        ffmpeg_path = shutil.which("ffmpeg")
-        if ffmpeg_path:
-            status["ffmpeg"] = ffmpeg_path
-        elif has_module("imageio_ffmpeg"):
-            status["ffmpeg"] = "설치됨"
-        else:
-            status["ffmpeg"] = "미설치"
-        status["nvidia"] = "확인 전"
-        return status
-
-    ffmpeg_path = find_ffmpeg()
-    status["ffmpeg"] = ffmpeg_path if ffmpeg_path else "미설치"
-    nvidia_gpus = detect_nvidia_gpus()
-    status["nvidia"] = " / ".join(nvidia_gpus) if nvidia_gpus else "미감지"
-
-    return status
-
-
-def install_python_engines(on_line: Callable[[str], None]) -> None:
-    if is_frozen_app():
-        missing_packages = [
-            package_name
-            for package_name, module_name in ENGINE_PACKAGES.items()
-            if not has_module(module_name)
-        ]
-        if missing_packages:
-            raise RuntimeError(
-                "EXE 패키지 안에서 엔진을 찾지 못했습니다. "
-                "배포 파일을 다시 압축 해제하거나 새 패키지를 받아 주세요."
+            on_progress(30)
+            on_line("음성을 글자로 바꾸는 중 ...")
+            segments, source_language = self.asr.transcribe(
+                wav_path,
+                on_line=on_line,
+                should_stop=should_stop,
+                on_segment=on_segment,
             )
 
-        on_line("EXE 패키지에는 필요한 엔진이 이미 포함되어 있습니다.")
-        on_line("별도 설치 없이 바로 자막 제작과 번역 기능을 사용할 수 있습니다.")
-        return
+            if not segments:
+                raise RuntimeError("인식할 수 있는 음성을 찾지 못했습니다.")
 
-    command = [sys.executable, "-m", "pip", "install", "--upgrade"]
+            on_progress(55)
+            on_line("한국어로 번역하는 중 ...")
+            translated = self.translator.translate_texts([s.text for s in segments], source_language)
+            if len(translated) != len(segments):
+                translated = translated + ["" for _ in range(len(segments) - len(translated))]
 
-    if not is_running_in_venv():
-        command.append("--user")
+            translated_segments: list[SubtitleSegment] = []
+            for original, text in zip(segments, translated):
+                if should_stop is not None and should_stop():
+                    raise OperationCancelled("취소되었습니다.")
+                subtitle_text = (text or original.text).strip()
+                if subtitle_text:
+                    translated_segments.append(
+                        SubtitleSegment(
+                            start=original.start,
+                            end=original.end,
+                            text=subtitle_text,
+                        )
+                    )
 
-    if REQUIREMENTS_PATH.exists():
-        command.extend(["-r", str(REQUIREMENTS_PATH)])
-    else:
-        command.extend(ENGINE_PACKAGES.keys())
+            on_progress(85)
+            on_line(f"SRT 저장: {output_srt}")
+            write_srt(translated_segments, output_srt)
 
-    if detect_nvidia_gpus():
-        command.extend(CUDA_RUNTIME_PACKAGES)
-        on_line("NVIDIA 그래픽카드가 감지되어 GPU 가속 라이브러리도 함께 설치합니다.")
-
-    on_line("Python 자막/번역 엔진 설치를 시작합니다.")
-    on_line(f"설치 위치: {install_target_label()}")
-    on_line(" ".join(command))
-    exit_code = run_command(command, on_line=on_line)
-
-    if exit_code != 0:
-        raise RuntimeError("엔진 설치 명령이 실패했습니다. 로그의 마지막 줄을 확인해 주세요.")
-
-    on_line("엔진 설치가 끝났습니다. 앱을 다시 실행하면 새 엔진을 더 안정적으로 인식합니다.")
+        on_progress(100)
+        return output_srt
 
 
-def run_powershell_json(command: str) -> object | None:
-    powershell = shutil.which("powershell") or shutil.which("pwsh")
-    if not powershell:
-        return None
+class LiveCaptionService:
+    def __init__(
+        self,
+        asr: ASREngine,
+        translator: TranslationEngine,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        chunk_seconds: float = DEFAULT_CHUNK_SECONDS,
+    ):
+        self.asr = asr
+        self.translator = translator
+        self.sample_rate = sample_rate
+        self.chunk_seconds = chunk_seconds
+        self.chunk_frames = int(sample_rate * chunk_seconds)
+        self._capture_thread: threading.Thread | None = None
+        self._worker_thread: threading.Thread | None = None
+        self._stop_event: threading.Event | None = None
+        self._chunk_queue: queue.Queue[tuple[int | None, Path | None]] | None = None
+        self._temp_dir: Path | None = None
+        self._ffmpeg_process: subprocess.Popen | None = None
+        self._source_url: str | None = None
+        self._loopback_recorder: object | None = None
 
-    script = (
-        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
-        "$OutputEncoding=[System.Text.Encoding]::UTF8; "
-        f"{command} | ConvertTo-Json -Depth 4"
-    )
+    def _is_running(self) -> bool:
+        return (
+            (self._capture_thread is not None and self._capture_thread.is_alive())
+            or (self._worker_thread is not None and self._worker_thread.is_alive())
+        )
 
-    try:
-        completed = subprocess.run(
-            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-            capture_output=True,
+    def start(
+        self,
+        emit: Callable[[str, object], None],
+        stop_event: threading.Event,
+        internet_url: str | None = None,
+    ) -> None:
+        if self._is_running():
+            raise RuntimeError("실시간 자막 기능이 이미 실행 중입니다.")
+
+        self._stop_event = stop_event
+        stop_event.clear()
+        self._chunk_queue = queue.Queue(maxsize=8)
+        self._temp_dir = Path(tempfile.mkdtemp(prefix="papastop_live_"))
+        self._source_url = internet_url.strip() if internet_url else None
+
+        if self._source_url:
+            capture_target = self._capture_from_url
+            capture_args = (self._source_url, emit, stop_event)
+        else:
+            capture_target = self._capture_loop
+            capture_args = (emit, stop_event)
+
+        self._capture_thread = threading.Thread(target=capture_target, args=capture_args, daemon=True)
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop,
+            args=(emit, stop_event),
+            daemon=True,
+        )
+
+        self._capture_thread.start()
+        self._worker_thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._ffmpeg_process is not None:
+            process = self._ffmpeg_process
+            self._ffmpeg_process = None
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=1)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+        loopback_recorder = self._loopback_recorder
+        if loopback_recorder is not None:
+            self._loopback_recorder = None
+            try:
+                loopback_recorder.close()
+            except Exception:
+                pass
+
+        if self._chunk_queue is not None:
+            try:
+                self._chunk_queue.put_nowait((None, None))
+            except queue.Full:
+                try:
+                    self._chunk_queue.get_nowait()
+                    self._chunk_queue.put_nowait((None, None))
+                except Exception:
+                    pass
+
+        if self._capture_thread is not None:
+            self._capture_thread.join(timeout=timeout)
+        if self._worker_thread is not None:
+            self._worker_thread.join(timeout=timeout)
+
+        self._capture_thread = None
+        self._worker_thread = None
+        self._stop_event = None
+        if self._chunk_queue is not None:
+            while True:
+                try:
+                    _, leftover = self._chunk_queue.get_nowait()
+                    if leftover and leftover.exists():
+                        try:
+                            leftover.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                except queue.Empty:
+                    break
+            self._chunk_queue = None
+
+        self._source_url = None
+
+        if self._temp_dir is not None:
+            try:
+                shutil.rmtree(self._temp_dir, ignore_errors=True)
+            except OSError:
+                pass
+            self._temp_dir = None
+
+    def _safe_put_chunk(self, item: tuple[int | None, Path | None]) -> None:
+        if self._chunk_queue is None:
+            return
+        try:
+            self._chunk_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self._chunk_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._chunk_queue.put_nowait(item)
+            except queue.Full:
+                pass
+
+    def _capture_loop(self, emit: Callable[[str, object], None], stop_event: threading.Event) -> None:
+        if os.name != "nt":
+            emit("error", "실시간 캡처는 Windows에서만 사용할 수 있습니다.")
+            self._safe_put_chunk((None, None))
+            return
+
+        if not has_module("soundcard"):
+            emit("error", "PC 소리 캡처 도구(soundcard)가 설치되어 있지 않습니다.")
+            self._safe_put_chunk((None, None))
+            return
+
+        import warnings
+
+        import soundcard as sc
+
+        try:
+            speaker = sc.default_speaker()
+            if speaker is None:
+                raise RuntimeError("기본 스피커를 찾지 못했습니다.")
+
+            emit("log", f"기본 스피커: {speaker.name}")
+            loopback = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+            with loopback.recorder(samplerate=self.sample_rate) as recorder:
+                self._loopback_recorder = recorder
+                try:
+                    chunk_index = 0
+                    while not stop_event.is_set():
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings(
+                                "ignore",
+                                message="data discontinuity in recording",
+                            )
+                            audio = recorder.record(numframes=self.chunk_frames)
+
+                        if stop_event.is_set():
+                            break
+                        if self._temp_dir is None:
+                            break
+                        if not getattr(audio, "size", 1):
+                            continue
+
+                        chunk_path = self._temp_dir / f"chunk-{chunk_index:06d}.wav"
+                        save_float_audio_to_wav(audio, self.sample_rate, chunk_path)
+                        self._safe_put_chunk((chunk_index, chunk_path))
+                        chunk_index += 1
+                finally:
+                    self._loopback_recorder = None
+        except OperationCancelled:
+            emit("log", "실시간 캡처가 취소되었습니다.")
+        except Exception as exc:
+            if stop_event.is_set():
+                emit("log", f"실시간 캡처가 중지되었습니다: {exc}")
+            else:
+                emit("error", f"실시간 캡처 오류: {exc}")
+        finally:
+            self._safe_put_chunk((None, None))
+
+    def _capture_from_url(
+        self,
+        url: str,
+        emit: Callable[[str, object], None],
+        stop_event: threading.Event,
+    ) -> None:
+        ffmpeg = find_ffmpeg()
+        if ffmpeg is None:
+            emit("error", "ffmpeg가 없어 인터넷 실시간 캡처를 사용할 수 없습니다.")
+            self._safe_put_chunk((None, None))
+            return
+
+        if not is_http_media_source(url):
+            emit("error", "실시간 URL은 http, https, rtmp, rtmps, rtsp 중 하나로 시작해야 합니다.")
+            self._safe_put_chunk((None, None))
+            return
+
+        command = [
+            ffmpeg,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+            "-i",
+            url,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(self.sample_rate),
+            "-acodec",
+            "pcm_s16le",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ]
+
+        process = None
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=windows_creation_flags(),
+            )
+            self._ffmpeg_process = process
+            emit("log", f"인터넷 실시간 캡처를 시작했습니다: {url}")
+
+            if process.stdout is None:
+                raise RuntimeError("ffmpeg에서 오디오 스트림을 읽지 못했습니다.")
+
+            chunk_bytes = self.chunk_frames * 2
+            pending = bytearray()
+            chunk_index = 0
+            while not stop_event.is_set():
+                need = chunk_bytes - len(pending)
+                if need > 0:
+                    chunk = process.stdout.read(need)
+                    if chunk:
+                        pending.extend(chunk)
+                    elif not pending:
+                        break
+
+                if len(pending) < chunk_bytes:
+                    continue
+
+                data = bytes(pending[:chunk_bytes])
+                del pending[:chunk_bytes]
+
+                if stop_event.is_set():
+                    break
+                if not self._temp_dir:
+                    break
+
+                chunk_path = self._temp_dir / f"chunk-url-{chunk_index:06d}.wav"
+                try:
+                    write_pcm16_to_wav(data, self.sample_rate, chunk_path)
+                except Exception:
+                    break
+                self._safe_put_chunk((chunk_index, chunk_path))
+                chunk_index += 1
+        except OperationCancelled:
+            emit("log", "실시간 캡처가 취소되었습니다.")
+        except Exception as exc:
+            emit("error", f"실시간 캡처 오류: {url} - {exc}")
+        finally:
+            if process is not None:
+                try:
+                    if process.stdout is not None:
+                        process.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+            self._safe_put_chunk((None, None))
+
+    def _worker_loop(self, emit: Callable[[str, object], None], stop_event: threading.Event) -> None:
+        while True:
+            if self._chunk_queue is None:
+                return
+
+            try:
+                chunk = self._chunk_queue.get(timeout=0.25)
+            except queue.Empty:
+                if stop_event.is_set():
+                    break
+                continue
+
+            chunk_index, chunk_path = chunk
+            if chunk_index is None:
+                break
+            if chunk_path is None:
+                continue
+            if stop_event.is_set():
+                break
+
+            try:
+                segments, source_language = self.asr.transcribe(
+                    chunk_path,
+                    should_stop=stop_event.is_set,
+                )
+                if segments:
+                    translated = self.translator.translate_texts(
+                        [s.text for s in segments],
+                        source_language,
+                    )
+                    if len(translated) != len(segments):
+                        translated = translated + ["" for _ in range(len(segments) - len(translated))]
+                    lines = [t.strip() or s.text.strip() for s, t in zip(segments, translated) if (t or s.text).strip()]
+                    if lines:
+                        emit("live_caption", "\n".join(lines[-2:]))
+            except OperationCancelled:
+                emit("log", "실시간 번역이 취소되었습니다.")
+            except Exception as exc:
+                emit("error", f"실시간 번역 오류: {chunk_path.name} - {exc}")
+            finally:
+                if chunk_path.exists():
+                    try:
+                        chunk_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+
+class ScreenRecorderService:
+    def __init__(
+        self,
+        sample_rate: int = DEFAULT_RECORD_SAMPLE_RATE,
+        audio_block_seconds: float = 0.5,
+    ):
+        self.sample_rate = sample_rate
+        self.audio_block_frames = max(1024, int(sample_rate * audio_block_seconds))
+        self._stop_event: threading.Event | None = None
+        self._monitor_thread: threading.Thread | None = None
+        self._audio_thread: threading.Thread | None = None
+        self._video_process: subprocess.Popen | None = None
+        self._audio_recorder: object | None = None
+        self._temp_dir: Path | None = None
+        self._video_path: Path | None = None
+        self._audio_path: Path | None = None
+        self._output_path: Path | None = None
+        self._capture_audio = True
+        self._audio_has_data = False
+
+    def is_running(self) -> bool:
+        process_running = self._video_process is not None and self._video_process.poll() is None
+        return process_running or (
+            self._monitor_thread is not None and self._monitor_thread.is_alive()
+        )
+
+    def start(
+        self,
+        output_path: Path,
+        fps: int,
+        capture_audio: bool,
+        emit: Callable[[str, object], None],
+        stop_event: threading.Event,
+    ) -> None:
+        if self.is_running():
+            raise RuntimeError("화면 녹화가 이미 실행 중입니다.")
+        if os.name != "nt":
+            raise RuntimeError("화면 녹화는 Windows에서만 사용할 수 있습니다.")
+
+        ffmpeg = find_ffmpeg()
+        if ffmpeg is None:
+            raise RuntimeError("화면 녹화에는 ffmpeg가 필요합니다.")
+        if capture_audio and not has_module("soundcard"):
+            raise RuntimeError("PC 스피커 소리 녹음에는 soundcard가 필요합니다.")
+
+        output_path = output_path.with_suffix(".mkv")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._stop_event = stop_event
+        stop_event.clear()
+        self._temp_dir = Path(tempfile.mkdtemp(prefix="papastop_record_"))
+        self._video_path = self._temp_dir / "screen-video.mkv"
+        self._audio_path = self._temp_dir / "speaker-audio.wav"
+        self._output_path = output_path
+        self._capture_audio = capture_audio
+        self._audio_has_data = False
+
+        command = build_lossless_screen_capture_command(ffmpeg, self._video_path, fps)
+        self._video_process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
             creationflags=windows_creation_flags(),
-            timeout=12,
-            check=False,
-        )
-    except Exception:
-        return None
-
-    if completed.returncode != 0 or not completed.stdout.strip():
-        return None
-
-    try:
-        return json.loads(completed.stdout)
-    except json.JSONDecodeError:
-        return None
-
-
-def bytes_to_gb(value: int | float | str | None) -> str:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return "확인 필요"
-
-    return f"{number / (1024 ** 3):.1f} GB"
-
-
-def format_file_size(size_bytes: int) -> str:
-    units = ("B", "KB", "MB", "GB", "TB")
-    size = float(size_bytes)
-    for unit in units:
-        if size < 1024 or unit == units[-1]:
-            if unit == "B":
-                return f"{int(size)} {unit}"
-            return f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size_bytes} B"
-
-
-def format_duration_short(seconds: float) -> str:
-    seconds = max(0, int(round(seconds)))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours:
-        return f"{hours}시간 {minutes}분"
-    if minutes:
-        return f"{minutes}분 {secs}초"
-    return f"{secs}초"
-
-
-def media_files_in_folder(folder_path: Path) -> list[Path]:
-    if not folder_path.exists() or not folder_path.is_dir():
-        return []
-
-    return sorted(
-        (
-            path
-            for path in folder_path.iterdir()
-            if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
-        ),
-        key=lambda path: path.name.lower(),
-    )
-
-
-def language_display(code: str) -> str:
-    return LANGUAGES.get(code, code)
-
-
-def language_code_from_display(value: str) -> str:
-    if value in LANGUAGES:
-        return value
-
-    for code, label in LANGUAGES.items():
-        if value == label:
-            return code
-
-    for code, label in LANGUAGES.items():
-        if value.startswith(f"{label} "):
-            return code
-
-    return value
-
-
-def language_values(allow_auto: bool = True) -> list[str]:
-    source = LANGUAGES if allow_auto else TRANSLATION_LANGUAGES
-    return [language_display(code) for code in source]
-
-
-def translation_engine_values() -> list[str]:
-    return list(TRANSLATION_ENGINES.values())
-
-
-def translation_engine_code(value: str) -> str:
-    if value in TRANSLATION_ENGINES:
-        return value
-    for code, label in TRANSLATION_ENGINES.items():
-        if value == label:
-            return code
-    return "argos"
-
-
-DEVICE_OPTIONS = {
-    "auto": "자동 선택 (auto)",
-    "cpu": "CPU 사용 (cpu)",
-    "cuda": "GPU·NVIDIA (cuda)",
-}
-
-
-def device_values() -> list[str]:
-    return list(DEVICE_OPTIONS.values())
-
-
-def device_code(value: str) -> str:
-    if value in DEVICE_OPTIONS:
-        return value
-    for code, label in DEVICE_OPTIONS.items():
-        if value == label:
-            return code
-    return "auto"
-
-
-def detect_hardware() -> dict[str, str]:
-    hardware = {
-        "운영체제": platform.platform(),
-        "Python": sys.version.split()[0],
-    }
-
-    if os.name == "nt":
-        cpu = run_powershell_json(
-            "Get-CimInstance Win32_Processor | "
-            "Select-Object -First 1 Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed"
-        )
-        memory = run_powershell_json(
-            "Get-CimInstance Win32_ComputerSystem | Select-Object -First 1 TotalPhysicalMemory"
-        )
-        gpus = run_powershell_json(
-            "Get-CimInstance Win32_VideoController | "
-            "Select-Object Name,AdapterRAM,DriverVersion"
         )
 
-        if isinstance(cpu, dict):
-            hardware["CPU"] = str(cpu.get("Name") or "확인 필요")
-            hardware["CPU 코어"] = str(cpu.get("NumberOfCores") or "확인 필요")
-            hardware["CPU 논리 코어"] = str(cpu.get("NumberOfLogicalProcessors") or "확인 필요")
-            hardware["CPU 최대 속도"] = f"{cpu.get('MaxClockSpeed', '확인 필요')} MHz"
+        if capture_audio:
+            self._audio_thread = threading.Thread(
+                target=self._record_loopback_audio,
+                args=(emit, stop_event),
+                daemon=True,
+            )
+            self._audio_thread.start()
 
-        if isinstance(memory, dict):
-            hardware["RAM"] = bytes_to_gb(memory.get("TotalPhysicalMemory"))
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_recording,
+            args=(emit,),
+            daemon=True,
+        )
+        self._monitor_thread.start()
 
-        nvidia_gpus = detect_nvidia_gpus()
-        if nvidia_gpus:
-            for index, gpu in enumerate(nvidia_gpus, start=1):
-                hardware[f"GPU {index}"] = gpu
-        elif isinstance(gpus, dict):
-            gpus = [gpus]
+    def stop(self, timeout: float = 5.0) -> None:
+        if self._stop_event is not None:
+            self._stop_event.set()
 
-        if not nvidia_gpus and isinstance(gpus, list):
-            for index, gpu in enumerate(gpus, start=1):
-                if not isinstance(gpu, dict):
-                    continue
-                name = gpu.get("Name") or "확인 필요"
-                ram = bytes_to_gb(gpu.get("AdapterRAM"))
-                hardware[f"GPU {index}"] = f"{name} / {ram}"
+        self._finish_video_process(timeout=timeout)
 
-    hardware.setdefault("CPU", platform.processor() or "확인 필요")
+    def _record_loopback_audio(
+        self,
+        emit: Callable[[str, object], None],
+        stop_event: threading.Event,
+    ) -> None:
+        import warnings
 
-    if "RAM" not in hardware and has_module("psutil"):
+        import soundcard as sc
+
+        if self._audio_path is None:
+            return
+
+        wav_file: wave.Wave_write | None = None
+        expected_channels: int | None = None
         try:
-            import psutil
+            speaker = sc.default_speaker()
+            if speaker is None:
+                raise RuntimeError("기본 스피커를 찾지 못했습니다.")
 
-            hardware["RAM"] = bytes_to_gb(psutil.virtual_memory().total)
+            loopback = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+            with loopback.recorder(samplerate=self.sample_rate) as recorder:
+                self._audio_recorder = recorder
+                try:
+                    while not stop_event.is_set():
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings(
+                                "ignore",
+                                message="data discontinuity in recording",
+                            )
+                            audio = recorder.record(numframes=self.audio_block_frames)
+
+                        pcm_bytes, channels, frame_count = float_audio_to_pcm16_bytes(audio)
+                        if frame_count <= 0 or not pcm_bytes:
+                            continue
+
+                        if wav_file is None:
+                            self._audio_path.parent.mkdir(parents=True, exist_ok=True)
+                            wav_file = wave.open(str(self._audio_path), "wb")
+                            wav_file.setnchannels(channels)
+                            wav_file.setsampwidth(2)
+                            wav_file.setframerate(self.sample_rate)
+                            expected_channels = channels
+                        elif channels != expected_channels:
+                            raise RuntimeError("녹음 중 스피커 소리 채널 수가 바뀌었습니다.")
+
+                        wav_file.writeframes(pcm_bytes)
+                        self._audio_has_data = True
+                finally:
+                    self._audio_recorder = None
+        except Exception as exc:
+            if not stop_event.is_set():
+                emit("log", f"스피커 소리 녹음을 건너뛰었습니다: {exc}")
+        finally:
+            if wav_file is not None:
+                wav_file.close()
+
+    def _monitor_recording(self, emit: Callable[[str, object], None]) -> None:
+        try:
+            if self._output_path is None or self._video_path is None:
+                raise RuntimeError("화면 녹화 준비가 끝나지 않았습니다.")
+
+            emit("record_status", "녹화 중")
+            emit("log", f"무손실 화면 녹화를 시작했습니다: {self._output_path}")
+
+            process = self._video_process
+            while self._stop_event is not None and not self._stop_event.is_set():
+                if process is None or process.poll() is not None:
+                    break
+                time.sleep(0.3)
+
+            emit("record_status", "녹화를 정리하는 중 ...")
+            return_code = self._finish_video_process(timeout=5.0)
+
+            if self._stop_event is not None:
+                self._stop_event.set()
+            if self._audio_thread is not None:
+                self._audio_thread.join(timeout=3.0)
+
+            if return_code not in (0, None):
+                error_text = self._read_video_error()
+                raise RuntimeError(error_text or f"ffmpeg가 오류 코드 {return_code}로 종료되었습니다.")
+            if not self._video_path.exists() or self._video_path.stat().st_size <= 0:
+                raise RuntimeError("화면 녹화 파일이 만들어지지 않았습니다.")
+
+            emit("record_status", "저장 중 ...")
+            saved_path = self._save_recording(emit)
+            emit("record_output_path", str(saved_path))
+            emit("record_status", "저장 완료")
+            emit("done", f"화면 녹화를 저장했습니다: {saved_path}")
+        except Exception as exc:
+            emit("error", f"화면 녹화 오류: {exc}")
+        finally:
+            self._cleanup()
+            emit("busy_record", False)
+            emit("status", "대기 중")
+
+    def _finish_video_process(self, timeout: float) -> int | None:
+        process = self._video_process
+        if process is None:
+            return None
+
+        if process.poll() is None:
+            try:
+                if process.stdin is not None:
+                    process.stdin.write("q\n")
+                    process.stdin.flush()
+            except Exception:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+
+        try:
+            return process.wait(timeout=timeout)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            try:
+                return process.wait(timeout=1)
+            except Exception:
+                return 1
+
+    def _read_video_error(self) -> str:
+        process = self._video_process
+        if process is None or process.stderr is None:
+            return ""
+        try:
+            return process.stderr.read().strip()
+        except Exception:
+            return ""
+
+    def _save_recording(self, emit: Callable[[str, object], None]) -> Path:
+        if self._output_path is None or self._video_path is None:
+            raise RuntimeError("화면 녹화 저장 위치가 준비되지 않았습니다.")
+
+        audio_ready = (
+            self._capture_audio
+            and self._audio_has_data
+            and self._audio_path is not None
+            and self._audio_path.exists()
+            and self._audio_path.stat().st_size > 44
+        )
+
+        if audio_ready:
+            self._mux_video_and_audio(emit)
+        else:
+            if self._capture_audio:
+                emit("log", "스피커 소리가 비어 있어 영상만 저장했습니다.")
+            if self._output_path.exists():
+                self._output_path.unlink()
+            shutil.move(str(self._video_path), str(self._output_path))
+
+        return self._output_path
+
+    def _mux_video_and_audio(self, emit: Callable[[str, object], None]) -> None:
+        if self._output_path is None or self._video_path is None or self._audio_path is None:
+            raise RuntimeError("영상과 소리를 합칠 준비가 끝나지 않았습니다.")
+
+        ffmpeg = find_ffmpeg()
+        if ffmpeg is None:
+            raise RuntimeError("화면 녹화를 저장하려면 ffmpeg가 필요합니다.")
+
+        command = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(self._video_path),
+            "-i",
+            str(self._audio_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "pcm_s16le",
+            "-shortest",
+            str(self._output_path),
+        ]
+        run_command(command, on_line=lambda line: emit("log", line))
+
+    def _cleanup(self) -> None:
+        self._video_process = None
+        self._audio_thread = None
+        self._monitor_thread = None
+        self._audio_recorder = None
+        self._stop_event = None
+        if self._temp_dir is not None:
+            try:
+                shutil.rmtree(self._temp_dir, ignore_errors=True)
+            except OSError:
+                pass
+        self._temp_dir = None
+        self._video_path = None
+        self._audio_path = None
+        self._output_path = None
+        self._audio_has_data = False
+
+
+class LiveSubtitleOverlay(tk.Toplevel):
+    def __init__(self, root: tk.Tk):
+        super().__init__(root)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.configure(bg="#0f172a")
+        self._drag_start_x = 0
+        self._drag_start_y = 0
+
+        # 윈도우 상단 바가 없는 상태에서도 마우스로 위치를 이동할 수 있게 드래그 이벤트 등록
+        self.bind("<Button-1>", self._begin_drag)
+        self.bind("<B1-Motion>", self._on_drag)
+
+        self.label = tk.Label(
+            self,
+            text="",
+            fg="white",
+            bg="#0f172a",
+            font=("Arial", 26, "bold"),
+            justify="center",
+            wraplength=1000,
+        )
+        self.label.bind("<Button-1>", self._begin_drag)
+        self.label.bind("<B1-Motion>", self._on_drag)
+        self.label.pack(fill="both", expand=True, padx=16, pady=16)
+
+        screen_w = self.winfo_screenwidth()
+        self.geometry(f"1100x220+{max(20, (screen_w - 1100) // 2)}+20")
+        self.label.config(text="실시간 자막 준비 완료")
+        self.deiconify()
+
+    def _begin_drag(self, event: tk.Event) -> None:
+        self._drag_start_x = event.x_root
+        self._drag_start_y = event.y_root
+
+    def _on_drag(self, event: tk.Event) -> None:
+        self.geometry(f"+{event.x_root - self._drag_start_x + self.winfo_x()}+{event.y_root - self._drag_start_y + self.winfo_y()}")
+        self._drag_start_x = event.x_root
+        self._drag_start_y = event.y_root
+
+    def set_text(self, text: str) -> None:
+        if not text:
+            return
+        self.label.config(text=text)
+
+    def close(self) -> None:
+        try:
+            self.destroy()
         except Exception:
             pass
 
-    return hardware
-
-
-def largest_gpu_memory_gb(nvidia_gpus: list[str]) -> float:
-    best = 0.0
-    for label in nvidia_gpus:
-        match = re.search(r"([\d.]+)\s*GB", label)
-        if match:
-            best = max(best, float(match.group(1)))
-    return best
-
-
-def recommend_transcribe_settings(nvidia_gpus: list[str] | None = None) -> tuple[dict[str, object], str]:
-    if nvidia_gpus is None:
-        nvidia_gpus = detect_nvidia_gpus()
-
-    if nvidia_gpus:
-        memory_gb = largest_gpu_memory_gb(nvidia_gpus)
-        if memory_gb >= 8:
-            # 정확도 최우선: 원본 large-v3를 씁니다. (turbo는 속도용 경량판이라 정확도를 약간 양보합니다.)
-            model = "large-v3"
-        elif memory_gb >= 5:
-            model = "small"
-        else:
-            model = "base"
-        memory_note = f"약 {memory_gb:.0f}GB" if memory_gb else "메모리 확인 필요"
-        return (
-            {
-                "model": model,
-                "device": "cuda",
-                "compute": "float16",
-                "beam": 5,
-            },
-            f"NVIDIA 그래픽카드({memory_note})에 맞춰 {model} 모델 GPU 설정을 적용했습니다.",
-        )
-
-    return (
-        {
-            "model": "base",
-            "device": "cpu",
-            "compute": "int8",
-            "beam": 3,
-        },
-        "NVIDIA 그래픽카드가 감지되지 않아 CPU 중심 설정을 적용했습니다.",
-    )
-
-
-def format_timestamp(seconds: float) -> str:
-    milliseconds = int(round(max(seconds, 0) * 1000))
-    hours, remainder = divmod(milliseconds, 3_600_000)
-    minutes, remainder = divmod(remainder, 60_000)
-    secs, millis = divmod(remainder, 1000)
-    return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
-
-
-def wrap_subtitle_text(text: str, max_chars: int) -> str:
-    text = re.sub(r"[ \t]+", " ", text).strip()
-    if max_chars <= 0 or len(text) <= max_chars:
-        return text
-
-    if " " in text:
-        lines: list[str] = []
-        current = ""
-        for word in text.split(" "):
-            if current and len(current) + 1 + len(word) > max_chars:
-                lines.append(current)
-                current = word
-            else:
-                current = f"{current} {word}".strip()
-        if current:
-            lines.append(current)
-        return "\n".join(lines)
-
-    return "\n".join(text[i : i + max_chars] for i in range(0, len(text), max_chars))
-
-
-def render_srt(rows: Iterable[tuple[float, float, str]], max_line_chars: int = 42) -> str:
-    blocks: list[str] = []
-
-    for index, (start, end, text) in enumerate(rows, start=1):
-        clean_text = wrap_subtitle_text(text, max_line_chars)
-        blocks.append(
-            "\n".join(
-                [
-                    str(index),
-                    f"{format_timestamp(start)} --> {format_timestamp(end)}",
-                    clean_text,
-                ]
-            )
-        )
-
-    return "\n\n".join(blocks) + ("\n" if blocks else "")
-
-
-def read_text_file(path: Path) -> str:
-    for encoding in ("utf-8-sig", "utf-8", "cp949"):
-        try:
-            return path.read_text(encoding=encoding)
-        except UnicodeDecodeError:
-            continue
-    return path.read_text(encoding="utf-8", errors="replace")
-
-
-def parse_srt_blocks(text: str) -> list[SubtitleBlock]:
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not normalized:
-        return []
-
-    blocks: list[SubtitleBlock] = []
-    for raw_block in re.split(r"\n\s*\n", normalized):
-        lines = raw_block.split("\n")
-        if len(lines) < 3:
-            continue
-
-        index = lines[0].strip()
-        timing = lines[1].strip()
-        content_lines = [line.rstrip() for line in lines[2:]]
-        blocks.append(SubtitleBlock(index=index, timing=timing, lines=content_lines))
-
-    return blocks
-
-
-def render_srt_blocks(blocks: Iterable[SubtitleBlock]) -> str:
-    rendered: list[str] = []
-    for block in blocks:
-        rendered.append("\n".join([block.index, block.timing, *block.lines]))
-    return "\n\n".join(rendered) + ("\n" if rendered else "")
-
-
-def render_vtt_blocks(blocks: Iterable[SubtitleBlock]) -> str:
-    rendered = ["WEBVTT", ""]
-    for block in blocks:
-        rendered.append(block.timing.replace(",", "."))
-        rendered.extend(block.lines)
-        rendered.append("")
-    return "\n".join(rendered).rstrip() + "\n"
-
-
-def render_text_blocks(blocks: Iterable[SubtitleBlock]) -> str:
-    paragraphs: list[str] = []
-    for block in blocks:
-        paragraph = " ".join(line.strip() for line in block.lines if line.strip())
-        if paragraph:
-            paragraphs.append(paragraph)
-    return "\n\n".join(paragraphs) + ("\n" if paragraphs else "")
-
-
-def subtitle_extension(format_code: str) -> str:
-    normalized = format_code.lower().strip(".")
-    if normalized not in SUBTITLE_FORMATS:
-        raise ValueError(f"지원하지 않는 자막 형식입니다: {format_code}")
-    return f".{normalized}"
-
-
-def ensure_subtitle_extension(path: Path, format_code: str) -> Path:
-    extension = subtitle_extension(format_code)
-    if path.suffix.lower() == extension:
-        return path
-    return path.with_suffix(extension)
-
-
-def convert_srt_text(text: str, output_format: str) -> str:
-    blocks = parse_srt_blocks(text)
-    if not blocks:
-        raise RuntimeError("SRT 자막 내용을 읽지 못했습니다.")
-
-    normalized = output_format.lower().strip(".")
-    if normalized == "srt":
-        return render_srt_blocks(blocks)
-    if normalized == "vtt":
-        return render_vtt_blocks(blocks)
-    if normalized == "txt":
-        return render_text_blocks(blocks)
-
-    raise ValueError(f"지원하지 않는 자막 형식입니다: {output_format}")
-
-
-def convert_subtitle_file(
-    source_path: Path,
-    target_path: Path,
-    output_format: str,
-    on_line: Callable[[str], None],
-    on_progress: Callable[[float], None],
-) -> Path:
-    on_line(f"자막 변환을 시작합니다: {SUBTITLE_FORMATS.get(output_format, output_format)}")
-    on_progress(20)
-    target_path = ensure_subtitle_extension(target_path, output_format)
-    converted = convert_srt_text(read_text_file(source_path), output_format)
-    on_progress(70)
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_text(converted, encoding="utf-8")
-    on_progress(100)
-    on_line(f"변환 자막 저장 완료: {target_path}")
-    return target_path
-
-
-def ensure_not_cancelled(should_stop: Callable[[], bool] | None) -> None:
-    if should_stop and should_stop():
-        raise OperationCancelled("작업이 중지되었습니다.")
-
-
-def validate_media_for_transcription(media_path: Path) -> None:
-    if media_path.suffix.lower() not in MEDIA_EXTENSIONS:
-        raise RuntimeError(f"지원하지 않는 파일 형식입니다: {media_path.suffix}")
-
-    ffmpeg = find_ffmpeg()
-    if not ffmpeg:
-        raise RuntimeError("FFmpeg를 찾지 못했습니다. 먼저 엔진 설치를 눌러 주세요.")
-
-    try:
-        completed = subprocess.run(
-            [ffmpeg, "-hide_banner", "-i", str(media_path)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=windows_creation_flags(),
-            timeout=20,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("동영상 정보를 확인하는 데 시간이 너무 오래 걸렸습니다.") from exc
-
-    probe_text = f"{completed.stdout}\n{completed.stderr}"
-    if "Invalid data found" in probe_text or "No such file" in probe_text:
-        raise RuntimeError("파일을 동영상/음성 파일로 읽지 못했습니다.")
-
-    if "Audio:" not in probe_text:
-        raise RuntimeError("이 파일에서 음성 트랙을 찾지 못했습니다. 자막을 만들려면 소리가 들어 있어야 합니다.")
-
-
-def language_label(code: str) -> str:
-    return f"{LANGUAGES.get(code, code)} ({code})"
-
-
-def translate_srt_file(
-    source_path: Path,
-    target_path: Path,
-    from_code: str,
-    to_code: str,
-    on_line: Callable[[str], None],
-    on_progress: Callable[[float], None],
-    should_stop: Callable[[], bool] | None = None,
-    engine: str = "argos",
-) -> None:
-    if from_code == to_code:
-        raise ValueError("원본 언어와 번역 언어가 같습니다.")
-
-    if engine == "nllb":
-        translate_srt_file_nllb(
-            source_path, target_path, from_code, to_code, on_line, on_progress, should_stop
-        )
-        return
-
-    if not has_module("argostranslate"):
-        raise RuntimeError("Argos Translate가 설치되어 있지 않습니다. 먼저 엔진 설치를 눌러 주세요.")
-
-    from argostranslate import package, translate
-
-    on_line(f"번역 언어팩을 확인합니다: {language_label(from_code)} -> {language_label(to_code)}")
-
-    installed_languages = translate.get_installed_languages()
-    installed_from = next((language for language in installed_languages if language.code == from_code), None)
-    installed_to = next((language for language in installed_languages if language.code == to_code), None)
-
-    if installed_from is None or installed_to is None or installed_from.get_translation(installed_to) is None:
-        on_line("언어팩이 없어 다운로드합니다. 첫 실행 때만 시간이 걸릴 수 있습니다.")
-        package.update_package_index()
-        available_packages = package.get_available_packages()
-        matching_package = next(
-            (
-                available_package
-                for available_package in available_packages
-                if available_package.from_code == from_code and available_package.to_code == to_code
-            ),
-            None,
-        )
-        if matching_package is None:
-            raise RuntimeError("Argos에서 해당 번역 언어팩을 찾지 못했습니다.")
-
-        download_path = matching_package.download()
-        package.install_from_path(download_path)
-        on_line("언어팩 설치가 끝났습니다.")
-
-    text = read_text_file(source_path)
-    blocks = parse_srt_blocks(text)
-    if not blocks:
-        raise RuntimeError("SRT 자막 내용을 읽지 못했습니다.")
-
-    translated_blocks: list[SubtitleBlock] = []
-    total_lines = sum(len(block.lines) for block in blocks) or 1
-    translated_lines = 0
-
-    for block in blocks:
-        ensure_not_cancelled(should_stop)
-        new_lines: list[str] = []
-        for line in block.lines:
-            if line.strip():
-                new_lines.append(translate.translate(line, from_code, to_code))
-            else:
-                new_lines.append(line)
-
-            translated_lines += 1
-            on_progress(min(95, translated_lines / total_lines * 95))
-
-        translated_blocks.append(SubtitleBlock(block.index, block.timing, new_lines))
-
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_text(render_srt_blocks(translated_blocks), encoding="utf-8")
-    on_progress(100)
-    on_line(f"번역 자막 저장 완료: {target_path}")
-
-
-def nllb_model_dir() -> Path:
-    # 개발 환경과 EXE 배포 모두 exe 옆 .papastop_data 폴더의 모델을 사용합니다.
-    return NLLB_MODEL_DIR
-
-
-def nllb_model_is_downloaded() -> bool:
-    return nllb_model_dir().is_dir()
-
-
-def ensure_nllb_model(on_line: Callable[[str], None]) -> None:
-    if nllb_model_dir().is_dir():
-        return
-
-    on_line("NLLB 고품질(3.3B) 모델을 준비합니다. 처음 한 번만 큰 다운로드(약 17GB)와 변환이 필요하며 십수 분 걸릴 수 있습니다.")
-    from ctranslate2.converters import TransformersConverter
-
-    APP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    on_line("모델을 내려받아 변환하는 중입니다. 진행 표시줄이 움직이는 동안 기다려 주세요.")
-    converter = TransformersConverter(NLLB_MODEL_NAME)
-    # 정확도 우선: 16비트(float16)로 변환합니다. 변환 후 크기는 약 6.6GB이며 16GB GPU에 충분합니다.
-    converter.convert(str(NLLB_MODEL_DIR), quantization="float16")
-    on_line("NLLB 모델 준비가 끝났습니다.")
-
-
-_nllb_translator = None
-_nllb_tokenizers: dict[str, object] = {}
-
-
-def load_nllb(
-    from_code: str,
-    to_code: str,
-    on_line: Callable[[str], None],
-) -> tuple[object, object, str]:
-    nllb_from = NLLB_LANGUAGE_CODES.get(from_code)
-    nllb_to = NLLB_LANGUAGE_CODES.get(to_code)
-    if not nllb_from or not nllb_to:
-        raise RuntimeError("NLLB가 지원하지 않는 언어입니다.")
-
-    if not has_module("ctranslate2") or not has_module("transformers"):
-        raise RuntimeError("NLLB 번역 엔진(ctranslate2/transformers)이 설치되어 있지 않습니다.")
-
-    ensure_nllb_model(on_line)
-    prepare_cuda_library_path()
-
-    import ctranslate2
-    from transformers import AutoTokenizer
-
-    global _nllb_translator
-    if _nllb_translator is None:
-        on_line("NLLB 번역 모델을 불러옵니다.")
-        device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
-        # GPU에서는 16비트(float16)로 가장 정확하게, CPU 대체 시에는 int8로 돌립니다.
-        compute_type = "float16" if device == "cuda" else "int8"
-        _nllb_translator = ctranslate2.Translator(
-            str(nllb_model_dir()), device=device, compute_type=compute_type
-        )
-
-    if nllb_from not in _nllb_tokenizers:
-        _nllb_tokenizers[nllb_from] = AutoTokenizer.from_pretrained(NLLB_MODEL_NAME, src_lang=nllb_from)
-
-    return _nllb_tokenizers[nllb_from], _nllb_translator, nllb_to
-
-
-_SENTENCE_ENDER_PATTERN = re.compile(r"[.!?…。！？]+")
-_CJK_ENDERS = "。！？"
-
-
-def split_combined_into_sentences(combined: str) -> list[tuple[int, int]]:
-    """이어 붙인 자막 텍스트를 문장 끝 구두점 기준으로 [시작, 끝) 범위 목록으로 나눕니다.
-    소수점(3.14)이나 약어 뒤가 아니라, 구두점 다음이 공백·문장 끝일 때만 문장 경계로 봅니다.
-    한·중·일 마침표(。！？)는 공백이 없어도 항상 경계로 처리합니다."""
-    length = len(combined)
-    ranges: list[tuple[int, int]] = []
-    start = 0
-    for match in _SENTENCE_ENDER_PATTERN.finditer(combined):
-        end = match.end()
-        last_char = combined[end - 1]
-        if last_char in _CJK_ENDERS or end >= length or combined[end].isspace():
-            ranges.append((start, end))
-            start = end
-    if start < length:
-        ranges.append((start, length))
-    return ranges
-
-
-def plan_block_sentences(pieces: list[str]) -> tuple[list[str], list[list[tuple[int, int]]]]:
-    """블록별 텍스트(pieces)를 문장 단위로 묶습니다.
-    돌려주는 값:
-      - sentences: 번역할 완전한 문장 텍스트 목록
-      - mapping: 각 문장이 어느 블록에서 몇 글자씩 왔는지 [(블록번호, 글자수), ...] 목록
-    한 문장이 여러 블록에 걸쳐 있어도 합쳐서 한 번에 번역하도록 묶어 줍니다."""
-    combined_parts: list[str] = []
-    piece_spans: list[tuple[int, int]] = []
-    cursor = 0
-    for text in pieces:
-        start = cursor
-        combined_parts.append(text)
-        cursor += len(text)
-        piece_spans.append((start, cursor))
-        combined_parts.append(" ")  # 블록 사이를 공백으로 구분 (어느 블록에도 속하지 않음)
-        cursor += 1
-    combined = "".join(combined_parts)
-
-    sentences: list[str] = []
-    mapping: list[list[tuple[int, int]]] = []
-    for sentence_start, sentence_end in split_combined_into_sentences(combined):
-        sentence_text = combined[sentence_start:sentence_end].strip()
-        if not sentence_text:
-            continue
-        contributions: list[tuple[int, int]] = []
-        for index, (piece_start, piece_end) in enumerate(piece_spans):
-            overlap = min(piece_end, sentence_end) - max(piece_start, sentence_start)
-            if overlap > 0:
-                contributions.append((index, overlap))
-        if contributions:
-            sentences.append(sentence_text)
-            mapping.append(contributions)
-    return sentences, mapping
-
-
-def distribute_translation(text: str, weights: list[int]) -> list[str]:
-    """번역문 text를 weights 비율대로 순서를 지키며 여러 조각으로 나눠 돌려줍니다.
-    한 문장이 여러 블록에 걸쳐 있을 때, 번역 결과를 각 블록의 원문 글자 수 비율로 배분합니다.
-    한국어·영어처럼 띄어쓰기가 있으면 어절 단위로, 중국어·일본어처럼 없으면 글자 단위로 나눕니다."""
-    count = len(weights)
-    text = text.strip()
-    if count <= 1:
-        return [text]
-    if not text:
-        return ["" for _ in range(count)]
-
-    has_space = " " in text
-    units = text.split() if has_space else list(text)
-    separator = " " if has_space else ""
-    total_units = len(units)
-    total_weight = sum(weights) or count
-
-    result: list[str] = []
-    used = 0
-    cumulative_weight = 0
-    for index in range(count):
-        cumulative_weight += weights[index]
-        if index == count - 1:
-            boundary = total_units
-        else:
-            boundary = round(cumulative_weight / total_weight * total_units)
-        boundary = max(used, min(total_units, boundary))
-        result.append(separator.join(units[used:boundary]))
-        used = boundary
-    return result
-
-
-def translate_srt_file_nllb(
-    source_path: Path,
-    target_path: Path,
-    from_code: str,
-    to_code: str,
-    on_line: Callable[[str], None],
-    on_progress: Callable[[float], None],
-    should_stop: Callable[[], bool] | None = None,
-    max_line_chars: int = 42,
-) -> None:
-    tokenizer, translator, nllb_to = load_nllb(from_code, to_code, on_line)
-
-    on_line(f"NLLB(3.3B)로 번역합니다: {language_label(from_code)} -> {language_label(to_code)}")
-    text = read_text_file(source_path)
-    blocks = parse_srt_blocks(text)
-    if not blocks:
-        raise RuntimeError("SRT 자막 내용을 읽지 못했습니다.")
-
-    # 1) 각 블록의 여러 줄을 한 줄로 합쳐 '조각'으로 만듭니다.
-    pieces = [
-        " ".join(line.strip() for line in block.lines if line.strip())
-        for block in blocks
-    ]
-    # 2) 조각들을 문장 단위로 다시 묶습니다(여러 블록에 걸친 한 문장을 합칩니다).
-    sentences, mapping = plan_block_sentences(pieces)
-
-    # 3) 완전한 문장을 배치로 묶어 한 번에 GPU로 번역합니다(빠르고 정확).
-    translations: list[str] = []
-    batch_size = 16
-    total_sentences = len(sentences) or 1
-    for start in range(0, len(sentences), batch_size):
-        ensure_not_cancelled(should_stop)
-        chunk = sentences[start : start + batch_size]
-        source_tokens = [
-            tokenizer.convert_ids_to_tokens(tokenizer.encode(sentence)) for sentence in chunk
-        ]
-        results = translator.translate_batch(
-            source_tokens,
-            target_prefix=[[nllb_to]] * len(chunk),
-            beam_size=5,
-            max_decoding_length=512,
-            repetition_penalty=1.1,
-        )
-        for result in results:
-            target_tokens = result.hypotheses[0]
-            if target_tokens and target_tokens[0] == nllb_to:
-                target_tokens = target_tokens[1:]
-            translations.append(tokenizer.decode(tokenizer.convert_tokens_to_ids(target_tokens)))
-        on_progress(min(95, (start + len(chunk)) / total_sentences * 95))
-
-    # 4) 번역문을 원래 블록 타이밍에 글자 수 비율로 다시 나눠 배분합니다.
-    piece_results: list[list[str]] = [[] for _ in pieces]
-    for translated, contributions in zip(translations, mapping):
-        weights = [weight for _, weight in contributions]
-        parts = distribute_translation(translated, weights)
-        for (piece_index, _), part in zip(contributions, parts):
-            if part.strip():
-                piece_results[piece_index].append(part.strip())
-
-    # 5) 블록을 다시 만듭니다. 합쳐진 번역문은 가독성을 위해 줄바꿈을 적용합니다.
-    translated_blocks: list[SubtitleBlock] = []
-    for block, parts in zip(blocks, piece_results):
-        merged = " ".join(parts).strip()
-        if merged:
-            new_lines = wrap_subtitle_text(merged, max_line_chars).split("\n")
-        else:
-            new_lines = block.lines
-        translated_blocks.append(SubtitleBlock(block.index, block.timing, new_lines))
-
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_text(render_srt_blocks(translated_blocks), encoding="utf-8")
-    on_progress(100)
-    on_line(f"번역 자막 저장 완료: {target_path}")
-
-
-def whisper_model_repo(model_size: str) -> str | None:
-    return WHISPER_MODEL_REPOS.get(model_size)
-
-
-def local_whisper_model_path(model_size: str) -> Path | None:
-    """캐시에 받아둔 Whisper 모델 폴더(snapshots/<버전>) 경로를 돌려줍니다(없으면 None).
-    faster-whisper에 모델 이름 대신 이 폴더 경로를 주면 인터넷 검증을 건너뛰고
-    (오프라인에서도) 바로 로드하므로, 이미 받은 모델을 다시 받는 문제를 막습니다."""
-    repo = whisper_model_repo(model_size)
-    if not repo:
-        return None
-    prepare_model_cache_environment()
-    cache = Path(os.environ.get("HF_HUB_CACHE", str(HF_CACHE_DIR / "hub")))
-    snapshots = cache / ("models--" + repo.replace("/", "--")) / "snapshots"
-    if not snapshots.is_dir():
-        return None
-    for snapshot in sorted(snapshots.glob("*")):
-        if (snapshot / "model.bin").is_file():
-            return snapshot
-    return None
-
-
-def whisper_model_is_downloaded(model_size: str) -> bool:
-    return local_whisper_model_path(model_size) is not None
-
-
-def download_whisper_model(model_size: str, on_line: Callable[[str], None]) -> None:
-    if not has_module("faster_whisper"):
-        raise RuntimeError("faster-whisper가 설치되어 있지 않습니다. 먼저 엔진 설치를 눌러 주세요.")
-    prepare_model_cache_environment()
-    prepare_cuda_library_path()
-    from faster_whisper import WhisperModel
-
-    on_line(f"{model_size} 모델을 다운로드합니다. 크기에 따라 시간이 걸릴 수 있습니다.")
-    WhisperModel(model_size, device="cpu", compute_type="int8")
-    on_line(f"{model_size} 모델 다운로드가 끝났습니다.")
-
-
-def load_whisper_model(
-    model_size: str,
-    device: str,
-    compute_type: str,
-    on_line: Callable[[str], None],
-) -> object:
-    if not has_module("faster_whisper"):
-        raise RuntimeError("faster-whisper가 설치되어 있지 않습니다. 먼저 엔진 설치를 눌러 주세요.")
-
-    prepare_model_cache_environment()
-    prepare_cuda_library_path()
-
-    from faster_whisper import WhisperModel
-
-    compute_arg = "default" if compute_type == "auto" else compute_type
-
-    local_path = local_whisper_model_path(model_size)
-    if local_path is not None:
-        # 받아둔 모델은 폴더 경로로 직접 로드합니다.
-        # (모델 이름으로 주면 faster-whisper가 인터넷에서 캐시 무결성을 다시 확인하다가
-        #  이미 있는 모델을 또 받을 수 있습니다. 폴더 경로면 그 과정을 건너뜁니다.)
-        on_line(f"준비된 모델을 사용합니다: {model_size}")
-        return WhisperModel(str(local_path), device=device, compute_type=compute_arg)
-
-    on_line(f"모델을 준비합니다: {model_size}")
-    on_line("처음 쓰는 모델은 자동으로 다운로드됩니다. 영상 파일이 큰 경우 시간이 걸립니다.")
-    return WhisperModel(model_size, device=device, compute_type=compute_arg)
-
-
-def transcribe_media(
-    media_path: Path,
-    output_dir: Path,
-    model: object,
-    language_code: str,
-    beam_size: int,
-    on_line: Callable[[str], None],
-    on_progress: Callable[[float], None],
-    should_stop: Callable[[], bool] | None = None,
-    max_line_chars: int = 42,
-    on_subtitle_preview: Callable[[str], None] | None = None,
-    precise: bool = False,
-) -> tuple[Path, str]:
-    ensure_not_cancelled(should_stop)
-    validate_media_for_transcription(media_path)
-    ensure_not_cancelled(should_stop)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    language_arg = None if language_code == "auto" else language_code
-
-    on_progress(5)
-    on_line("영상의 소리를 분석합니다.")
-    if precise:
-        on_line("정밀 타이밍 모드: 단어 단위로 자막 시간을 맞춥니다.")
-
-    detected_language = language_code or "audio"
-
-    def collect_rows(vad_filter: bool) -> list[tuple[float, float, str]]:
-        nonlocal detected_language
-        segments, info = model.transcribe(
-            str(media_path),
-            language=language_arg,
-            beam_size=beam_size,
-            vad_filter=vad_filter,
-            # 직전 자막을 다음 추론의 힌트로 쓰지 않습니다. 한 번 잘못 받아쓰면
-            # 그 뒤로 헛소리가 줄줄이 이어지는 "환각 루프"를 끊어 정확도를 높입니다.
-            condition_on_previous_text=False,
-            # 정밀 타이밍을 켜면 단어 단위 시간을 함께 계산해 자막 시작/끝을 더 정확히 맞춥니다.
-            word_timestamps=precise,
-        )
-        collected: list[tuple[float, float, str]] = []
-        duration = getattr(info, "duration", None)
-        detected_language = getattr(info, "language", None) or language_code or "audio"
-        for segment in segments:
-            ensure_not_cancelled(should_stop)
-            start = float(segment.start)
-            end = float(segment.end)
-            if precise:
-                # 단어 단위 시간이 있으면 앞뒤 무음을 빼고 실제 말이 시작/끝나는 시점으로 조입니다.
-                words = getattr(segment, "words", None) or []
-                word_starts = [w.start for w in words if w.start is not None]
-                word_ends = [w.end for w in words if w.end is not None]
-                if word_starts and word_ends:
-                    start = float(word_starts[0])
-                    end = float(word_ends[-1])
-            collected.append((start, end, str(segment.text)))
-            if on_subtitle_preview:
-                on_subtitle_preview(render_srt(collected, max_line_chars))
-            if duration:
-                on_progress(5 + min(90, float(segment.end) / float(duration) * 90))
-            elif len(collected) % 5 == 0:
-                on_progress(min(95, 5 + len(collected)))
-        return collected
-
-    rows = collect_rows(True)
-    if not rows:
-        ensure_not_cancelled(should_stop)
-        on_line("음성 구간을 찾지 못해, 무음 제거 없이 다시 분석합니다.")
-        on_progress(5)
-        rows = collect_rows(False)
-
-    if not rows:
-        raise RuntimeError("소리에서 자막으로 만들 문장을 찾지 못했습니다.")
-
-    output_path = output_dir / f"{media_path.stem}.srt"
-    output_path.write_text(render_srt(rows, max_line_chars), encoding="utf-8")
-    on_progress(100)
-    on_line(f"자막 저장 완료: {output_path}")
-    return output_path, detected_language
-
-
-def extract_embedded_subtitle(
-    media_path: Path,
-    output_dir: Path,
-    on_line: Callable[[str], None],
-    on_progress: Callable[[float], None],
-) -> Path:
-    ffmpeg = find_ffmpeg()
-    if not ffmpeg:
-        raise RuntimeError("FFmpeg를 찾지 못했습니다. 먼저 엔진 설치를 눌러 주세요.")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{media_path.stem}.embedded.srt"
-
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-y",
-        "-i",
-        str(media_path),
-        "-map",
-        "0:s:0?",
-        str(output_path),
-    ]
-
-    on_line("영상 안에 이미 들어 있는 자막을 찾습니다.")
-    on_progress(20)
-    exit_code = run_command(command, on_line=on_line)
-
-    if exit_code != 0 or not output_path.exists() or output_path.stat().st_size == 0:
-        if output_path.exists():
-            output_path.unlink(missing_ok=True)
-        raise RuntimeError("영상 안에서 꺼낼 수 있는 SRT 자막을 찾지 못했습니다.")
-
-    on_progress(100)
-    on_line(f"기존 자막 추출 완료: {output_path}")
-    return output_path
-
-
-class ToolTip:
-    def __init__(self, widget: tk.Widget, text: str) -> None:
-        self.widget = widget
-        self.text = text
-        self.window: tk.Toplevel | None = None
-        widget.bind("<Enter>", self.show)
-        widget.bind("<Leave>", self.hide)
-
-    def show(self, _event: tk.Event | None = None) -> None:
-        if self.window or not self.text:
-            return
-
-        x = self.widget.winfo_rootx() + 18
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
-        self.window = tk.Toplevel(self.widget)
-        self.window.wm_overrideredirect(True)
-        self.window.wm_geometry(f"+{x}+{y}")
-        label = ttk.Label(
-            self.window,
-            text=self.text,
-            background="#fff7cc",
-            foreground="#111827",
-            relief=tk.SOLID,
-            borderwidth=1,
-            padding=(8, 5),
-            wraplength=360,
-        )
-        label.pack()
-
-    def hide(self, _event: tk.Event | None = None) -> None:
-        if self.window:
-            self.window.destroy()
-            self.window = None
-
 
 class PapaStopApp(tk.Tk):
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.minsize(1280, 760)
+        self.geometry("980x700")
+        self.minsize(900, 680)
 
-        self.events: queue.Queue[tuple[str, object]] = queue.Queue()
-        self.busy = False
-        self.cancel_event = threading.Event()
-        self.media_table_paths: dict[str, Path] = {}
-        self.selected_media_iids: set[str] = set()
+        self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
 
-        self.media_path_var = tk.StringVar()
-        self.media_folder_var = tk.StringVar()
-        self.output_dir_var = tk.StringVar()
-        self.subtitle_path_var = tk.StringVar()
-        self.model_var = tk.StringVar(value="base")
-        self.model_status_var = tk.StringVar(value="")
-        self.source_lang_var = tk.StringVar(value=language_display("auto"))
-        self.device_var = tk.StringVar(value=DEVICE_OPTIONS["auto"])
-        self.compute_var = tk.StringVar(value="auto")
-        self.beam_var = tk.IntVar(value=5)
-        self.max_line_chars_var = tk.IntVar(value=42)
-        self.precise_timing_var = tk.BooleanVar(value=False)
-        self.auto_translate_var = tk.BooleanVar(value=False)
-        self.auto_translate_to_var = tk.StringVar(value=language_display("ko"))
-        self.pc_audio_seconds_var = tk.IntVar(value=60)
-        self.live_chunk_seconds_var = tk.IntVar(value=1)
-        self.expert_mode_var = tk.BooleanVar(value=False)
-        self.translate_from_var = tk.StringVar(value=language_display("en"))
-        self.translate_to_var = tk.StringVar(value=language_display("ko"))
-        self.translate_engine_var = tk.StringVar(value=TRANSLATION_ENGINES["argos"])
-        self.nllb_status_var = tk.StringVar(value="")
-        self.translate_overwrite_var = tk.BooleanVar(value=False)
-        self.translate_output_path_var = tk.StringVar()
-        self.convert_format_var = tk.StringVar(value="vtt")
-        self.convert_output_path_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="대기 중")
-        self.progress_var = tk.DoubleVar(value=0)
-        self.eta_var = tk.StringVar(value="예상 완료: 대기 중")
-        self.task_var = tk.StringVar(value="make")  # 'make', 'live', 'pc_audio', 'extract', 'translate', 'convert', 'engine'
-        self.work_started_at: float | None = None
-        self.last_output_dir: Path | None = None
+        self.asr = ASREngine()
+        self.translator = TranslationEngine(preferred="auto")
+        self.file_workflow = FileSubtitleWorkflow(self.asr, self.translator)
+        self.live_service = LiveCaptionService(self.asr, self.translator)
+        self.record_service = ScreenRecorderService()
 
-        self._configure_style()
+        self.file_cancel_event = threading.Event()
+        self.live_cancel_event = threading.Event()
+        self.record_cancel_event = threading.Event()
+        self.file_queue: list[str] = []
+        self.file_preview_lines: list[str] = []
+        self._batch_outputs: list[Path] = []
+        self._batch_current = 0
+        self.last_output: Path | None = None
+        self.overlay: LiveSubtitleOverlay | None = None
+        self._is_file_running = False
+        self._is_live_running = False
+        self._is_record_running = False
+        self._is_asr_preparing = False
+        self._is_translation_preparing = False
+
         self._build_ui()
-        self.after(100, self._process_events)
-        self.after(250, lambda: self.refresh_hardware(startup=True))
-        self.after(350, self._check_and_prompt_for_initial_setup)
-        self.after(450, lambda: self.refresh_engines(startup=True))
-        self.after(650, self.refresh_model_status)
-        self.after(750, self.refresh_nllb_status)
-        self.task_var.trace_add("write", self._on_task_changed)
-        self.translate_overwrite_var.trace_add("write", self._on_overwrite_changed)
-
-    def _configure_style(self) -> None:
-        style = ttk.Style(self)
-        for theme_name in ("clam", "vista", "xpnative"):
-            if theme_name in style.theme_names():
-                style.theme_use(theme_name)
-                break
-
-        app_bg = "#f3f6fb"
-        panel_bg = "#ffffff"
-        border = "#dbe3ef"
-        text = "#111827"
-        subtle = "#4b5563"
-        primary = "#2563eb"
-        primary_hover = "#1d4ed8"
-        soft = "#edf2f7"
-        success = "#16a34a"
-        chip_bg = "#e8edf5"
-
-        self.colors = {
-            "app_bg": app_bg,
-            "panel_bg": panel_bg,
-            "border": border,
-            "text": text,
-            "subtle": subtle,
-            "primary": primary,
-            "primary_hover": primary_hover,
-            "soft": soft,
-            "success": success,
-            "chip_bg": chip_bg,
-        }
-
-        self.configure(bg=app_bg)
-        style.configure(".", font=("Malgun Gothic", 10))
-        style.configure("TFrame", background=panel_bg)
-        style.configure("App.TFrame", background=app_bg)
-        style.configure("Card.TFrame", background=panel_bg)
-        style.configure("CardBody.TFrame", background=panel_bg)
-        style.configure("Title.TLabel", font=("Malgun Gothic", 21, "bold"), foreground=text, background=app_bg)
-        style.configure("Subtle.TLabel", foreground=subtle, background=panel_bg)
-        style.configure("Status.TLabel", foreground=subtle, background=app_bg)
-        style.configure("TLabel", foreground=text, background=panel_bg)
-        style.configure("Panel.TLabel", foreground=text, background=panel_bg)
-        style.configure(
-            "TButton",
-            padding=(14, 8),
-            relief=tk.FLAT,
-            borderwidth=0,
-            background="#e8edf5",
-            foreground=text,
-            focusthickness=0,
-        )
-        style.map(
-            "TButton",
-            background=[("active", "#dce5f1"), ("pressed", "#cfd9e8"), ("disabled", "#edf1f6")],
-            foreground=[("disabled", "#9ca3af")],
-        )
-        style.configure(
-            "Accent.TButton",
-            font=("Malgun Gothic", 10, "bold"),
-            background=primary,
-            foreground="#ffffff",
-            padding=(16, 9),
-        )
-        style.map(
-            "Accent.TButton",
-            background=[("active", primary_hover), ("pressed", "#1e40af"), ("disabled", "#bfdbfe")],
-            foreground=[("disabled", "#eff6ff")],
-        )
-        style.configure(
-            "Big.Accent.TButton",
-            font=("Malgun Gothic", 13, "bold"),
-            background=primary,
-            foreground="#ffffff",
-            padding=(16, 14),
-        )
-        style.map(
-            "Big.Accent.TButton",
-            background=[("active", primary_hover), ("pressed", "#1e40af"), ("disabled", "#bfdbfe")],
-            foreground=[("disabled", "#eff6ff")],
-        )
-        style.configure(
-            "Treeview",
-            rowheight=24,
-            background=panel_bg,
-            fieldbackground=panel_bg,
-            foreground=text,
-            bordercolor=border,
-            borderwidth=0,
-            relief=tk.FLAT,
-        )
-        style.map("Treeview", background=[("selected", "#dbeafe")], foreground=[("selected", text)])
-        style.configure("Treeview.Heading", font=("Malgun Gothic", 10, "bold"), background="#eef3f9", foreground=text)
-        style.map("Treeview.Heading", background=[("active", "#e2eaf5")])
-        style.configure("TEntry", padding=(8, 6), fieldbackground="#ffffff")
-        style.configure("TCombobox", padding=(8, 5), fieldbackground="#ffffff")
-        style.configure("TNotebook", background=app_bg, borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(14, 8), background="#e9eef6", foreground=subtle)
-        style.map(
-            "TNotebook.Tab",
-            background=[("selected", panel_bg), ("active", "#f8fafc")],
-            foreground=[("selected", text), ("active", text)],
-        )
-        style.configure(
-            "Horizontal.TProgressbar",
-            troughcolor="#e6ebf2",
-            background=primary,
-            bordercolor="#e6ebf2",
-            lightcolor=primary,
-            darkcolor=primary,
-        )
+        self._refresh_status()
+        self.after(80, self._process_events)
 
     def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=16, style="App.TFrame")
-        root.pack(fill=tk.BOTH, expand=True)
+        root = self
+        nb = ttk.Notebook(root)
+        nb.pack(fill="both", expand=True, padx=12, pady=12)
 
-        header = ttk.Frame(root, style="App.TFrame")
-        header.pack(fill=tk.X, pady=(0, 14))
+        self.file_tab = ttk.Frame(nb)
+        self.live_tab = ttk.Frame(nb)
+        self.record_tab = ttk.Frame(nb)
+        nb.add(self.file_tab, text="파일 자막")
+        nb.add(self.live_tab, text="실시간 자막")
+        nb.add(self.record_tab, text="화면 녹화")
 
-        ttk.Label(header, text="PapaStop", style="Title.TLabel").pack(side=tk.LEFT)
-        self.status_chip = tk.Label(
-            header,
-            textvariable=self.status_var,
-            background=self.colors["chip_bg"],
-            foreground=self.colors["subtle"],
-            font=("Malgun Gothic", 9),
-            padx=12,
-            pady=4,
+        # File tab
+        self.file_path_var = tk.StringVar()
+        self.output_path_var = tk.StringVar()
+        self.file_status_var = tk.StringVar(value="대기 중")
+        self.batch_status_var = tk.StringVar(value="0개 파일")
+        self.whisper_model_var = tk.StringVar(value=WHISPER_MODEL_LABELS[DEFAULT_WHISPER_MODEL])
+        self.translation_profile_var = tk.StringVar(value=TRANSLATION_PROFILE_LABELS["auto"])
+        self.live_url_var = tk.StringVar()
+        self.live_source_var = tk.StringVar(value=LIVE_SOURCE_SPEAKER)
+        self.record_output_var = tk.StringVar(value=str(default_recording_path()))
+        self.record_status_var = tk.StringVar(value="대기 중")
+        self.record_audio_var = tk.BooleanVar(value=True)
+        self.record_fps_var = tk.StringVar(value=str(DEFAULT_RECORD_FPS))
+
+        file_row0 = ttk.Frame(self.file_tab)
+        file_row0.pack(fill="x", pady=6)
+        ttk.Label(file_row0, text="원본 영상/음성").pack(side="left")
+        ttk.Entry(file_row0, textvariable=self.file_path_var, width=80).pack(
+            side="left", fill="x", expand=True, padx=8
         )
-        self.status_chip.pack(side=tk.RIGHT)
+        self.select_media_btn = ttk.Button(file_row0, text="선택", command=self._select_media)
+        self.select_media_btn.pack(side="left")
+        self.add_file_btn = ttk.Button(file_row0, text="목록에 추가", command=self._add_input_to_queue)
+        self.add_file_btn.pack(side="left", padx=6)
 
-        body = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
-        body.pack(fill=tk.BOTH, expand=True)
-
-        left = ttk.Frame(body, width=720, style="App.TFrame")
-        right = ttk.Frame(body, width=500, style="App.TFrame")
-        body.add(left, weight=2)
-        body.add(right, weight=1)
-
-        self._build_file_panel(left)
-
-        self._build_task_selection_panel(right)
-
-        self.settings_container = ttk.Frame(right, style="App.TFrame")
-        self.settings_container.pack(fill=tk.X, expand=True, pady=(0, 12))
-
-        # 각 작업 패널을 만들고 인스턴스 변수에 저장합니다.
-        # 각 _build_*_panel 메서드는 이제 pack()을 호출하지 않고 프레임을 반환합니다.
-        self.transcribe_frame = self._build_transcribe_panel(self.settings_container)
-        self.extract_frame = self._build_extract_panel(self.settings_container)
-        self.translate_frame = self._build_translate_panel(self.settings_container)
-        self.convert_frame = self._build_convert_panel(self.settings_container)
-        self.engine_frame = self._build_engine_panel(self.settings_container)
-
-        self._build_action_panel(right)
-
-        right_tabs = ttk.Notebook(right)
-        right_tabs.pack(fill=tk.BOTH, expand=True)
-
-        progress_tab = ttk.Frame(right_tabs, padding=(0, 8, 0, 0))
-        subtitle_tab = ttk.Frame(right_tabs, padding=(0, 8, 0, 0))
-        hardware_tab = ttk.Frame(right_tabs, padding=(0, 8, 0, 0))
-        log_tab = ttk.Frame(right_tabs, padding=(0, 8, 0, 0))
-        right_tabs.add(progress_tab, text="진행 단계")
-        right_tabs.add(subtitle_tab, text="미리보기")
-        right_tabs.add(hardware_tab, text="PC 장치")
-        right_tabs.add(log_tab, text="작업 기록")
-
-        self._build_progress_panel(progress_tab)
-        self._build_subtitle_preview_panel(subtitle_tab)
-        self._build_hardware_panel(hardware_tab)
-        self._build_log_panel(log_tab)
-
-        # 앱 시작 시 기본 작업 패널을 보여줍니다.
-        self._on_task_changed()
-
-    def _label_with_help(self, parent: ttk.Frame, text: str, help_text: str) -> ttk.Frame:
-        frame = ttk.Frame(parent)
-        ttk.Label(frame, text=text).pack(side=tk.LEFT)
-        help_label = tk.Label(
-            frame,
-            text="?",
-            width=2,
-            anchor=tk.CENTER,
-            background="#e0ecff",
-            foreground=self.colors["primary"],
-            font=("Malgun Gothic", 9, "bold"),
+        file_row1 = ttk.Frame(self.file_tab)
+        file_row1.pack(fill="x", pady=6)
+        ttk.Label(file_row1, text="저장할 SRT / 폴더").pack(side="left")
+        ttk.Entry(file_row1, textvariable=self.output_path_var, width=80).pack(
+            side="left", fill="x", expand=True, padx=8
         )
-        help_label.pack(side=tk.LEFT, padx=(5, 0))
-        ToolTip(help_label, help_text)
-        return frame
+        ttk.Button(file_row1, text="같은 이름으로", command=self._set_default_output).pack(side="left")
+        ttk.Button(file_row1, text="폴더 선택", command=self._select_output_dir).pack(side="left", padx=6)
 
-    def _build_card(
-        self,
-        parent: tk.Widget,
-        title: str,
-        fill: str = tk.X,
-        expand: bool = False,
-        step: str | None = None,
-    ) -> ttk.Frame:
-        outer = tk.Frame(
-            parent,
-            background=self.colors["panel_bg"],
-            highlightbackground=self.colors["border"],
-            highlightcolor=self.colors["border"],
-            highlightthickness=1,
-            borderwidth=0,
-        )
-        outer.pack(fill=fill, expand=expand, pady=(0, 12))
+        file_row2 = ttk.Frame(self.file_tab)
+        file_row2.pack(fill="x", pady=8)
+        self.start_file_btn = ttk.Button(file_row2, text="자막 만들기 시작", command=self._start_file_job)
+        self.cancel_file_btn = ttk.Button(file_row2, text="중지", command=self._cancel_file_job, state="disabled")
+        self.start_file_btn.pack(side="left")
+        self.cancel_file_btn.pack(side="left", padx=6)
+        ttk.Button(file_row2, text="결과 열기", command=self._open_output).pack(side="right")
 
-        title_row = tk.Frame(outer, background=self.colors["panel_bg"])
-        title_row.pack(fill=tk.X, padx=16, pady=(14, 4))
-
-        if step is not None:
-            tk.Label(
-                title_row,
-                text=step,
-                width=2,
-                anchor=tk.CENTER,
-                background=self.colors["primary"],
-                foreground="#ffffff",
-                font=("Malgun Gothic", 11, "bold"),
-                pady=1,
-            ).pack(side=tk.LEFT, padx=(0, 8))
-
-        title_label = tk.Label(
-            title_row,
-            text=title,
-            background=self.colors["panel_bg"],
-            foreground=self.colors["text"],
-            font=("Malgun Gothic", 12, "bold"),
-            anchor=tk.W,
-        )
-        title_label.pack(side=tk.LEFT)
-
-        body = ttk.Frame(outer, style="CardBody.TFrame", padding=(16, 8, 16, 16))
-        body._card_outer = outer  # type: ignore[attr-defined]
-        body.pack(fill=tk.BOTH, expand=True)
-        return body
-
-    def _show_card(self, frame: ttk.Frame, fill: str = tk.X, expand: bool = False) -> None:
-        outer = getattr(frame, "_card_outer", frame)
-        outer.pack(fill=fill, expand=expand, pady=(0, 12))
-
-    def _hide_card(self, frame: ttk.Frame) -> None:
-        outer = getattr(frame, "_card_outer", frame)
-        outer.pack_forget()
-
-    def _build_file_panel(self, parent: ttk.Frame) -> None:
-        frame = self._build_card(parent, "파일 선택", fill=tk.BOTH, expand=True, step="1")
-        frame.rowconfigure(2, weight=1)
-        frame.columnconfigure(0, weight=1)
-
-        ttk.Label(frame, text="자막을 만들 영상/음성을 선택하세요", style="Panel.TLabel").grid(
-            row=0, column=0, sticky=tk.W
-        )
-        source_row = ttk.Frame(frame)
-        source_row.grid(row=1, column=0, sticky=tk.EW, pady=(4, 8))
-        source_row.columnconfigure(0, weight=1)
-        source_row.columnconfigure(1, weight=1)
-        ttk.Button(source_row, text="파일 1개 찾기", command=self.choose_media_file).grid(
-            row=0, column=0, sticky=tk.EW, padx=(0, 3)
-        )
-        ttk.Button(source_row, text="폴더 전체 찾기", command=self.choose_media_folder).grid(
-            row=0, column=1, sticky=tk.EW, padx=(3, 0)
-        )
-
-        table_frame = ttk.Frame(frame)
-        table_frame.grid(row=2, column=0, sticky=tk.NSEW, pady=(0, 10))
-        table_frame.rowconfigure(0, weight=1)
-        table_frame.columnconfigure(0, weight=1)
-
-        self.media_tree = ttk.Treeview(
-            table_frame,
-            columns=("selected", "name", "ext", "size", "status"),
-            show="headings",
-            height=20,
-        )
-        self.media_tree.heading("selected", text="선택")
-        self.media_tree.heading("name", text="파일명")
-        self.media_tree.heading("ext", text="확장자")
-        self.media_tree.heading("size", text="파일용량")
-        self.media_tree.heading("status", text="상태")
-        self.media_tree.column("selected", width=70, stretch=False, anchor=tk.CENTER)
-        self.media_tree.column("name", width=180, stretch=True)
-        self.media_tree.column("ext", width=70, stretch=False, anchor=tk.CENTER)
-        self.media_tree.column("size", width=90, stretch=False, anchor=tk.E)
-        self.media_tree.column("status", width=80, stretch=False, anchor=tk.CENTER)
-        self.media_tree.grid(row=0, column=0, sticky=tk.NSEW)
-        self.media_tree.bind("<Button-1>", self._on_media_tree_click)
-
-        media_scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.media_tree.yview)
-        media_scrollbar.grid(row=0, column=1, sticky=tk.NS)
-        self.media_tree.configure(yscrollcommand=media_scrollbar.set)
-
-        selection_row = ttk.Frame(frame)
-        selection_row.grid(row=3, column=0, sticky=tk.EW, pady=(0, 6))
-        selection_row.columnconfigure(0, weight=1)
-        selection_row.columnconfigure(1, weight=1)
-        ttk.Button(selection_row, text="전체 선택", command=self.select_all_media_files).grid(row=0, column=0, sticky=tk.EW, padx=(0, 3))
-        ttk.Button(selection_row, text="전체 해제", command=self.clear_media_file_selection).grid(row=0, column=1, sticky=tk.EW, padx=(3, 0))
-
-        ttk.Label(frame, text="저장 폴더", style="Panel.TLabel").grid(row=4, column=0, sticky=tk.W)
-        output_row = ttk.Frame(frame)
-        output_row.grid(row=5, column=0, sticky=tk.EW, pady=(4, 0))
-        output_row.columnconfigure(0, weight=1)
-        ttk.Entry(output_row, textvariable=self.output_dir_var).grid(row=0, column=0, sticky=tk.EW)
-        ttk.Button(output_row, text="폴더", command=self.choose_output_dir).grid(row=0, column=1, padx=(6, 0))
-
-    def _build_task_selection_panel(self, parent: ttk.Frame) -> None:
-        frame = self._build_card(parent, "무엇을 할까요", step="2")
-        task_columns = 7
-        for column in range(task_columns):
-            frame.columnconfigure(column, weight=1)
-
-        tasks = {
-            "자막 만들기": "make",
-            "실시간": "live",
-            "PC 소리": "pc_audio",
-            "자막 추출": "extract",
-            "자막 번역": "translate",
-            "형식 변환": "convert",
-            "엔진": "engine",
-        }
-
-        for index, (text, value) in enumerate(tasks.items()):
-            is_primary = value == "make"
-            tk.Radiobutton(
-                frame,
-                text=text,
-                variable=self.task_var,
-                value=value,
-                indicatoron=False,
-                borderwidth=0,
-                relief=tk.FLAT,
-                padx=6,
-                pady=11 if is_primary else 7,
-                background="#e0ecff" if is_primary else self.colors["soft"],
-                activebackground="#dbeafe",
-                foreground=self.colors["primary"] if is_primary else self.colors["subtle"],
-                selectcolor="#dbeafe",
-                font=("Malgun Gothic", 11, "bold") if is_primary else ("Malgun Gothic", 10),
-            ).grid(row=index // task_columns, column=index % task_columns, sticky=tk.EW, padx=4, pady=4)
-
-    def _build_engine_panel(self, parent: ttk.Frame) -> ttk.Frame:
-        frame = self._build_card(parent, "세부 설정 · 엔진 관리", step="3")
-        frame.columnconfigure(0, weight=1)
-        frame.columnconfigure(1, weight=1)
-
-        self.engine_tree = ttk.Treeview(frame, columns=("value",), show="tree headings", height=6)
-        self.engine_tree.heading("#0", text="항목")
-        self.engine_tree.heading("value", text="상태")
-        self.engine_tree.column("#0", width=150, stretch=False)
-        self.engine_tree.column("value", width=240, stretch=True)
-        self.engine_tree.grid(row=0, column=0, columnspan=2, sticky=tk.EW)
-
-        ttk.Button(frame, text="엔진 확인", command=self.refresh_engines).grid(
-            row=1, column=0, sticky=tk.EW, pady=(8, 0), padx=(0, 3)
-        )
-        ttk.Button(
-            frame,
-            text="엔진 설치",
-            command=self.install_engines,
-            style="Accent.TButton",
-        ).grid(row=1, column=1, sticky=tk.EW, padx=(3, 0), pady=(8, 0))
-        return frame
-
-    def _build_extract_panel(self, parent: ttk.Frame) -> ttk.Frame:
-        frame = self._build_card(parent, "세부 설정 · 자막 추출", step="3")
-        # 이 작업은 별도 설정이 필요 없습니다.
-        # '파일' 패널에서 선택한 영상/폴더에 대해 작업이 실행됩니다.
-        ttk.Label(
-            frame,
-            text="선택한 영상 파일에 내장된 SRT 형식 자막을 추출합니다.\n"
-                 "별도 설정 없이 아래 '작업 시작' 버튼을 누르세요.",
-            wraplength=380,
-            justify=tk.LEFT,
-        ).pack(pady=20, padx=10)
-        return frame
-
-    def _build_transcribe_panel(self, parent: ttk.Frame) -> ttk.Frame:
-        frame = self._build_card(parent, "세부 설정 · 자막 만들기 / PC 소리", step="3")
-
-        for column in range(2):
-            frame.columnconfigure(column, weight=1)
-
-        mode_switch = ttk.Checkbutton(
-            frame,
-            text="전문가 모드 (고급 설정 표시)",
-            variable=self.expert_mode_var,
-            command=self._on_mode_changed,
-        )
-        mode_switch.grid(row=0, column=0, columnspan=2, sticky=tk.E, pady=(0, 10))
-
-        self._label_with_help(
-            frame,
-            "자막 품질",
-            "소리를 글자로 바꾸는 모델입니다. base는 첫 테스트에 좋고, large 계열은 더 정확하지만 시간이 더 걸립니다. 정확도 최우선이면 large-v3를 고르세요(turbo보다 정확).",
-        ).grid(row=1, column=0, sticky=tk.W)
-        model_frame = ttk.Frame(frame)
-        model_frame.grid(row=2, column=0, sticky=tk.EW, pady=(4, 8), padx=(0, 6))
-        model_frame.columnconfigure(0, weight=1)
-        model_combo = ttk.Combobox(
-            model_frame,
-            textvariable=self.model_var,
-            values=("tiny", "base", "small", "medium", "large-v3", "large-v3-turbo", "distil-large-v3"),
+        file_row3 = ttk.Frame(self.file_tab)
+        file_row3.pack(fill="x", pady=6)
+        ttk.Label(file_row3, text="음성 인식 모델").pack(side="left")
+        self.whisper_model_combo = ttk.Combobox(
+            file_row3,
+            textvariable=self.whisper_model_var,
+            values=[WHISPER_MODEL_LABELS[key] for key in WHISPER_MODEL_ORDER],
             state="readonly",
+            width=30,
         )
-        model_combo.grid(row=0, column=0, sticky=tk.EW)
-        model_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_model_status())
-        ttk.Button(model_frame, text="받기", width=6, command=self.download_selected_model).grid(
-            row=0, column=1, padx=(4, 0)
+        self.whisper_model_combo.bind("<<ComboboxSelected>>", self._on_whisper_model_selected)
+        self.whisper_model_combo.current(WHISPER_MODEL_ORDER.index(DEFAULT_WHISPER_MODEL))
+        self.whisper_model_combo.pack(side="left", padx=8)
+        self.prepare_asr_btn = ttk.Button(
+            file_row3,
+            text="위스퍼 모델 다운로드",
+            command=self._prepare_asr_model,
         )
-        ttk.Label(model_frame, textvariable=self.model_status_var, style="Subtle.TLabel").grid(
-            row=1, column=0, columnspan=2, sticky=tk.W, pady=(2, 0)
-        )
+        self.prepare_asr_btn.pack(side="left", padx=6)
 
-        ttk.Label(frame, text="원본 언어").grid(row=1, column=1, sticky=tk.W)
-        ttk.Combobox(
-            frame,
-            textvariable=self.source_lang_var,
-            values=language_values(allow_auto=True),
+        file_row4 = ttk.Frame(self.file_tab)
+        file_row4.pack(fill="x", pady=6)
+        ttk.Label(file_row4, text="번역 모델").pack(side="left")
+        self.translation_profile_combo = ttk.Combobox(
+            file_row4,
+            textvariable=self.translation_profile_var,
+            values=[TRANSLATION_PROFILE_LABELS[key] for key in TRANSLATION_PROFILE_ORDER],
             state="readonly",
-        ).grid(row=2, column=1, sticky=tk.EW, pady=(4, 8))
-
-        self.device_label = self._label_with_help(
-            frame,
-            "사용 장치",
-            "자막을 만들 때 CPU 또는 그래픽카드 GPU 중 무엇을 쓸지 정합니다. NVIDIA 그래픽카드가 있으면 cuda가 빠를 수 있습니다.",
+            width=45,
         )
-        self.device_label.grid(row=3, column=0, sticky=tk.W)
-        self.device_combo = ttk.Combobox(
-            frame,
-            textvariable=self.device_var,
-            values=device_values(),
-            state="readonly",
+        self.translation_profile_combo.bind("<<ComboboxSelected>>", self._on_translation_profile_selected)
+        self.translation_profile_combo.current(0)
+        self.translation_profile_combo.pack(side="left", padx=8)
+        self.prepare_translation_btn = ttk.Button(
+            file_row4,
+            text="번역 모델 다운로드",
+            command=self._prepare_translation_model,
         )
-        self.device_combo.grid(row=4, column=0, sticky=tk.EW, pady=(4, 8), padx=(0, 6))
+        self.prepare_translation_btn.pack(side="left", padx=6)
 
-        self.compute_label = self._label_with_help(
-            frame,
-            "계산 방식",
-            "계산을 얼마나 가볍게 할지 정합니다. int8은 가볍고 CPU에 유리하며, float16은 GPU에서 빠른 편입니다.",
+        queue_frame = ttk.LabelFrame(self.file_tab, text="작업할 파일 목록")
+        queue_frame.pack(fill="both", expand=True, pady=(0, 8))
+
+        list_area = ttk.Frame(queue_frame)
+        list_area.pack(fill="both", expand=True, padx=6, pady=6)
+
+        listbox_area = ttk.Frame(list_area)
+        listbox_area.pack(side="left", fill="both", expand=True)
+        self.file_listbox = tk.Listbox(
+            listbox_area,
+            height=7,
+            selectmode="extended",
+            exportselection=False,
         )
-        self.compute_label.grid(row=3, column=1, sticky=tk.W)
-        self.compute_combo = ttk.Combobox(
-            frame,
-            textvariable=self.compute_var,
-            values=("auto", "int8", "float16", "float32"),
-            state="readonly",
-        )
-        self.compute_combo.grid(row=4, column=1, sticky=tk.EW, pady=(4, 8))
-
-        self.beam_label = self._label_with_help(
-            frame,
-            "정확도 단계",
-            "문장을 고를 때 몇 가지 후보를 비교할지 정합니다. 숫자가 높으면 더 꼼꼼하지만 느려질 수 있습니다.",
-        )
-        self.beam_label.grid(row=5, column=0, sticky=tk.W)
-        self.beam_spinbox = ttk.Spinbox(frame, from_=1, to=10, textvariable=self.beam_var)
-        self.beam_spinbox.grid(
-            row=6,
-            column=0,
-            sticky=tk.EW,
-            pady=(4, 10),
-            padx=(0, 6),
-        )
-
-        self.max_line_chars_label = self._label_with_help(
-            frame,
-            "한 줄 최대 글자",
-            "자막 한 줄이 이 글자 수를 넘으면 자동으로 줄을 나눕니다. 0이면 줄바꿈하지 않습니다.",
-        )
-        self.max_line_chars_label.grid(row=5, column=1, sticky=tk.W)
-        self.max_line_chars_spinbox = ttk.Spinbox(frame, from_=0, to=100, textvariable=self.max_line_chars_var)
-        self.max_line_chars_spinbox.grid(row=6, column=1, sticky=tk.EW, pady=(4, 10))
-
-        self.precise_check = ttk.Checkbutton(
-            frame,
-            text="정밀 타이밍 (단어 단위)",
-            variable=self.precise_timing_var,
-        )
-        self.precise_check.grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(0, 6))
-        ToolTip(
-            self.precise_check,
-            "켜면 단어 단위 시간을 함께 계산해 자막의 시작·끝을 실제 말소리에 더 정확히 맞춥니다. "
-            "앞뒤 무음이 줄어 싱크가 좋아지지만, 분석 시간이 조금 더 걸립니다. "
-            "새 설치 없이 지금 엔진으로 바로 동작합니다.",
-        )
-
-        self.recommend_button = ttk.Button(
-            frame,
-            text="권장 설정 적용",
-            command=self.apply_recommended_settings,
-        )
-        self.recommend_button.grid(row=8, column=0, columnspan=2, sticky=tk.EW)
-
-        translate_row = ttk.Frame(frame)
-        translate_row.grid(row=9, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
-        translate_row.columnconfigure(1, weight=1)
-        auto_translate_check = ttk.Checkbutton(
-            translate_row,
-            text="자막 만든 뒤 자동 번역 →",
-            variable=self.auto_translate_var,
-        )
-        auto_translate_check.grid(row=0, column=0, sticky=tk.W)
-        ToolTip(
-            auto_translate_check,
-            "체크하면 여러 영상의 자막을 만든 뒤 곧바로 선택한 언어로 번역까지 한 번에 진행합니다. "
-            "번역 원본 언어는 위의 '원본 언어' 설정을 따르며, '자동 감지'면 소리에서 감지한 언어를 사용합니다.",
-        )
-        ttk.Combobox(
-            translate_row,
-            textvariable=self.auto_translate_to_var,
-            values=language_values(allow_auto=False),
-            state="readonly",
-            width=12,
-        ).grid(row=0, column=1, sticky=tk.E, padx=(8, 0))
-
-        self.pc_audio_capture_frame = ttk.Frame(frame)
-        self.pc_audio_capture_frame.grid(row=10, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
-        self.pc_audio_capture_frame.columnconfigure(1, weight=1)
-        ttk.Label(self.pc_audio_capture_frame, text="PC 소리 녹음 시간(초)").grid(row=0, column=0, sticky=tk.W)
-        self.pc_audio_seconds_spinbox = ttk.Spinbox(
-            self.pc_audio_capture_frame,
-            from_=1,
-            to=7200,
-            increment=5,
-            textvariable=self.pc_audio_seconds_var,
-            width=10,
-        )
-        self.pc_audio_seconds_spinbox.grid(row=0, column=1, sticky=tk.E, padx=(8, 0))
-        ToolTip(
-            self.pc_audio_seconds_spinbox,
-            "작업 시작을 누른 뒤 이 시간만큼 Windows 기본 스피커에서 나오는 소리를 녹음합니다. "
-            "인터넷 영상을 재생해 둔 상태에서 사용하면 됩니다.",
-        )
-
-        self.live_capture_frame = ttk.Frame(frame)
-        self.live_capture_frame.grid(row=11, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
-        self.live_capture_frame.columnconfigure(1, weight=1)
-        ttk.Label(self.live_capture_frame, text="실시간 분석 간격(초)").grid(row=0, column=0, sticky=tk.W)
-        self.live_chunk_seconds_spinbox = ttk.Spinbox(
-            self.live_capture_frame,
-            from_=1,
-            to=30,
-            increment=1,
-            textvariable=self.live_chunk_seconds_var,
-            width=10,
-        )
-        self.live_chunk_seconds_spinbox.grid(row=0, column=1, sticky=tk.E, padx=(8, 0))
-        ToolTip(
-            self.live_chunk_seconds_spinbox,
-            "이 시간만큼 PC 소리를 모은 뒤 바로 자막으로 바꿉니다. "
-            "1초는 가장 빠르지만 문장이 짧게 끊길 수 있습니다.",
-        )
-        self.pc_audio_capture_frame.grid_remove()
-        self.live_capture_frame.grid_remove()
-
-        self._on_mode_changed()
-
-        return frame
-
-    def _build_translate_panel(self, parent: ttk.Frame) -> ttk.Frame:
-        frame = self._build_card(parent, "세부 설정 · 번역 저장", step="3")
-        frame.columnconfigure(0, weight=1)
-
-        ttk.Label(frame, text="번역할 SRT 파일").grid(row=0, column=0, sticky=tk.W)
-        subtitle_row = ttk.Frame(frame)
-        subtitle_row.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(4, 8))
-        subtitle_row.columnconfigure(0, weight=1)
-        ttk.Entry(subtitle_row, textvariable=self.subtitle_path_var).grid(row=0, column=0, sticky=tk.EW)
-        ttk.Button(subtitle_row, text="찾기", command=self.choose_subtitle_file).grid(row=0, column=1, padx=(6, 0))
-
-        language_row = ttk.Frame(frame)
-        language_row.grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
-        language_row.columnconfigure(0, weight=1)
-        language_row.columnconfigure(1, weight=1)
-
-        ttk.Label(language_row, text="원본").grid(row=0, column=0, sticky=tk.W)
-        ttk.Combobox(
-            language_row,
-            textvariable=self.translate_from_var,
-            values=language_values(allow_auto=False),
-            state="readonly",
-        ).grid(row=1, column=0, sticky=tk.EW, padx=(0, 6), pady=(4, 0))
-
-        ttk.Label(language_row, text="번역").grid(row=0, column=1, sticky=tk.W)
-        ttk.Combobox(
-            language_row,
-            textvariable=self.translate_to_var,
-            values=language_values(allow_auto=False),
-            state="readonly",
-        ).grid(row=1, column=1, sticky=tk.EW, pady=(4, 0))
-
-        ttk.Label(language_row, text="번역 엔진").grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
-        engine_combo = ttk.Combobox(
-            language_row,
-            textvariable=self.translate_engine_var,
-            values=translation_engine_values(),
-            state="readonly",
-        )
-        engine_combo.grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(4, 0))
-        ToolTip(
-            engine_combo,
-            "Argos는 가볍고 빠릅니다. NLLB는 더 정확하지만 첫 사용 시 모델 다운로드가 필요하고 GPU에서 빠릅니다. "
-            "이 설정은 번역 저장·폴더 일괄 번역과 자막 제작의 자동 번역에 모두 적용됩니다.",
-        )
-
-        nllb_row = ttk.Frame(language_row)
-        nllb_row.grid(row=4, column=0, columnspan=2, sticky=tk.EW, pady=(4, 0))
-        nllb_row.columnconfigure(0, weight=1)
-        ttk.Label(nllb_row, textvariable=self.nllb_status_var, style="Subtle.TLabel").grid(
-            row=0, column=0, sticky=tk.W
-        )
-        ttk.Button(nllb_row, text="NLLB 모델 준비", command=self.prepare_nllb_model).grid(
-            row=0, column=1, padx=(4, 0)
-        )
-
-        ttk.Label(frame, text="번역 저장 이름").grid(row=3, column=0, sticky=tk.W)
-        translate_output_row = ttk.Frame(frame)
-        translate_output_row.grid(row=4, column=0, columnspan=2, sticky=tk.EW, pady=(4, 8))
-        translate_output_row.columnconfigure(0, weight=1)
-        self.translate_output_entry = ttk.Entry(translate_output_row, textvariable=self.translate_output_path_var)
-        self.translate_output_entry.grid(row=0, column=0, sticky=tk.EW)
-        self.translate_output_button = ttk.Button(translate_output_row, text="이름", command=self.choose_translate_output_file)
-        self.translate_output_button.grid(
-            row=0,
-            column=1,
-            padx=(6, 0),
-        )
-
-        overwrite_check = ttk.Checkbutton(
-            frame,
-            text="번역 결과를 원본 SRT 파일에 덮어쓰기",
-            variable=self.translate_overwrite_var,
-        )
-        overwrite_check.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
-        ToolTip(
-            overwrite_check,
-            "이 옵션을 켜면 '번역 저장 이름' 설정은 무시되고, 번역할 원본 SRT 파일을 덮어씁니다.",
-        )
-
-        ttk.Button(
-            frame,
-            text="폴더 SRT 모두 번역",
-            command=self.translate_subtitle_folder,
-        ).grid(row=6, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
-
-        return frame
-
-    def _build_convert_panel(self, parent: ttk.Frame) -> ttk.Frame:
-        frame = self._build_card(parent, "세부 설정 · 자막 변환", step="3")
-        frame.columnconfigure(0, weight=1)
-
-        ttk.Label(frame, text="변환할 SRT 파일").grid(row=0, column=0, sticky=tk.W)
-        subtitle_row = ttk.Frame(frame)
-        subtitle_row.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(4, 8))
-        subtitle_row.columnconfigure(0, weight=1)
-        ttk.Entry(subtitle_row, textvariable=self.subtitle_path_var).grid(row=0, column=0, sticky=tk.EW)
-        ttk.Button(subtitle_row, text="찾기", command=self.choose_subtitle_file).grid(row=0, column=1, padx=(6, 0))
-
-        convert_row = ttk.Frame(frame)
-        convert_row.grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=(0, 8))
-        convert_row.columnconfigure(1, weight=1)
-        ttk.Label(convert_row, text="변환 형식").grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
-        ttk.Combobox(
-            convert_row,
-            textvariable=self.convert_format_var,
-            values=list(SUBTITLE_FORMATS.keys()),
-            state="readonly",
-            width=8,
-        ).grid(row=0, column=1, sticky=tk.EW)
-
-        ttk.Label(frame, text="변환 저장 이름").grid(row=3, column=0, sticky=tk.W)
-        convert_output_row = ttk.Frame(frame)
-        convert_output_row.grid(row=4, column=0, columnspan=2, sticky=tk.EW, pady=(4, 8))
-        convert_output_row.columnconfigure(0, weight=1)
-        ttk.Entry(convert_output_row, textvariable=self.convert_output_path_var).grid(row=0, column=0, sticky=tk.EW)
-        ttk.Button(convert_output_row, text="이름", command=self.choose_convert_output_file).grid(
-            row=0,
-            column=1,
-            padx=(6, 0),
-        )
-
-        return frame
-
-    def _build_action_panel(self, parent: ttk.Frame) -> None:
-        frame = self._build_card(parent, "실행", step="4")
-        frame.columnconfigure(0, weight=1)
-
-        self.action_button = ttk.Button(
-            frame,
-            text="작업 시작",
-            command=self.start_work,
-            style="Big.Accent.TButton",
-        )
-        self.action_button.grid(row=0, column=0, columnspan=2, sticky=tk.EW)
-
-        progress_row = ttk.Frame(frame)
-        progress_row.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
-        progress_row.columnconfigure(0, weight=1)
-        self.progress_bar = ttk.Progressbar(progress_row, variable=self.progress_var, maximum=100)
-        self.progress_bar.grid(row=0, column=0, sticky=tk.EW)
-        ttk.Button(progress_row, text="작업 중지", command=self.stop_current_work).grid(
-            row=0, column=1, padx=(8, 0)
-        )
-
-        bottom_row = ttk.Frame(frame)
-        bottom_row.grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
-        bottom_row.columnconfigure(0, weight=1)
-        ttk.Label(bottom_row, textvariable=self.eta_var, style="Subtle.TLabel").grid(
-            row=0, column=0, sticky=tk.W
-        )
-        self.open_output_button = ttk.Button(
-            bottom_row,
-            text="결과 폴더 열기",
-            command=self.open_output_folder,
-            state=tk.DISABLED,
-        )
-        self.open_output_button.grid(row=0, column=1, sticky=tk.E)
-
-    def open_output_folder(self) -> None:
-        folder = self.last_output_dir
-        if folder is None or not folder.exists():
-            self._append_log("열 결과 폴더가 아직 없습니다.")
-            return
-        try:
-            os.startfile(str(folder))  # type: ignore[attr-defined]
-        except OSError as error:
-            self._append_log(f"결과 폴더를 여는 데 실패했습니다: {error}")
-
-    def _build_progress_panel(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent, style="CardBody.TFrame", padding=12)
-        frame.pack(fill=tk.BOTH, expand=True)
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-
-        self.step_tree = ttk.Treeview(frame, columns=("status",), show="tree headings", height=5)
-        self.step_tree.heading("#0", text="단계")
-        self.step_tree.heading("status", text="상태")
-        self.step_tree.column("#0", width=240, stretch=True)
-        self.step_tree.column("status", width=120, stretch=False)
-        self.step_tree.grid(row=0, column=0, sticky=tk.NSEW)
-
-        for step_id, label in self._progress_steps_for_task(self.task_var.get()):
-            self.step_tree.insert("", tk.END, iid=step_id, text=label, values=("대기",))
-
-    def _build_subtitle_preview_panel(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent, style="CardBody.TFrame", padding=12)
-        frame.pack(fill=tk.BOTH, expand=True)
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-
-        self.subtitle_preview_text = tk.Text(
-            frame,
-            height=10,
-            wrap=tk.WORD,
-            font=("Consolas", 10),
-            background="#ffffff",
-            relief=tk.FLAT,
-            padx=12,
-            pady=10,
-            state=tk.DISABLED,
-        )
-        self.subtitle_preview_text.grid(row=0, column=0, sticky=tk.NSEW)
-
-        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.subtitle_preview_text.yview)
-        scrollbar.grid(row=0, column=1, sticky=tk.NS)
-        self.subtitle_preview_text.configure(yscrollcommand=scrollbar.set)
-
-    def _build_hardware_panel(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent, style="CardBody.TFrame", padding=12)
-        frame.pack(fill=tk.BOTH, expand=True)
-        frame.columnconfigure(0, weight=1)
-
-        self.hardware_tree = ttk.Treeview(frame, columns=("value",), show="tree headings", height=4)
-        self.hardware_tree.heading("#0", text="항목")
-        self.hardware_tree.heading("value", text="내용")
-        self.hardware_tree.column("#0", width=150, stretch=False)
-        self.hardware_tree.column("value", width=320, stretch=True)
-        self.hardware_tree.grid(row=0, column=0, sticky=tk.EW)
-
-        ttk.Button(frame, text="장치 새로고침", command=self.refresh_hardware).grid(row=1, column=0, sticky=tk.EW, pady=(8, 0))
-
-    def _build_log_panel(self, parent: ttk.Frame) -> None:
-        frame = ttk.Frame(parent, style="CardBody.TFrame", padding=12)
-        frame.pack(fill=tk.BOTH, expand=True)
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-
-        self.log_text = tk.Text(
-            frame,
-            height=6,
-            wrap=tk.WORD,
-            font=("Consolas", 10),
-            background="#ffffff",
-            relief=tk.FLAT,
-            padx=10,
-            pady=10,
-        )
-        self.log_text.grid(row=0, column=0, sticky=tk.NSEW)
-
-        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.log_text.yview)
-        scrollbar.grid(row=0, column=1, sticky=tk.NS)
-        self.log_text.configure(yscrollcommand=scrollbar.set)
-
-    def choose_media_file(self) -> None:
-        path = filedialog.askopenfilename(filetypes=MEDIA_FILE_TYPES)
-        if not path:
-            return
-
-        media_path = Path(path)
-        self.media_path_var.set(str(media_path))
-        self.media_folder_var.set(str(media_path.parent))
-        if not self.output_dir_var.get():
-            self.output_dir_var.set(str(media_path.parent))
-        self._fill_media_table([media_path], selected_by_default=True)
-        self._set_step("file", "완료")
-
-    def choose_media_folder(self) -> None:
-        path = filedialog.askdirectory()
-        if not path:
-            return
-
-        folder_path = Path(path)
-        self.media_folder_var.set(str(folder_path))
-        if not self.output_dir_var.get():
-            self.output_dir_var.set(str(folder_path))
-
-        media_files = media_files_in_folder(folder_path)
-        self._fill_media_table(media_files, selected_by_default=False)
-        if media_files:
-            self.media_path_var.set("")
-            self._set_step("file", "완료")
-            self._append_log(f"동영상/음성 파일 {len(media_files)}개를 찾았습니다. 필요한 파일을 체크해 주세요.")
-        else:
-            self.media_path_var.set("")
-            self._append_log("선택한 폴더에서 지원하는 동영상/음성 파일을 찾지 못했습니다.")
-
-    def choose_output_dir(self) -> None:
-        path = filedialog.askdirectory()
-        if path:
-            self.output_dir_var.set(path)
-
-    def choose_subtitle_file(self) -> None:
-        path = filedialog.askopenfilename(filetypes=SUBTITLE_FILE_TYPES)
-        if path:
-            self.subtitle_path_var.set(path)
-            self.translate_output_path_var.set("")
-            self.convert_output_path_var.set("")
-
-    def choose_translate_output_file(self) -> None:
-        source_path = self._selected_subtitle_path()
-        target_code = language_code_from_display(self.translate_to_var.get())
-        initial_dir = source_path.parent if source_path else Path.cwd()
-        initial_file = self._default_subtitle_name(source_path, target_code, "srt")
-        path = filedialog.asksaveasfilename(
-            defaultextension=".srt",
-            filetypes=[("SRT subtitle", "*.srt"), ("All files", "*.*")],
-            initialdir=str(initial_dir),
-            initialfile=initial_file,
-        )
-        if path:
-            self.translate_output_path_var.set(str(ensure_subtitle_extension(Path(path), "srt")))
-
-    def choose_convert_output_file(self) -> None:
-        output_format = self.convert_format_var.get()
-        source_path = self._selected_subtitle_path()
-        initial_dir = source_path.parent if source_path else Path.cwd()
-        initial_file = self._default_subtitle_name(source_path, output_format, output_format)
-        extension = subtitle_extension(output_format)
-        path = filedialog.asksaveasfilename(
-            defaultextension=extension,
-            filetypes=SUBTITLE_SAVE_TYPES,
-            initialdir=str(initial_dir),
-            initialfile=initial_file,
-        )
-        if path:
-            self.convert_output_path_var.set(str(ensure_subtitle_extension(Path(path), output_format)))
-
-    def _fill_media_table(self, media_files: list[Path], selected_by_default: bool) -> None:
-        for item in self.media_tree.get_children():
-            self.media_tree.delete(item)
-
-        self.media_table_paths.clear()
-        self.selected_media_iids.clear()
-
-        for index, media_path in enumerate(media_files, start=1):
-            iid = f"media-{index}"
-            self.media_table_paths[iid] = media_path
-            if selected_by_default:
-                self.selected_media_iids.add(iid)
-            try:
-                size_label = format_file_size(media_path.stat().st_size)
-            except OSError:
-                size_label = "확인 필요"
-
-            self.media_tree.insert(
-                "",
-                tk.END,
-                iid=iid,
-                values=("☑" if selected_by_default else "☐", media_path.name, media_path.suffix.lower(), size_label, ""),
-            )
-
-    def _on_media_tree_click(self, event: tk.Event) -> None:
-        if self.media_tree.identify_region(event.x, event.y) != "cell":
-            return
-
-        if self.media_tree.identify_column(event.x) != "#1":
-            return
-
-        iid = self.media_tree.identify_row(event.y)
-        if not iid:
-            return
-
-        self._toggle_media_iid(iid)
-
-    def _toggle_media_iid(self, iid: str) -> None:
-        if iid in self.selected_media_iids:
-            self.selected_media_iids.remove(iid)
-            self.media_tree.set(iid, "selected", "☐")
-        else:
-            self.selected_media_iids.add(iid)
-            self.media_tree.set(iid, "selected", "☑")
-
-    def select_all_media_files(self) -> None:
-        for iid in self.media_table_paths:
-            self.selected_media_iids.add(iid)
-            self.media_tree.set(iid, "selected", "☑")
-
-    def clear_media_file_selection(self) -> None:
-        self.selected_media_iids.clear()
-        for iid in self.media_table_paths:
-            self.media_tree.set(iid, "selected", "☐")
-
-    def apply_recommended_settings(self) -> None:
-        settings, reason = recommend_transcribe_settings()
-        self.model_var.set(str(settings["model"]))
-        self.device_var.set(DEVICE_OPTIONS.get(str(settings["device"]), str(settings["device"])))
-        self.compute_var.set(str(settings["compute"]))
-        self.beam_var.set(int(settings["beam"]))
-        self._append_log(reason)
-        self.refresh_model_status()
-
-    def refresh_model_status(self) -> None:
-        model = self.model_var.get()
-        if whisper_model_is_downloaded(model):
-            self.model_status_var.set(f"✓ {model} 모델 받음")
-        else:
-            self.model_status_var.set(f"✗ {model} 모델 없음 — '받기'로 미리 받을 수 있어요")
-
-    def download_selected_model(self) -> None:
-        model = self.model_var.get()
-        if whisper_model_is_downloaded(model):
-            messagebox.showinfo(APP_NAME, f"{model} 모델은 이미 받아져 있습니다.")
-            return
-
-        def work() -> None:
-            self._emit("status", f"{model} 모델 다운로드 중")
-            download_whisper_model(model, lambda line: self._emit("log", line))
-            self._emit("status", "대기 중")
-            self._emit("model_status", None)
-            self._emit("done", f"{model} 모델 다운로드가 끝났습니다.")
-
-        self._run_worker(work)
-
-    def refresh_nllb_status(self) -> None:
-        if nllb_model_is_downloaded():
-            self.nllb_status_var.set("✓ NLLB 모델 준비됨")
-        else:
-            self.nllb_status_var.set("✗ NLLB 모델 없음 — 고품질 번역 전 '준비' 필요")
-
-    def prepare_nllb_model(self) -> None:
-        if nllb_model_is_downloaded():
-            messagebox.showinfo(APP_NAME, "NLLB 모델은 이미 준비되어 있습니다.")
-            return
-
-        def work() -> None:
-            self._emit("status", "NLLB 모델 준비 중")
-            self._emit("busy_bar", True)
-            try:
-                ensure_nllb_model(lambda line: self._emit("log", line))
-            finally:
-                self._emit("busy_bar", False)
-            self._emit("status", "대기 중")
-            self._emit("nllb_status", None)
-            self._emit("done", "NLLB 모델 준비가 끝났습니다.")
-
-        self._run_worker(work)
-
-    def start_work(self) -> None:
-        task = self.task_var.get()
-        if task == "make":
-            self.make_subtitle()
-        elif task == "live":
-            self.make_live_pc_audio_subtitle()
-        elif task == "pc_audio":
-            self.make_pc_audio_subtitle()
-        elif task == "extract":
-            self.extract_embedded_subtitle()
-        elif task == "translate":
-            self.translate_subtitle()
-        elif task == "convert":
-            self.convert_subtitle()
-        elif task == "engine":
-            messagebox.showinfo(APP_NAME, "엔진 관리는 패널 안의 '엔진 설치' 또는 '엔진 확인' 버튼을 눌러주세요.")
-
-    def _on_task_changed(self, *args) -> None:
-        # 모든 설정 패널 숨기기
-        if not hasattr(self, "transcribe_frame"):
-            return  # UI가 아직 완전히 빌드되지 않음
-        self._hide_card(self.transcribe_frame)
-        self._hide_card(self.extract_frame)
-        self._hide_card(self.translate_frame)
-        self._hide_card(self.convert_frame)
-        self._hide_card(self.engine_frame)
-        if hasattr(self, "pc_audio_capture_frame"):
-            self.pc_audio_capture_frame.grid_remove()
-        if hasattr(self, "live_capture_frame"):
-            self.live_capture_frame.grid_remove()
-
-        task = self.task_var.get()
-
-        # 선택된 작업에 맞는 패널 보여주기 및 실행 버튼 텍스트 변경
-        if task == "make":
-            self._show_card(self.transcribe_frame, fill=tk.X, expand=True)
-            self.action_button.config(text="자막 만들기", state=tk.NORMAL)
-        elif task == "live":
-            self._show_card(self.transcribe_frame, fill=tk.X, expand=True)
-            self.live_capture_frame.grid()
-            self.action_button.config(text="실시간 자막 시작", state=tk.NORMAL)
-        elif task == "pc_audio":
-            self._show_card(self.transcribe_frame, fill=tk.X, expand=True)
-            self.pc_audio_capture_frame.grid()
-            self.action_button.config(text="PC 소리 자막 만들기", state=tk.NORMAL)
-        elif task == "extract":
-            self._show_card(self.extract_frame, fill=tk.X, expand=True)
-            self.action_button.config(text="영상 속 자막 추출", state=tk.NORMAL)
-        elif task == "translate":
-            self._show_card(self.translate_frame, fill=tk.X, expand=True)
-            self.action_button.config(text="번역 자막 저장", state=tk.NORMAL)
-        elif task == "convert":
-            self._show_card(self.convert_frame, fill=tk.X, expand=True)
-            self.action_button.config(text="자막 변환 저장", state=tk.NORMAL)
-        elif task == "engine":
-            self._show_card(self.engine_frame, fill=tk.X, expand=True)
-            self.action_button.config(text="위의 엔진 버튼을 사용하세요", state=tk.DISABLED)
-
-        self._set_progress_steps(task)
-
-    def stop_current_work(self) -> None:
-        if not self.busy:
-            self._append_log("진행 중인 작업이 없습니다.")
-            return
-
-        self.cancel_event.set()
-        self.status_var.set("중지 요청 중")
-        self._append_log("작업 중지를 요청했습니다. 현재 처리 중인 작은 단계를 마친 뒤 멈춥니다.")
-
-    def refresh_engines(self, *, startup: bool = False) -> None:
-        def work() -> None:
-            if not startup:
-                self._emit("status", "엔진 상태 확인 중")
-            status = check_engine_status(quick=startup)
-            self._emit("engines", status)
-            self._emit("step", ("engine", "완료"))
-            self._emit("status_if_idle" if startup else "status", "대기 중")
-
-        self._run_worker(work, allow_when_busy=startup)
-
-    def refresh_hardware(self, *, startup: bool = False) -> None:
-        def work() -> None:
-            if not startup:
-                self._emit("status", "PC 장치 확인 중")
-            hardware = detect_hardware()
-            self._emit("hardware", hardware)
-            self._emit("status_if_idle" if startup else "status", "대기 중")
-
-        self._run_worker(work, allow_when_busy=True)
-
-    def install_engines(self) -> None:
-        def work() -> None:
-            self._emit("status", "엔진 설치 중")
-            self._emit("progress", 5)
-            install_python_engines(lambda line: self._emit("log", line))
-            self._emit("progress", 100)
-            self._emit("engines", check_engine_status())
-            self._emit("step", ("engine", "완료"))
-            self._emit("status", "대기 중")
-            self._emit("done", "엔진 설치가 끝났습니다. 앱을 다시 실행하면 더 안정적입니다.")
-
-        self._run_worker(work)
-
-    def _check_and_prompt_for_initial_setup(self) -> None:
-        """앱 시작 시 필수 엔진이 없으면 사용자에게 설치를 안내합니다."""
-        # EXE 패키지는 엔진이 포함되어 있으므로 이 검사를 건너뜁니다.
-        if is_frozen_app():
-            return
-
-        def work() -> None:
-            # 핵심 엔진 확인도 시작 화면을 붙잡지 않도록 작업자로 보냅니다.
-            if not has_module("faster_whisper"):
-                self._emit("initial_setup_prompt", None)
-
-        self._run_worker(work, allow_when_busy=True)
-
-    def _on_mode_changed(self, *args) -> None:
-        """'전문가 모드' 상태에 따라 고급 설정 위젯의 표시 여부를 변경합니다."""
-        if not hasattr(self, "device_label"):
-            return  # UI가 아직 완전히 빌드되지 않음
-
-        is_expert = self.expert_mode_var.get()
-
-        expert_widgets = [
-            self.device_label,
-            self.device_combo,
-            self.compute_label,
-            self.compute_combo,
-            self.beam_label,
-            self.beam_spinbox,
-            self.max_line_chars_label,
-            self.max_line_chars_spinbox,
-            self.precise_check,
+        list_scroll = ttk.Scrollbar(listbox_area, orient="vertical", command=self.file_listbox.yview)
+        self.file_listbox.configure(yscrollcommand=list_scroll.set)
+        self.file_listbox.pack(side="left", fill="both", expand=True)
+        list_scroll.pack(side="left", fill="y")
+
+        queue_button_frame = ttk.Frame(list_area)
+        queue_button_frame.pack(side="left", fill="y", padx=(8, 0))
+        self.add_queue_btn = ttk.Button(queue_button_frame, text="파일 추가", command=self._add_files_to_queue)
+        self.add_queue_btn.pack(fill="x")
+        self.add_folder_btn = ttk.Button(queue_button_frame, text="폴더 추가", command=self._add_folder_to_queue)
+        self.add_folder_btn.pack(fill="x", pady=4)
+        self.remove_queue_btn = ttk.Button(queue_button_frame, text="선택 삭제", command=self._remove_selected_files)
+        self.remove_queue_btn.pack(fill="x")
+        self.clear_queue_btn = ttk.Button(queue_button_frame, text="전체 비우기", command=self._clear_file_queue)
+        self.clear_queue_btn.pack(fill="x", pady=4)
+        self.move_up_btn = ttk.Button(queue_button_frame, text="위로", command=self._move_selected_up)
+        self.move_up_btn.pack(fill="x")
+        self.move_down_btn = ttk.Button(queue_button_frame, text="아래로", command=self._move_selected_down)
+        self.move_down_btn.pack(fill="x", pady=4)
+
+        self._batch_controls = [
+            self.select_media_btn,
+            self.add_file_btn,
+            self.add_queue_btn,
+            self.add_folder_btn,
+            self.remove_queue_btn,
+            self.clear_queue_btn,
+            self.move_up_btn,
+            self.move_down_btn,
+            self.start_file_btn,
+            self.cancel_file_btn,
+            self.whisper_model_combo,
+            self.prepare_asr_btn,
+            self.translation_profile_combo,
+            self.prepare_translation_btn,
         ]
 
-        for widget in expert_widgets:
-            if is_expert:
-                widget.grid()
-            else:
-                widget.grid_remove()
-
-    def _on_overwrite_changed(self, *args) -> None:
-        """번역 덮어쓰기 옵션이 바뀌면 관련 UI 상태를 업데이트합니다."""
-        if not hasattr(self, "translate_output_entry"):
-            return  # UI가 아직 완전히 빌드되지 않음
-        state = tk.DISABLED if self.translate_overwrite_var.get() else tk.NORMAL
-        self.translate_output_entry.config(state=state)
-        self.translate_output_button.config(state=state)
-
-    def _update_media_tree_with_results(self, results: dict[str, tuple[str, str]]) -> None:
-        """작업 결과를 파일 목록 Treeview에 시각적으로 반영합니다."""
-        for iid, (status, message) in results.items():
-            if not self.media_tree.exists(iid):
-                continue
-            if status == "success":
-                self.media_tree.set(iid, "selected", "✅")
-                self.media_tree.set(iid, "status", "성공")
-            elif status == "error":
-                self.media_tree.set(iid, "selected", "❌")
-                self.media_tree.set(iid, "status", "오류")
-
-    def make_subtitle(self) -> None:
-        try:
-            jobs = self._selected_media_jobs()
-        except ValueError as exc:
-            messagebox.showwarning(APP_NAME, str(exc))
-            return
-
-        # 작업 시작 전, 대상 파일들의 상태를 '대기 중'으로 초기화합니다.
-        path_to_iid = {v: k for k, v in self.media_table_paths.items()}
-        for media_path, _ in jobs:
-            iid = path_to_iid.get(media_path)
-            if iid and self.media_tree.exists(iid):
-                self.media_tree.set(iid, "selected", "☑")
-                self.media_tree.set(iid, "status", "대기 중...")
-
-        auto_translate = bool(self.auto_translate_var.get())
-        translate_to = language_code_from_display(self.auto_translate_to_var.get())
-        source_lang = language_code_from_display(self.source_lang_var.get())
-        engine = translation_engine_code(self.translate_engine_var.get())
-
-        def work() -> None:
-            self._emit("status", "자막 만드는 중")
-            if not auto_translate:
-                self._emit("step", ("translate", "사용 안 함"))
-            self._emit("step", ("model", "진행 중"))
-            path_to_iid = {v: k for k, v in self.media_table_paths.items()}
-            job_results: dict[str, tuple[str, str]] = {}
-            saved_paths: list[Path] = []
-            translated_paths: list[Path] = []
-            errors: list[str] = []
-            total = len(jobs)
-            subtitle_weight = 0.6 if auto_translate else 1.0
-
-            ensure_not_cancelled(self.cancel_event.is_set)
-            log = lambda line: self._emit("log", line)
-            precise = bool(self.precise_timing_var.get())
-            model = load_whisper_model(
-                self.model_var.get(),
-                device_code(self.device_var.get()),
-                self.compute_var.get(),
-                log,
-            )
-            self._emit("step", ("model", "완료"))
-
-            for index, (media_path, output_dir) in enumerate(jobs, start=1):
-                ensure_not_cancelled(self.cancel_event.is_set)
-                iid = path_to_iid.get(media_path)
-                self._emit("log", f"[{index}/{total}] 자막 생성 시작: {media_path.name}")
-                self._emit("subtitle_preview", "")
-                try:
-                    output_path, detected_language = transcribe_media(
-                        media_path=media_path,
-                        output_dir=output_dir,
-                        model=model,
-                        language_code=source_lang,
-                        beam_size=int(self.beam_var.get()),
-                        on_line=log,
-                        on_progress=lambda value, item_index=index: self._emit(
-                            "progress",
-                            ((item_index - 1) + (value / 100) * subtitle_weight) / total * 100,
-                        ),
-                        should_stop=self.cancel_event.is_set,
-                        max_line_chars=int(self.max_line_chars_var.get()),
-                        on_subtitle_preview=lambda text: self._emit("subtitle_preview", text),
-                        precise=precise,
-                    )
-                    saved_paths.append(output_path)
-                    self._emit("subtitle_path", str(output_path))
-                    if iid:
-                        job_results[iid] = ("success", f"{output_path.name} 생성 완료")
-
-                    if auto_translate:
-                        from_code = source_lang if source_lang != "auto" else detected_language
-                        if from_code not in TRANSLATION_LANGUAGES:
-                            self._emit(
-                                "log",
-                                f"[{index}/{total}] 번역할 수 없는 원본 언어({from_code})라 "
-                                f"번역을 건너뜁니다: {media_path.name}",
-                            )
-                        elif from_code == translate_to:
-                            self._emit(
-                                "log",
-                                f"[{index}/{total}] 원본과 번역 언어가 같아 번역을 건너뜁니다: {media_path.name}",
-                            )
-                        else:
-                            self._emit("step", ("translate", "진행 중"))
-                            translated_path = output_path.with_name(
-                                f"{output_path.stem}.{translate_to}.srt"
-                            )
-                            self._emit(
-                                "log",
-                                f"[{index}/{total}] 번역 시작: "
-                                f"{language_label(from_code)} -> {language_label(translate_to)}",
-                            )
-                            translate_srt_file(
-                                source_path=output_path,
-                                target_path=translated_path,
-                                from_code=from_code,
-                                to_code=translate_to,
-                                on_line=lambda line: self._emit("log", line),
-                                on_progress=lambda value, item_index=index: self._emit(
-                                    "progress",
-                                    (
-                                        (item_index - 1)
-                                        + subtitle_weight
-                                        + (value / 100) * (1 - subtitle_weight)
-                                    )
-                                    / total
-                                    * 100,
-                                ),
-                                should_stop=self.cancel_event.is_set,
-                                engine=engine,
-                            )
-                            translated_paths.append(translated_path)
-                            self._emit("subtitle_path", str(translated_path))
-                            self._emit("step", ("translate", "완료"))
-                except OperationCancelled:
-                    raise
-                except Exception as exc:
-                    errors.append(f"{media_path.name}: {exc}")
-                    self._emit("log", f"오류: {media_path.name} - {exc}")
-                    if iid:
-                        job_results[iid] = ("error", str(exc))
-
-            if not saved_paths and errors:
-                raise RuntimeError("선택한 파일에서 자막을 만들지 못했습니다.\n" + "\n".join(errors[:3]))
-
-            self._emit("step", ("audio", "완료"))
-            self._emit("step", ("subtitle", "완료"))
-            self._emit("status", "대기 중")
-            self._emit("job_results", job_results)
-            message = f"자막 {len(saved_paths)}개를 저장했습니다."
-            if translated_paths:
-                message += f"\n번역 자막 {len(translated_paths)}개도 저장했습니다."
-            if errors:
-                message += f"\n오류 {len(errors)}개는 작업 기록을 확인해 주세요."
-            self._emit("done", message)
-
-        self._reset_progress()
-        self._set_step("file", "완료")
-        self._set_step("engine", "진행 중")
-        self._run_worker(work)
-
-    def make_live_pc_audio_subtitle(self) -> None:
-        try:
-            chunk_seconds = int(self.live_chunk_seconds_var.get())
-        except (tk.TclError, ValueError):
-            messagebox.showwarning(APP_NAME, "실시간 분석 간격을 숫자로 입력해 주세요.")
-            return
-
-        if chunk_seconds < 1:
-            messagebox.showwarning(APP_NAME, "실시간 분석 간격은 1초 이상으로 입력해 주세요.")
-            return
-
-        output_dir_text = self.output_dir_var.get().strip()
-        output_dir = Path(output_dir_text) if output_dir_text else APP_DIR / "recordings"
-        if not output_dir_text:
-            self.output_dir_var.set(str(output_dir))
-
-        auto_translate = bool(self.auto_translate_var.get())
-        translate_to = language_code_from_display(self.auto_translate_to_var.get())
-        source_lang = language_code_from_display(self.source_lang_var.get())
-        engine = translation_engine_code(self.translate_engine_var.get())
-
-        def work() -> None:
-            if not has_module("soundcard"):
-                raise RuntimeError("PC 소리 녹음 도구(soundcard)가 설치되어 있지 않습니다. 먼저 엔진 설치를 눌러 주세요.")
-
-            import soundcard as sc
-
-            log = lambda line: self._emit("log", line)
-            self._emit("status", "실시간 자막 준비 중")
-            self._emit("busy_bar", True)
-            self._emit("subtitle_preview", "")
-            self._emit("output_dir", str(output_dir))
-
-            subtitle_path = unique_timestamped_path(output_dir, "live-pc-speaker", ".srt")
-            translated_path = subtitle_path.with_name(f"{subtitle_path.stem}.{translate_to}.srt")
-            original_rows: list[tuple[float, float, str]] = []
-            translated_rows: list[tuple[float, float, str]] = []
-            detected_source_lang: str | None = None
-            translation_notice_shown = False
-
-            def save_and_preview() -> None:
-                if original_rows:
-                    subtitle_path.parent.mkdir(parents=True, exist_ok=True)
-                    subtitle_path.write_text(
-                        render_srt(original_rows, int(self.max_line_chars_var.get())),
-                        encoding="utf-8",
-                    )
-                    self._emit("subtitle_path", str(subtitle_path))
-
-                preview_rows = translated_rows if translated_rows else original_rows
-                if preview_rows:
-                    self._emit("subtitle_preview", render_srt(preview_rows, int(self.max_line_chars_var.get())))
-                if translated_rows:
-                    translated_path.parent.mkdir(parents=True, exist_ok=True)
-                    translated_path.write_text(
-                        render_srt(translated_rows, int(self.max_line_chars_var.get())),
-                        encoding="utf-8",
-                    )
-                    self._emit("subtitle_path", str(translated_path))
-
-            def translate_live_rows(
-                rows: list[tuple[float, float, str]],
-                chunk_index: int,
-                temp_dir: Path,
-                from_code: str,
-            ) -> list[tuple[float, float, str]]:
-                chunk_source = temp_dir / f"live-source-{chunk_index:04d}.srt"
-                chunk_target = temp_dir / f"live-target-{chunk_index:04d}.srt"
-                chunk_source.write_text(render_srt(rows, int(self.max_line_chars_var.get())), encoding="utf-8")
-                translate_srt_file(
-                    source_path=chunk_source,
-                    target_path=chunk_target,
-                    from_code=from_code,
-                    to_code=translate_to,
-                    on_line=lambda line: self._emit("log", line),
-                    on_progress=lambda _value: None,
-                    should_stop=None,
-                    engine=engine,
-                )
-                blocks = parse_srt_blocks(read_text_file(chunk_target))
-                translated: list[tuple[float, float, str]] = []
-                for index, (start, end, text) in enumerate(rows):
-                    if index < len(blocks):
-                        translated_text = " ".join(line.strip() for line in blocks[index].lines if line.strip())
-                    else:
-                        translated_text = text
-                    translated.append((start, end, translated_text or text))
-                return translated
-
-            try:
-                self._emit("step", ("engine", "완료"))
-                if not auto_translate:
-                    self._emit("step", ("translate", "사용 안 함"))
-
-                self._emit("step", ("model", "진행 중"))
-                precise = bool(self.precise_timing_var.get())
-                model = load_whisper_model(
-                    self.model_var.get(),
-                    device_code(self.device_var.get()),
-                    self.compute_var.get(),
-                    log,
-                )
-                self._emit("step", ("model", "완료"))
-
-                speaker = sc.default_speaker()
-                if speaker is None:
-                    raise RuntimeError("기본 스피커를 찾지 못했습니다. Windows 소리 출력 장치를 먼저 확인해 주세요.")
-
-                loopback = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-                self._emit("log", f"실시간 자막을 시작합니다: {speaker.name}")
-                self._emit("log", "중지하려면 '작업 중지' 버튼을 누르세요.")
-
-                audio_offset = 0.0
-                chunk_index = 0
-                output_dir.mkdir(parents=True, exist_ok=True)
-
-                with tempfile.TemporaryDirectory(prefix="papastop-live-") as temp_root:
-                    temp_dir = Path(temp_root)
-                    with loopback.recorder(samplerate=48000) as recorder:
-                        self._emit("status", "실시간 자막 중")
-                        while not self.cancel_event.is_set():
-                            chunk_index += 1
-                            chunk_path = temp_dir / f"live-audio-{chunk_index:04d}.wav"
-                            self._emit("step", ("record", "진행 중"))
-                            recorded_seconds = record_audio_chunk_to_wav(
-                                recorder=recorder,
-                                output_path=chunk_path,
-                                duration_seconds=chunk_seconds,
-                                should_stop=self.cancel_event.is_set,
-                            )
-                            if recorded_seconds <= 0.25 or not chunk_path.exists():
-                                break
-
-                            self._emit("step", ("record", "완료"))
-                            self._emit("step", ("audio", "진행 중"))
-                            rows, detected_language = transcribe_audio_chunk(
-                                audio_path=chunk_path,
-                                model=model,
-                                language_code=source_lang,
-                                beam_size=int(self.beam_var.get()),
-                                should_stop=None,
-                                precise=precise,
-                            )
-                            if detected_language and detected_source_lang is None:
-                                detected_source_lang = detected_language
-
-                            absolute_rows = offset_subtitle_rows(rows, audio_offset)
-                            if absolute_rows:
-                                original_rows.extend(absolute_rows)
-                                self._emit("step", ("subtitle", "진행 중"))
-
-                                if auto_translate:
-                                    from_code = source_lang if source_lang != "auto" else (detected_source_lang or detected_language)
-                                    if from_code not in TRANSLATION_LANGUAGES:
-                                        if not translation_notice_shown:
-                                            self._emit("log", f"번역할 수 없는 원본 언어({from_code})라 실시간 번역은 건너뜁니다.")
-                                            translation_notice_shown = True
-                                    elif from_code == translate_to:
-                                        if not translation_notice_shown:
-                                            self._emit("log", "원본과 번역 언어가 같아 실시간 번역은 건너뜁니다.")
-                                            translation_notice_shown = True
-                                    else:
-                                        self._emit("step", ("translate", "진행 중"))
-                                        translated_rows.extend(
-                                            translate_live_rows(absolute_rows, chunk_index, temp_dir, from_code)
-                                        )
-
-                                save_and_preview()
-
-                            audio_offset += recorded_seconds
-
-                if not original_rows:
-                    raise RuntimeError("실시간 자막으로 저장할 문장을 아직 찾지 못했습니다.")
-
-                save_and_preview()
-                self._emit("step", ("record", "완료"))
-                self._emit("step", ("audio", "완료"))
-                self._emit("step", ("subtitle", "완료"))
-                if auto_translate and translated_rows:
-                    self._emit("step", ("translate", "완료"))
-                self._emit("progress", 100)
-                self._emit("status", "대기 중")
-
-                message = f"실시간 자막을 저장했습니다.\n{subtitle_path}"
-                if translated_rows:
-                    message += f"\n실시간 번역 자막도 저장했습니다.\n{translated_path}"
-                self._emit("done", message)
-            finally:
-                self._emit("busy_bar", False)
-
-        self._reset_progress()
-        self._set_step("engine", "진행 중")
-        self._run_worker(work)
-
-    def make_pc_audio_subtitle(self) -> None:
-        try:
-            duration_seconds = int(self.pc_audio_seconds_var.get())
-        except (tk.TclError, ValueError):
-            messagebox.showwarning(APP_NAME, "PC 소리 녹음 시간을 숫자로 입력해 주세요.")
-            return
-
-        if duration_seconds <= 0:
-            messagebox.showwarning(APP_NAME, "PC 소리 녹음 시간은 1초 이상으로 입력해 주세요.")
-            return
-
-        output_dir_text = self.output_dir_var.get().strip()
-        output_dir = Path(output_dir_text) if output_dir_text else APP_DIR / "recordings"
-        if not output_dir_text:
-            self.output_dir_var.set(str(output_dir))
-
-        auto_translate = bool(self.auto_translate_var.get())
-        translate_to = language_code_from_display(self.auto_translate_to_var.get())
-        source_lang = language_code_from_display(self.source_lang_var.get())
-        engine = translation_engine_code(self.translate_engine_var.get())
-
-        def work() -> None:
-            self._emit("status", "PC 소리 녹음 중")
-            if not has_module("soundcard"):
-                raise RuntimeError("PC 소리 녹음 도구(soundcard)가 설치되어 있지 않습니다. 먼저 엔진 설치를 눌러 주세요.")
-            self._emit("step", ("engine", "완료"))
-            if not auto_translate:
-                self._emit("step", ("translate", "사용 안 함"))
-
-            ensure_not_cancelled(self.cancel_event.is_set)
-            log = lambda line: self._emit("log", line)
-            self._emit("step", ("record", "진행 중"))
-            audio_path = record_system_audio(
-                output_dir=output_dir,
-                duration_seconds=duration_seconds,
-                on_line=log,
-                on_progress=lambda value: self._emit("progress", value * 0.30),
-                should_stop=self.cancel_event.is_set,
-            )
-            self._emit("step", ("record", "완료"))
-            self._emit("output_dir", str(output_dir))
-
-            self._emit("status", "녹음한 소리 자막 만드는 중")
-            self._emit("step", ("model", "진행 중"))
-            precise = bool(self.precise_timing_var.get())
-            model = load_whisper_model(
-                self.model_var.get(),
-                device_code(self.device_var.get()),
-                self.compute_var.get(),
-                log,
-            )
-            self._emit("step", ("model", "완료"))
-            self._emit("progress", 35)
-            self._emit("subtitle_preview", "")
-
-            transcribe_span = 45 if auto_translate else 65
-            translation_start = 35 + transcribe_span
-            output_path, detected_language = transcribe_media(
-                media_path=audio_path,
-                output_dir=output_dir,
-                model=model,
-                language_code=source_lang,
-                beam_size=int(self.beam_var.get()),
-                on_line=log,
-                on_progress=lambda value: self._emit(
-                    "progress",
-                    35 + (value / 100) * transcribe_span,
-                ),
-                should_stop=self.cancel_event.is_set,
-                max_line_chars=int(self.max_line_chars_var.get()),
-                on_subtitle_preview=lambda text: self._emit("subtitle_preview", text),
-                precise=precise,
-            )
-            self._emit("subtitle_path", str(output_path))
-
-            translated_path: Path | None = None
-            if auto_translate:
-                from_code = source_lang if source_lang != "auto" else detected_language
-                if from_code not in TRANSLATION_LANGUAGES:
-                    self._emit("log", f"번역할 수 없는 원본 언어({from_code})라 번역을 건너뜁니다.")
-                elif from_code == translate_to:
-                    self._emit("log", "원본과 번역 언어가 같아 번역을 건너뜁니다.")
-                else:
-                    self._emit("step", ("translate", "진행 중"))
-                    translated_path = output_path.with_name(f"{output_path.stem}.{translate_to}.srt")
-                    translate_srt_file(
-                        source_path=output_path,
-                        target_path=translated_path,
-                        from_code=from_code,
-                        to_code=translate_to,
-                        on_line=lambda line: self._emit("log", line),
-                        on_progress=lambda value: self._emit(
-                            "progress",
-                            translation_start + (value / 100) * (100 - translation_start),
-                        ),
-                        should_stop=self.cancel_event.is_set,
-                        engine=engine,
-                    )
-                    self._emit("subtitle_path", str(translated_path))
-                    self._emit("step", ("translate", "완료"))
-
-            self._emit("step", ("audio", "완료"))
-            self._emit("step", ("subtitle", "완료"))
-            self._emit("progress", 100)
-            self._emit("status", "대기 중")
-            message = f"PC 소리 자막을 저장했습니다.\n{output_path}"
-            if translated_path is not None:
-                message += f"\n번역 자막도 저장했습니다.\n{translated_path}"
-            self._emit("done", message)
-
-        self._reset_progress()
-        self._set_step("engine", "진행 중")
-        self._run_worker(work)
-
-    def extract_embedded_subtitle(self) -> None:
-        try:
-            media_path, output_dir = self._validated_media_and_output()
-        except ValueError as exc:
-            messagebox.showwarning(APP_NAME, str(exc))
-            return
-
-        def work() -> None:
-            self._emit("status", "기존 자막 추출 중")
-            output_path = extract_embedded_subtitle(
-                media_path=media_path,
-                output_dir=output_dir,
-                on_line=lambda line: self._emit("log", line),
-                on_progress=lambda value: self._emit("progress", value),
-            )
-            self._emit("step", ("subtitle", "완료"))
-            self._emit("subtitle_path", str(output_path))
-            self._emit("status", "대기 중")
-            self._emit("done", f"기존 자막을 저장했습니다.\n{output_path}")
-
-        self._reset_progress()
-        self._set_step("file", "완료")
-        self._run_worker(work)
-
-    def translate_subtitle(self) -> None:
-        source_path = self._selected_subtitle_path()
-        if source_path is None:
-            messagebox.showwarning(APP_NAME, "번역할 SRT 파일을 먼저 선택해 주세요.")
-            return
-
-        source_code = language_code_from_display(self.translate_from_var.get())
-        target_code = language_code_from_display(self.translate_to_var.get())
-        engine = translation_engine_code(self.translate_engine_var.get())
-        overwrite = bool(self.translate_overwrite_var.get())
-        if source_code == target_code:
-            messagebox.showwarning(APP_NAME, "원본 언어와 번역 언어가 같습니다.")
-            return
-
-        if overwrite:
-            target_path = source_path
-        else:
-            target_path = self._subtitle_target_path(
-                source_path,
-                self.translate_output_path_var.get(),
-                target_code,
-                "srt",
-            )
-
-        if overwrite and not messagebox.askyesno(
-            APP_NAME,
-            "원본 SRT 파일 내용을 번역 결과로 바꿉니다.\n"
-            "원본 파일을 따로 보관하지 않았다면 되돌리기 어렵습니다.\n\n"
-            "계속하시겠습니까?",
-        ):
-            return
-
-        def work() -> None:
-            self._emit("status", "번역 저장 중")
-            self._emit("step", ("translate", "진행 중"))
-            translate_srt_file(
-                source_path=source_path,
-                target_path=target_path,
-                from_code=source_code,
-                to_code=target_code,
-                on_line=lambda line: self._emit("log", line),
-                on_progress=lambda value: self._emit("progress", value),
-                engine=engine,
-            )
-            self._emit("step", ("translate", "완료"))
-            self._emit("subtitle_path", str(target_path))
-            self._emit("status", "대기 중")
-            self._emit("done", f"번역 자막을 저장했습니다.\n{target_path}")
-
-        self._reset_progress()
-        self._run_worker(work)
-
-    def translate_subtitle_folder(self) -> None:
-        folder = filedialog.askdirectory()
-        if not folder:
-            return
-
-        source_code = language_code_from_display(self.translate_from_var.get())
-        target_code = language_code_from_display(self.translate_to_var.get())
-        engine = translation_engine_code(self.translate_engine_var.get())
-        overwrite = bool(self.translate_overwrite_var.get())
-        if source_code == target_code:
-            messagebox.showwarning(APP_NAME, "원본 언어와 번역 언어가 같습니다.")
-            return
-
-        srt_files = [
-            path
-            for path in sorted(Path(folder).glob("*.srt"))
-            if not path.stem.endswith(f".{target_code}")
-        ]
-        if not srt_files:
-            messagebox.showinfo(APP_NAME, "폴더에서 번역할 SRT 파일을 찾지 못했습니다.")
-            return
-
-        if overwrite and not messagebox.askyesno(
-            APP_NAME,
-            f"폴더 안의 SRT 파일 {len(srt_files)}개를 번역 결과로 바꿉니다.\n"
-            "원본 파일을 따로 보관하지 않았다면 되돌리기 어렵습니다.\n\n"
-            "계속하시겠습니까?",
-        ):
-            return
-
-        def work() -> None:
-            self._emit("status", "폴더 일괄 번역 중")
-            self._emit("step", ("translate", "진행 중"))
-            saved_paths: list[Path] = []
-            errors: list[str] = []
-            total = len(srt_files)
-
-            for index, srt_path in enumerate(srt_files, start=1):
-                ensure_not_cancelled(self.cancel_event.is_set)
-                self._emit("log", f"[{index}/{total}] 번역 시작: {srt_path.name}")
-                if overwrite:
-                    target_path = srt_path
-                else:
-                    target_path = srt_path.with_name(f"{srt_path.stem}.{target_code}.srt")
-                try:
-                    translate_srt_file(
-                        source_path=srt_path,
-                        target_path=target_path,
-                        from_code=source_code,
-                        to_code=target_code,
-                        on_line=lambda line: self._emit("log", line),
-                        on_progress=lambda value, item_index=index: self._emit(
-                            "progress",
-                            ((item_index - 1) + value / 100) / total * 100,
-                        ),
-                        should_stop=self.cancel_event.is_set,
-                        engine=engine,
-                    )
-                    saved_paths.append(target_path)
-                    self._emit("subtitle_path", str(target_path))
-                except OperationCancelled:
-                    raise
-                except Exception as exc:
-                    errors.append(f"{srt_path.name}: {exc}")
-                    self._emit("log", f"오류: {srt_path.name} - {exc}")
-
-            if not saved_paths and errors:
-                raise RuntimeError("폴더에서 번역에 성공한 파일이 없습니다.\n" + "\n".join(errors[:3]))
-
-            self._emit("step", ("translate", "완료"))
-            self._emit("status", "대기 중")
-            message = f"폴더에서 자막 {len(saved_paths)}개를 번역했습니다."
-            if errors:
-                message += f"\n오류 {len(errors)}개는 작업 기록을 확인해 주세요."
-            self._emit("done", message)
-
-        self._reset_progress()
-        self._run_worker(work)
-
-    def convert_subtitle(self) -> None:
-        source_path = self._selected_subtitle_path()
-        if source_path is None:
-            messagebox.showwarning(APP_NAME, "변환할 SRT 파일을 먼저 선택해 주세요.")
-            return
-
-        output_format = self.convert_format_var.get()
-        target_path = self._subtitle_target_path(
-            source_path,
-            self.convert_output_path_var.get(),
-            output_format,
-            output_format,
+        file_info = ttk.Label(
+            self.file_tab,
+            text="영상이나 음성에서 한국어 SRT 자막을 만들어 저장합니다.",
+        )
+        file_info.pack(anchor="w", pady=6)
+
+        ttk.Label(self.file_tab, text="파일 상태").pack(anchor="w")
+        ttk.Label(self.file_tab, textvariable=self.file_status_var).pack(anchor="w")
+        ttk.Label(self.file_tab, text="전체 진행").pack(anchor="w")
+        ttk.Label(self.file_tab, textvariable=self.batch_status_var).pack(anchor="w")
+
+        preview_frame = ttk.LabelFrame(self.file_tab, text="실시간 추출 미리보기")
+        preview_frame.pack(fill="both", expand=True, pady=(8, 0))
+        preview_area = ttk.Frame(preview_frame)
+        preview_area.pack(fill="both", expand=True, padx=6, pady=6)
+        self.file_preview_text = tk.Text(preview_area, height=6, wrap="word")
+        preview_scroll = ttk.Scrollbar(preview_area, orient="vertical", command=self.file_preview_text.yview)
+        self.file_preview_text.configure(yscrollcommand=preview_scroll.set)
+        self.file_preview_text.pack(side="left", fill="both", expand=True)
+        preview_scroll.pack(side="left", fill="y")
+        self.file_preview_text.insert("end", "자막 만들기를 시작하면 추출된 문장이 여기에 표시됩니다.")
+        self.file_preview_text.configure(state="disabled")
+
+        self._refresh_file_queue()
+
+        # Live tab
+        self.live_status_var = tk.StringVar(value="대기 중")
+        self.live_preview_var = tk.StringVar(value="실시간 한국어 자막이 여기에 표시됩니다.")
+        self.show_overlay_var = tk.BooleanVar(value=True)
+
+        source_frame = ttk.LabelFrame(self.live_tab, text="실시간 소리 입력")
+        source_frame.pack(fill="x", padx=4, pady=(0, 8))
+
+        live_row0 = ttk.Frame(source_frame)
+        live_row0.pack(fill="x", padx=8, pady=6)
+        ttk.Label(live_row0, text="입력:").pack(side="left")
+        ttk.Radiobutton(
+            live_row0,
+            text="PC 스피커 소리",
+            variable=self.live_source_var,
+            value=LIVE_SOURCE_SPEAKER,
+        ).pack(side="left", padx=(8, 12))
+        ttk.Radiobutton(
+            live_row0,
+            text="인터넷 URL 스트림",
+            variable=self.live_source_var,
+            value=LIVE_SOURCE_URL,
+        ).pack(side="left")
+
+        live_row_url = ttk.Frame(source_frame)
+        live_row_url.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Label(live_row_url, text="URL").pack(side="left")
+        ttk.Entry(live_row_url, textvariable=self.live_url_var, width=90).pack(
+            side="left", fill="x", expand=True, padx=8
         )
 
-        def work() -> None:
-            self._emit("status", "자막 변환 중")
-            self._emit("step", ("subtitle", "진행 중"))
-            saved_path = convert_subtitle_file(
-                source_path=source_path,
-                target_path=target_path,
-                output_format=output_format,
-                on_line=lambda line: self._emit("log", line),
-                on_progress=lambda value: self._emit("progress", value),
-            )
-            self._emit("step", ("subtitle", "완료"))
-            self._emit("subtitle_path", str(saved_path))
-            self._emit("status", "대기 중")
-            self._emit("done", f"변환 자막을 저장했습니다.\n{saved_path}")
+        live_row1 = ttk.Frame(self.live_tab)
+        live_row1.pack(fill="x", pady=6)
+        self.start_live_btn = ttk.Button(live_row1, text="시작", command=self._start_live_job)
+        self.stop_live_btn = ttk.Button(live_row1, text="중지", command=self._stop_live_job, state="disabled")
+        self.start_live_btn.pack(side="left", padx=(12, 6))
+        self.stop_live_btn.pack(side="left")
 
-        self._reset_progress()
-        self._run_worker(work)
+        live_row2 = ttk.Frame(self.live_tab)
+        live_row2.pack(fill="x", pady=6)
+        ttk.Checkbutton(
+            live_row2,
+            text="자막 창을 항상 위에 표시",
+            variable=self.show_overlay_var,
+            onvalue=True,
+            offvalue=False,
+        ).pack(side="left")
 
-    def _validated_media_and_output(self) -> tuple[Path, Path]:
-        selected_paths = [
-            self.media_table_paths[iid]
-            for iid in self.media_table_paths
-            if iid in self.selected_media_iids
+        ttk.Label(self.live_tab, text="실시간 자막 미리보기:").pack(anchor="w", pady=(12, 2))
+        self.live_preview = tk.Message(
+            self.live_tab,
+            textvariable=self.live_preview_var,
+            width=900,
+            font=("Arial", 14),
+            bg="#f8fafc",
+            relief="sunken",
+            padx=8,
+            pady=6,
+        )
+        self.live_preview.pack(fill="x")
+        ttk.Label(self.live_tab, textvariable=self.live_status_var).pack(anchor="w", pady=6)
+
+        # Screen record tab
+        record_source_frame = ttk.LabelFrame(self.record_tab, text="녹화 설정")
+        record_source_frame.pack(fill="x", padx=4, pady=(0, 8))
+
+        record_row0 = ttk.Frame(record_source_frame)
+        record_row0.pack(fill="x", padx=8, pady=6)
+        ttk.Label(record_row0, text="저장할 MKV").pack(side="left")
+        self.record_output_entry = ttk.Entry(record_row0, textvariable=self.record_output_var, width=80)
+        self.record_output_entry.pack(side="left", fill="x", expand=True, padx=8)
+        self.browse_record_btn = ttk.Button(record_row0, text="찾아보기", command=self._select_record_output)
+        self.browse_record_btn.pack(side="left")
+
+        record_row1 = ttk.Frame(record_source_frame)
+        record_row1.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Label(record_row1, text="초당 화면 수").pack(side="left")
+        self.record_fps_combo = ttk.Combobox(
+            record_row1,
+            textvariable=self.record_fps_var,
+            values=("24", "30", "60"),
+            state="readonly",
+            width=6,
+        )
+        self.record_fps_combo.pack(side="left", padx=(8, 18))
+        self.record_audio_check = ttk.Checkbutton(
+            record_row1,
+            text="PC 스피커 소리도 녹음",
+            variable=self.record_audio_var,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.record_audio_check.pack(side="left")
+
+        record_row2 = ttk.Frame(self.record_tab)
+        record_row2.pack(fill="x", pady=6)
+        self.start_record_btn = ttk.Button(record_row2, text="녹화 시작", command=self._start_record_job)
+        self.stop_record_btn = ttk.Button(
+            record_row2,
+            text="중지",
+            command=self._stop_record_job,
+            state="disabled",
+        )
+        self.start_record_btn.pack(side="left", padx=(12, 6))
+        self.stop_record_btn.pack(side="left")
+        ttk.Button(record_row2, text="결과 열기", command=self._open_output).pack(side="right", padx=(0, 12))
+
+        ttk.Label(self.record_tab, textvariable=self.record_status_var).pack(anchor="w", pady=6)
+        self._record_controls = [
+            self.record_output_entry,
+            self.browse_record_btn,
+            self.record_fps_combo,
+            self.record_audio_check,
+            self.start_record_btn,
+            self.stop_record_btn,
         ]
-        if len(selected_paths) > 1:
-            raise ValueError("이 작업은 파일 1개씩 처리합니다. 목록에서 파일 하나만 체크해 주세요.")
-        if selected_paths:
-            media_path = selected_paths[0]
-        else:
-            media_path = Path(self.media_path_var.get().strip())
-        if not media_path.exists() or not media_path.is_file():
-            if self.media_table_paths:
-                raise ValueError("작업할 파일을 목록에서 체크해 주세요.")
-            raise ValueError("영상 또는 음성 파일을 먼저 선택해 주세요.")
 
-        output_dir_text = self.output_dir_var.get().strip()
-        output_dir = Path(output_dir_text) if output_dir_text else media_path.parent
-        return media_path, output_dir
+        # Bottom common
+        common = ttk.LabelFrame(root, text="진행 상황과 작업 기록")
+        common.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-    def _selected_media_jobs(self) -> list[tuple[Path, Path]]:
-        selected_paths = [
-            self.media_table_paths[iid]
-            for iid in self.media_table_paths
-            if iid in self.selected_media_iids
-        ]
+        self.progress_var = tk.DoubleVar(value=0)
+        self.status_var = tk.StringVar(value="대기 중")
 
-        if not selected_paths and not self.media_table_paths:
-            media_path = Path(self.media_path_var.get().strip())
-            if media_path.exists() and media_path.is_file():
-                selected_paths = [media_path]
+        ttk.Label(common, textvariable=self.status_var).pack(anchor="w", padx=8, pady=(6, 0))
+        self.progress = ttk.Progressbar(common, variable=self.progress_var, maximum=100)
+        self.progress.pack(fill="x", padx=8, pady=6)
 
-        if not selected_paths:
-            if self.media_table_paths:
-                raise ValueError("작업할 파일을 목록에서 체크해 주세요.")
-            raise ValueError("자막을 만들 동영상 또는 음성 파일을 먼저 선택해 주세요.")
+        self.log_text = tk.Text(common, height=14, wrap="word")
+        self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
+        self.log_text.configure(state="disabled")
 
-        output_dir_text = self.output_dir_var.get().strip()
-        jobs: list[tuple[Path, Path]] = []
-        for media_path in selected_paths:
-            output_dir = Path(output_dir_text) if output_dir_text else media_path.parent
-            jobs.append((media_path, output_dir))
-        return jobs
-
-    def _selected_subtitle_path(self) -> Path | None:
-        path_text = self.subtitle_path_var.get().strip()
-        if not path_text:
-            return None
-
-        path = Path(path_text)
-        if path.exists() and path.is_file():
-            return path
-        return None
-
-    def _default_subtitle_name(self, source_path: Path | None, suffix: str, format_code: str) -> str:
-        stem = source_path.stem if source_path else "subtitle"
-        return f"{stem}.{suffix}{subtitle_extension(format_code)}"
-
-    def _subtitle_target_path(
-        self,
-        source_path: Path,
-        chosen_path: str,
-        suffix: str,
-        format_code: str,
-    ) -> Path:
-        if chosen_path.strip():
-            return ensure_subtitle_extension(Path(chosen_path.strip()), format_code)
-
-        output_dir_text = self.output_dir_var.get().strip()
-        output_dir = Path(output_dir_text) if output_dir_text else source_path.parent
-        return output_dir / self._default_subtitle_name(source_path, suffix, format_code)
-
-    def _run_worker(self, target: Callable[[], None], allow_when_busy: bool = False) -> None:
-        if self.busy and not allow_when_busy:
-            messagebox.showinfo(APP_NAME, "이미 작업이 진행 중입니다.")
+        self._append_log("앱을 시작했습니다.")
+    def _append_log(self, msg: object) -> None:
+        if self.log_text is None:
             return
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", f"{time.strftime('%H:%M:%S')} {msg}\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
 
-        if not allow_when_busy:
-            self.cancel_event.clear()
-            self.busy = True
-            self.work_started_at = time.time()
-            self.eta_var.set("예상 완료: 계산 중")
+    def _clear_file_preview(self) -> None:
+        self.file_preview_lines.clear()
+        self.file_preview_text.configure(state="normal")
+        self.file_preview_text.delete("1.0", tk.END)
+        self.file_preview_text.configure(state="disabled")
 
-        def wrapped() -> None:
-            started = time.time()
-            try:
-                target()
-            except OperationCancelled as exc:
-                self._emit("cancelled", str(exc))
-            except Exception as exc:
-                self._emit("error", str(exc))
-            finally:
-                if not allow_when_busy:
-                    self._emit("busy", False)
-                    self._emit("log", f"작업 시간: {time.time() - started:.1f}초")
+    def _append_file_preview(self, line: object) -> None:
+        text = str(line).strip()
+        if not text:
+            return
+        self.file_preview_lines.append(text)
+        if len(self.file_preview_lines) > 300:
+            self.file_preview_lines = self.file_preview_lines[-300:]
 
-        threading.Thread(target=wrapped, daemon=True).start()
+        self.file_preview_text.configure(state="normal")
+        self.file_preview_text.delete("1.0", tk.END)
+        self.file_preview_text.insert("end", "\n".join(self.file_preview_lines))
+        self.file_preview_text.see("end")
+        self.file_preview_text.configure(state="disabled")
 
     def _emit(self, kind: str, payload: object) -> None:
-        self.events.put((kind, payload))
+        self.event_queue.put((kind, payload))
 
     def _process_events(self) -> None:
-        processed = 0
-        max_events_per_tick = 80
-
-        while processed < max_events_per_tick:
+        drained = 0
+        while drained < 80:
+            drained += 1
             try:
-                kind, payload = self.events.get_nowait()
+                kind, payload = self.event_queue.get_nowait()
             except queue.Empty:
                 break
 
-            processed += 1
-
             if kind == "log":
-                self._append_log(str(payload))
+                self._append_log(payload)
             elif kind == "status":
                 self.status_var.set(str(payload))
-            elif kind == "status_if_idle":
-                if not self.busy:
-                    self.status_var.set(str(payload))
+            elif kind == "file_status":
+                self.file_status_var.set(str(payload))
+            elif kind == "batch_status":
+                self.batch_status_var.set(str(payload))
+            elif kind == "file_preview":
+                self._append_file_preview(payload)
+            elif kind == "file_preview_clear":
+                self._clear_file_preview()
+            elif kind == "live_status":
+                self.live_status_var.set(str(payload))
+            elif kind == "record_status":
+                self.record_status_var.set(str(payload))
             elif kind == "progress":
-                progress = float(payload)
-                self.progress_var.set(progress)
-                self._update_eta(progress)
-            elif kind == "step":
-                step_id, status = payload  # type: ignore[misc]
-                self._set_step(str(step_id), str(status))
-            elif kind == "hardware":
-                self._fill_tree(self.hardware_tree, payload)  # type: ignore[arg-type]
-            elif kind == "engines":
-                self._fill_tree(self.engine_tree, payload)  # type: ignore[arg-type]
-            elif kind == "subtitle_path":
-                output_path = Path(str(payload))
-                self.subtitle_path_var.set(str(output_path))
-                self.last_output_dir = output_path if output_path.is_dir() else output_path.parent
-            elif kind == "output_dir":
-                output_dir = Path(str(payload))
-                if output_dir.exists():
-                    self.last_output_dir = output_dir
-            elif kind == "model_status":
-                self.refresh_model_status()
-            elif kind == "nllb_status":
-                self.refresh_nllb_status()
-            elif kind == "busy_bar":
-                if payload:
-                    self.progress_bar.configure(mode="indeterminate")
-                    self.progress_bar.start(15)
-                else:
-                    self.progress_bar.stop()
-                    self.progress_bar.configure(mode="determinate")
-                    if self.progress_var.get() < 100:
-                        self.progress_var.set(0)
-                        self.eta_var.set("예상 완료: 계산 중")
-            elif kind == "busy":
-                self.busy = bool(payload)
-                if not self.busy and self.progress_var.get() >= 100:
-                    self.eta_var.set("예상 완료: 완료")
-                elif not self.busy and self.eta_var.get() == "예상 완료: 계산 중":
-                    self.eta_var.set("예상 완료: 대기 중")
-            elif kind == "done":
-                self.eta_var.set("예상 완료: 완료")
-                if self.last_output_dir is not None and self.last_output_dir.exists():
-                    self.open_output_button.config(state=tk.NORMAL)
-                messagebox.showinfo(APP_NAME, str(payload))
-            elif kind == "initial_setup_prompt":
-                if self.busy:
-                    self.after(1000, self._check_and_prompt_for_initial_setup)
-                    continue
-                response = messagebox.askyesno(
-                    APP_NAME,
-                    "PapaStop을 사용하려면 초기 설정이 필요합니다.\n\n"
-                    "필수 자막/번역 엔진을 지금 설치하시겠습니까?\n"
-                    "(인터넷 연결이 필요하며, 수 분 정도 걸릴 수 있습니다.)",
-                )
-                if response:
-                    self.install_engines()
-            elif kind == "cancelled":
-                self.busy = False
-                self.status_var.set("중지됨")
-                self.eta_var.set("예상 완료: 중지됨")
-                self._append_log(str(payload))
+                self.progress_var.set(float(payload))
+            elif kind == "output_path":
+                self.last_output = Path(str(payload))
+                self.output_path_var.set(str(self.last_output))
+            elif kind == "record_output_path":
+                self.last_output = Path(str(payload))
+                self.record_output_var.set(str(self.last_output))
+            elif kind == "live_caption":
+                text = str(payload)
+                self.live_preview_var.set(text)
+                if self.overlay is not None:
+                    self.overlay.set_text(text)
+            elif kind == "busy_file":
+                self._set_file_busy(bool(payload))
+            elif kind == "busy_live":
+                self._set_live_busy(bool(payload))
+            elif kind == "busy_record":
+                self._set_record_busy(bool(payload))
             elif kind == "error":
-                self.busy = False
-                self.status_var.set("오류 발생")
-                self.eta_var.set("예상 완료: 계산 불가")
-                self._append_log(f"오류: {payload}")
-                messagebox.showerror(APP_NAME, str(payload))
-            elif kind == "job_results":
-                self._update_media_tree_with_results(payload)  # type: ignore[arg-type]
-            elif kind == "subtitle_preview":
-                self._set_subtitle_preview(str(payload))
+                self._append_log(payload)
+                if self._is_live_running or self._is_file_running or self._is_record_running:
+                    messagebox.showerror(APP_NAME, str(payload))
+            elif kind == "done":
+                self._append_log(payload)
+                messagebox.showinfo(APP_NAME, str(payload))
+            elif kind == "subtitle_output":
+                path = Path(str(payload))
+                self.last_output = path
+                self.output_path_var.set(str(path))
+            elif kind == "asr_prepare_done":
+                payload_data = payload
+                self._set_asr_preparing(False)
+                if isinstance(payload_data, dict) and payload_data.get("message"):
+                    self._append_log(payload_data["message"])
+            elif kind == "translation_prepare_done":
+                payload_data = payload
+                self._set_translation_preparing(False)
+                if isinstance(payload_data, dict) and payload_data.get("message"):
+                    self._append_log(payload_data["message"])
 
-        delay = 10 if processed >= max_events_per_tick else 100
-        self.after(delay, self._process_events)
+            if kind == "error":
+                if self._is_file_running:
+                    self._set_file_busy(False)
+                if self._is_live_running:
+                    self._set_live_busy(False)
+                if self._is_record_running:
+                    self._set_record_busy(False)
 
-    def _update_eta(self, progress: float) -> None:
-        if self.work_started_at is None:
-            self.eta_var.set("예상 완료: 계산 중")
+        self.after(50, self._process_events)
+
+    def _set_file_busy(self, busy: bool) -> None:
+        self._is_file_running = busy
+        for widget in self._batch_controls:
+            state = "disabled" if busy else "normal"
+            if widget is self.cancel_file_btn:
+                state = "normal" if busy else "disabled"
+            if widget is self.start_file_btn and busy:
+                state = "disabled"
+            if widget in (self.whisper_model_combo, self.translation_profile_combo) and not busy:
+                state = "readonly"
+            widget.configure(state=state)
+        if self._is_asr_preparing:
+            self.prepare_asr_btn.configure(state="disabled")
+            self.start_file_btn.configure(state="disabled")
+        if self._is_translation_preparing:
+            self.prepare_translation_btn.configure(state="disabled")
+            self.start_file_btn.configure(state="disabled")
+
+    def _set_asr_preparing(self, preparing: bool) -> None:
+        self._is_asr_preparing = preparing
+        self.prepare_asr_btn.configure(state="disabled" if preparing else "normal")
+        self.prepare_translation_btn.configure(state="disabled" if preparing else "normal")
+        self.start_file_btn.configure(state="disabled" if preparing else "normal")
+        self.start_live_btn.configure(state="disabled" if preparing else "normal")
+        self.start_record_btn.configure(state="disabled" if preparing else "normal")
+        if self._is_translation_preparing:
+            self.prepare_asr_btn.configure(state="disabled")
+            self.prepare_translation_btn.configure(state="disabled")
+            self.start_file_btn.configure(state="disabled")
+            self.start_live_btn.configure(state="disabled")
+            self.start_record_btn.configure(state="disabled")
+        if self._is_file_running or self._is_live_running or self._is_record_running:
+            self.start_file_btn.configure(state="disabled")
+            self.start_live_btn.configure(state="disabled")
+            self.start_record_btn.configure(state="disabled")
+
+    def _set_translation_preparing(self, preparing: bool) -> None:
+        self._is_translation_preparing = preparing
+        if preparing:
+            self.prepare_translation_btn.configure(state="disabled")
+        else:
+            self.prepare_translation_btn.configure(state="normal")
+        self.prepare_asr_btn.configure(state="disabled" if preparing else "normal")
+        self.start_file_btn.configure(state="disabled" if preparing else "normal")
+        self.start_live_btn.configure(state="disabled" if preparing else "normal")
+        self.start_record_btn.configure(state="disabled" if preparing else "normal")
+        if self._is_asr_preparing:
+            self.prepare_asr_btn.configure(state="disabled")
+            self.prepare_translation_btn.configure(state="disabled")
+            self.start_file_btn.configure(state="disabled")
+            self.start_live_btn.configure(state="disabled")
+            self.start_record_btn.configure(state="disabled")
+
+    def _set_live_busy(self, busy: bool) -> None:
+        self._is_live_running = busy
+        self.start_live_btn.configure(state="disabled" if busy else "normal")
+        self.stop_live_btn.configure(state="normal" if busy else "disabled")
+        if not busy and self.overlay is not None:
+            self.overlay.close()
+            self.overlay = None
+
+    def _set_record_busy(self, busy: bool) -> None:
+        self._is_record_running = busy
+        for widget in self._record_controls:
+            state = "disabled" if busy else "normal"
+            if widget is self.stop_record_btn:
+                state = "normal" if busy else "disabled"
+            if widget is self.record_fps_combo and not busy:
+                state = "readonly"
+            widget.configure(state=state)
+        if self._is_asr_preparing or self._is_translation_preparing:
+            self.start_record_btn.configure(state="disabled")
+
+    def _select_record_output(self) -> None:
+        initial_path = Path(self.record_output_var.get().strip() or str(default_recording_path()))
+        path = filedialog.asksaveasfilename(
+            defaultextension=".mkv",
+            filetypes=[("MKV 영상", "*.mkv"), ("모든 파일", "*.*")],
+            initialdir=str(initial_path.parent),
+            initialfile=initial_path.name,
+        )
+        if not path:
+            return
+        self.record_output_var.set(str(Path(path).with_suffix(".mkv")))
+
+    def _select_media(self) -> None:
+        patterns = [("영상/음성 파일", " ".join(MEDIA_EXTS)), ("모든 파일", "*.*")]
+        path = filedialog.askopenfilename(filetypes=patterns)
+        if not path:
+            return
+        p = Path(path)
+        self.file_path_var.set(str(p))
+        self._set_default_output()
+
+    def _set_default_output(self) -> None:
+        media_text = self.file_path_var.get().strip()
+        if not media_text:
+            return
+        if is_http_media_source(media_text):
+            self.output_path_var.set(str(default_srt_path(media_text)))
+        else:
+            media_path = Path(media_text)
+            if not media_path.exists():
+                return
+            self.output_path_var.set(str(media_path.with_suffix(".srt")))
+
+    def _refresh_status(self) -> None:
+        tools = []
+        tools.append("faster-whisper: " + ("정상" if has_module("faster_whisper") else "없음"))
+        tools.append("transformers: " + ("정상" if has_module("transformers") else "없음"))
+        tools.append("argostranslate: " + ("정상" if has_module("argostranslate") else "없음"))
+        tools.append("soundcard: " + ("정상" if has_module("soundcard") else "없음"))
+        tools.append("ffmpeg: " + ("정상" if find_ffmpeg() else "없음"))
+        tools.append("음성 인식 모델: " + self.asr.model_label())
+        tools.append("번역 방식: " + self.translator.profile_label())
+        self._append_log(" | ".join(tools))
+
+    def _whisper_model_id_from_label(self, label: str) -> str:
+        for key, value in WHISPER_MODEL_LABELS.items():
+            if value == label:
+                return key
+        return DEFAULT_WHISPER_MODEL
+
+    def _whisper_model_from_selection(self) -> str:
+        return self._whisper_model_id_from_label(self.whisper_model_var.get())
+
+    def _on_whisper_model_selected(self, _event: object | None = None) -> None:
+        if self._is_file_running or self._is_live_running or self._is_asr_preparing:
+            self.whisper_model_var.set(self.asr.model_label())
+            messagebox.showwarning(APP_NAME, "현재 작업이 끝난 뒤 모델을 바꿔 주세요.")
+            return
+        model_name = self._whisper_model_from_selection()
+        self.asr.set_model(model_name)
+        self._append_log(f"음성 인식 모델을 바꿨습니다: {self.asr.model_label(model_name)}")
+
+    def _prepare_asr_model(self) -> None:
+        if self._is_file_running or self._is_live_running or self._is_record_running:
+            return
+        if self._is_asr_preparing or self._is_translation_preparing:
             return
 
-        if progress >= 100:
-            self.eta_var.set("예상 완료: 완료")
+        model_name = self._whisper_model_from_selection()
+        self.asr.set_model(model_name)
+        self._set_asr_preparing(True)
+        self._emit("log", f"위스퍼 모델을 미리 다운로드하는 중입니다: {self.asr.model_label(model_name)}")
+
+        def worker() -> None:
+            try:
+                self.asr.prepare_model(model_name)
+                self._emit(
+                    "asr_prepare_done",
+                    {"ok": True, "message": f"위스퍼 모델 준비 완료: {self.asr.model_label(model_name)}"},
+                )
+            except Exception as exc:
+                self._emit("error", str(exc))
+                self._emit(
+                    "asr_prepare_done",
+                    {"ok": False, "message": f"위스퍼 모델 준비 실패: {exc}"},
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _translation_profile_id_from_label(self, label: str) -> str:
+        for key, value in TRANSLATION_PROFILE_LABELS.items():
+            if value == label:
+                return key
+        return "auto"
+
+    def _translation_profile_from_selection(self) -> str:
+        return self._translation_profile_id_from_label(self.translation_profile_var.get())
+
+    def _on_translation_profile_selected(self, _event: object | None = None) -> None:
+        if self._is_file_running or self._is_live_running or self._is_translation_preparing:
+            self.translation_profile_var.set(self.translator.profile_label())
+            messagebox.showwarning(APP_NAME, "현재 작업이 끝난 뒤 번역 모델을 바꿔 주세요.")
+            return
+        profile = self._translation_profile_from_selection()
+        self.translator.set_profile(profile)
+        self._append_log(f"번역 방식을 바꿨습니다: {self.translator.profile_label()}")
+
+    def _prepare_translation_model(self) -> None:
+        if self._is_file_running or self._is_live_running or self._is_record_running:
+            return
+        if self._is_asr_preparing or self._is_translation_preparing:
             return
 
-        if progress < 3:
-            self.eta_var.set("예상 완료: 계산 중")
+        profile = self._translation_profile_from_selection()
+        self.translator.set_profile(profile)
+        self._set_translation_preparing(True)
+        self._emit("log", f"번역 모델을 준비하는 중입니다: {self.translator.profile_label()}")
+
+        def worker() -> None:
+            try:
+                self.translator.prepare_profile(profile)
+                self._emit(
+                    "translation_prepare_done",
+                    {"ok": True, "message": f"번역 모델 준비 완료: {self.translator.profile_label(profile)}"},
+                )
+            except Exception as exc:
+                self._emit("error", str(exc))
+                self._emit(
+                    "translation_prepare_done",
+                    {"ok": False, "message": f"번역 모델 준비 실패: {exc}"},
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _select_output_dir(self) -> None:
+        folder = filedialog.askdirectory()
+        if not folder:
+            return
+        self.output_path_var.set(folder)
+
+    def _append_to_queue(self, sources: list[str]) -> None:
+        added = 0
+        for source in sources:
+            source_text = str(source).strip()
+            if not source_text:
+                continue
+
+            if source_text in self.file_queue:
+                continue
+
+            if not is_http_media_source(source_text):
+                path = Path(source_text)
+                if not path.exists() or not path.is_file():
+                    self._append_log(f"잘못된 파일이라 건너뜁니다: {source_text}")
+                    continue
+                source_text = str(path.resolve())
+
+            self.file_queue.append(source_text)
+            added += 1
+
+        if added:
+            self._refresh_file_queue()
+            if self.file_path_var.get().strip():
+                self._set_default_output()
+
+    def _add_input_to_queue(self) -> None:
+        source = self.file_path_var.get().strip()
+        if not source:
+            messagebox.showwarning(APP_NAME, "먼저 영상 또는 음성 파일을 선택해 주세요.")
+            return
+        self._append_to_queue([source])
+
+    def _add_files_to_queue(self) -> None:
+        patterns = [("영상/음성 파일", " ".join(MEDIA_EXTS)), ("모든 파일", "*.*")]
+        paths = filedialog.askopenfilenames(filetypes=patterns)
+        if not paths:
+            return
+        self._append_to_queue(list(paths))
+
+    def _add_folder_to_queue(self) -> None:
+        folder = filedialog.askdirectory()
+        if not folder:
+            return
+        folder_path = Path(folder)
+        if not folder_path.exists() or not folder_path.is_dir():
+            messagebox.showwarning(APP_NAME, "올바른 폴더가 아닙니다.")
             return
 
-        elapsed = max(0.1, time.time() - self.work_started_at)
-        remaining = elapsed * (100 - progress) / progress
-        finish_time = time.strftime("%H:%M", time.localtime(time.time() + remaining))
-        self.eta_var.set(f"예상 완료: {finish_time} (약 {format_duration_short(remaining)} 남음)")
+        found: list[str] = []
+        for item in sorted(folder_path.rglob("*")):
+            if not item.is_file():
+                continue
+            if item.suffix.lower().lstrip(".") not in MEDIA_EXT_SET:
+                continue
+            found.append(str(item))
 
-    def _set_subtitle_preview(self, text: str) -> None:
-        if not hasattr(self, "subtitle_preview_text"):
+        if not found:
+            messagebox.showinfo(APP_NAME, "폴더 안에서 영상/음성 파일을 찾지 못했습니다.")
             return
 
-        self.subtitle_preview_text.configure(state=tk.NORMAL)
-        self.subtitle_preview_text.delete("1.0", tk.END)
-        if text:
-            self.subtitle_preview_text.insert(tk.END, text)
-        self.subtitle_preview_text.see(tk.END)
-        self.subtitle_preview_text.configure(state=tk.DISABLED)
+        self._append_to_queue(found)
 
-    def _append_log(self, message: str) -> None:
-        if not message:
+    def _remove_selected_files(self) -> None:
+        selected = list(self.file_listbox.curselection())
+        if not selected:
+            return
+        for index in reversed(sorted(selected)):
+            del self.file_queue[index]
+        self._refresh_file_queue()
+
+    def _clear_file_queue(self) -> None:
+        self.file_queue.clear()
+        self._refresh_file_queue()
+
+    def _move_selected_up(self) -> None:
+        selected = list(self.file_listbox.curselection())
+        if len(selected) != 1:
+            return
+        index = selected[0]
+        if index <= 0:
+            return
+        self.file_queue[index - 1], self.file_queue[index] = self.file_queue[index], self.file_queue[index - 1]
+        self._refresh_file_queue()
+        self.file_listbox.selection_set(index - 1)
+
+    def _move_selected_down(self) -> None:
+        selected = list(self.file_listbox.curselection())
+        if len(selected) != 1:
+            return
+        index = selected[0]
+        if index >= len(self.file_queue) - 1:
+            return
+        self.file_queue[index + 1], self.file_queue[index] = self.file_queue[index], self.file_queue[index + 1]
+        self._refresh_file_queue()
+        self.file_listbox.selection_set(index + 1)
+
+    def _refresh_file_queue(self) -> None:
+        self.file_listbox.delete(0, tk.END)
+        for source in self.file_queue:
+            self.file_listbox.insert(tk.END, source)
+        self.batch_status_var.set(f"{len(self.file_queue)}개 파일 대기 중")
+
+    def _collect_batch_sources(self) -> list[str]:
+        if self.file_queue:
+            selected = list(self.file_listbox.curselection())
+            if selected:
+                return [self.file_queue[idx] for idx in selected]
+            return list(self.file_queue)
+
+        source = self.file_path_var.get().strip()
+        return [source] if source else []
+
+    def _start_file_job(self) -> None:
+        if self._is_asr_preparing or self._is_translation_preparing:
+            messagebox.showwarning(APP_NAME, "모델 준비가 끝날 때까지 기다려 주세요.")
             return
 
-        self.log_text.configure(state=tk.NORMAL)
-        self.log_text.insert(tk.END, message + "\n")
-        self.log_text.see(tk.END)
-        self.log_text.configure(state=tk.NORMAL)
-
-    def _fill_tree(self, tree: ttk.Treeview, values: dict[str, str]) -> None:
-        for item in tree.get_children():
-            tree.delete(item)
-
-        for key, value in values.items():
-            tree.insert("", tk.END, text=key, values=(value,))
-
-    def _progress_steps_for_task(self, task: str) -> tuple[tuple[str, str], ...]:
-        steps_by_task: dict[str, tuple[tuple[str, str], ...]] = {
-            "make": (
-                ("file", "파일 선택"),
-                ("engine", "자막 도구 확인"),
-                ("model", "자막 품질 준비"),
-                ("audio", "소리 분석"),
-                ("subtitle", "자막 저장"),
-                ("translate", "번역 저장"),
-            ),
-            "live": (
-                ("engine", "녹음 도구 확인"),
-                ("model", "자막 품질 준비"),
-                ("record", "PC 소리 듣기"),
-                ("audio", "실시간 분석"),
-                ("subtitle", "자막 누적 저장"),
-                ("translate", "실시간 번역"),
-            ),
-            "pc_audio": (
-                ("engine", "녹음 도구 확인"),
-                ("record", "PC 소리 녹음"),
-                ("model", "자막 품질 준비"),
-                ("audio", "소리 분석"),
-                ("subtitle", "자막 저장"),
-                ("translate", "번역 저장"),
-            ),
-            "extract": (
-                ("file", "파일 선택"),
-                ("engine", "영상 도구 확인"),
-                ("subtitle", "기존 자막 저장"),
-            ),
-            "translate": (
-                ("file", "SRT 파일 선택"),
-                ("engine", "번역 도구 확인"),
-                ("translate", "번역 저장"),
-            ),
-            "convert": (
-                ("file", "SRT 파일 선택"),
-                ("subtitle", "변환 파일 저장"),
-            ),
-            "engine": (
-                ("engine", "엔진 확인/설치"),
-            ),
-        }
-        return steps_by_task.get(task, steps_by_task["make"])
-
-    def _set_progress_steps(self, task: str) -> None:
-        if not hasattr(self, "step_tree"):
+        if self._is_file_running or self._is_live_running or self._is_record_running:
             return
 
-        for item in self.step_tree.get_children():
-            self.step_tree.delete(item)
+        self.asr.set_model(self._whisper_model_from_selection())
 
-        for step_id, label in self._progress_steps_for_task(task):
-            self.step_tree.insert("", tk.END, iid=step_id, text=label, values=("대기",))
+        media_sources = self._collect_batch_sources()
+        if not media_sources:
+            messagebox.showwarning(APP_NAME, "영상 또는 음성 파일을 선택하고 목록에 추가해 주세요.")
+            return
 
-    def _set_step(self, step_id: str, status: str) -> None:
-        if self.step_tree.exists(step_id):
-            self.step_tree.set(step_id, "status", status)
-
-    def _reset_progress(self) -> None:
-        self.progress_var.set(0)
-        self.eta_var.set("예상 완료: 대기 중")
-        self.work_started_at = None
-        self.last_output_dir = None
-        if hasattr(self, "open_output_button"):
-            self.open_output_button.config(state=tk.DISABLED)
-        for step_id in self.step_tree.get_children():
-            self.step_tree.set(step_id, "status", "대기")
-
-
-def main() -> None:
-    if "--self-test" in sys.argv:
-        output_path = None
-        argument_index = sys.argv.index("--self-test")
-        if len(sys.argv) > argument_index + 1:
-            output_path = Path(sys.argv[argument_index + 1])
-        run_self_test(output_path)
-        return
-
-    if not acquire_single_instance_lock():
-        show_already_running_message()
-        return
-
-    try:
-        app = PapaStopApp()
-        app.mainloop()
-    finally:
-        release_single_instance_lock()
-
-
-def run_self_test(output_path: Path | None) -> None:
-    engine_status = check_engine_status()
-    import_results: dict[str, str] = {}
-
-    for package_name, module_name in ENGINE_PACKAGES.items():
+        output_text = self.output_path_var.get().strip()
+        total = len(media_sources)
+        output_paths: list[Path] = []
         try:
-            __import__(module_name)
-            import_results[package_name] = "ok"
+            for source in media_sources:
+                output_path = self._resolve_output_for_source(source, output_text, total)
+                output_paths.append(output_path)
+
+            for output_path in output_paths:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
-            import_results[package_name] = f"error: {exc}"
+            messagebox.showwarning(APP_NAME, str(exc))
+            return
+
+        existing_outputs = [path for path in output_paths if path.exists()]
+        if existing_outputs:
+            if not messagebox.askyesno(
+                APP_NAME,
+                build_subtitle_overwrite_prompt(existing_outputs),
+            ):
+                return
+
+        for path in media_sources:
+            if is_http_media_source(path):
+                continue
+            source_path = Path(path)
+            if not source_path.exists() or not source_path.is_file():
+                messagebox.showwarning(APP_NAME, f"올바른 영상/음성 파일이 아닙니다: {path}")
+                return
+
+        self.file_cancel_event.clear()
+        self._set_file_busy(True)
+        self.progress_var.set(0)
+        self._clear_file_preview()
+        self.batch_status_var.set(f"1/{total} 시작 중")
+        self._batch_outputs = output_paths
+        self._batch_current = 0
+        self._emit("file_status", "처리 중")
+        self._emit("status", f"파일 자막 작업 ({total}개)")
+
+        def update_for_overall_progress(file_index: int, file_progress: float) -> None:
+            base = ((file_index) / total) * 100
+            overall = base + (max(0.0, min(100.0, file_progress)) / total)
+            self._emit("progress", overall)
+
+        def worker() -> None:
+            saved_count = 0
+            failed_count = 0
+            try:
+                for index, media_source in enumerate(media_sources, start=1):
+                    self._batch_current = index
+                    if self.file_cancel_event.is_set():
+                        break
+
+                    target_output = output_paths[index - 1]
+                    display_name = Path(media_source).name if not is_http_media_source(media_source) else media_source
+                    self._emit("file_status", f"처리 중 {index}/{total}: {display_name}")
+                    self._emit("batch_status", f"{index}/{total}개 파일")
+                    self._emit("file_preview", f"--- {index}/{total} {display_name} ---")
+                    self._emit("progress", ((index - 1) / total) * 100)
+
+                    try:
+                        def preview_segment(segment: SubtitleSegment) -> None:
+                            start_text = format_srt_time(segment.start)
+                            self._emit("file_preview", f"{start_text}  {segment.text}")
+
+                        saved = self.file_workflow.run(
+                            media_source=media_source,
+                            output_srt=target_output,
+                            on_line=lambda m, s=media_source: self._emit("log", f"[{index}/{total}] {Path(s).name if not is_http_media_source(s) else s} - {m}"),
+                            on_progress=lambda p, i=index: update_for_overall_progress(i - 1, p),
+                            should_stop=self.file_cancel_event.is_set,
+                            on_segment=preview_segment,
+                        )
+                        saved_count += 1
+                        self._emit("subtitle_output", str(saved))
+                        self._emit("output_path", str(saved))
+                        self._emit("log", f"[{index}/{total}] 저장 완료: {saved}")
+                    except OperationCancelled:
+                        break
+                    except Exception as exc:
+                        failed_count += 1
+                        self._emit("log", f"[{index}/{total}] 실패: {exc}")
+                        continue
+
+                    if self.file_cancel_event.is_set():
+                        break
+
+                if self.file_cancel_event.is_set():
+                    self._emit("progress", (saved_count / total) * 100)
+                    self._emit("file_status", f"취소됨 ({saved_count}/{total})")
+                    self._emit("status", "취소됨")
+                else:
+                    self._emit("progress", (saved_count / total) * 100 if saved_count < total else 100)
+                    self._emit("file_status", f"완료 ({saved_count}/{total})")
+                    self._emit("done", f"작업이 끝났습니다. 성공: {saved_count}개, 실패: {failed_count}개")
+            except Exception as exc:
+                self._emit("error", str(exc))
+            finally:
+                self._emit("busy_file", False)
+                self._emit("status", "대기 중")
+                if total > 0:
+                    self._emit("batch_status", f"{saved_count}/{total}개 완료, {failed_count}개 실패")
+                else:
+                    self._emit("batch_status", "0개 파일")
+
+        self._emit("busy_file", True)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _resolve_output_for_source(self, media_source: str, output_text: str, total_files: int) -> Path:
+        if total_files <= 0:
+            return default_srt_path(media_source)
+
+        if output_text:
+            output_path = Path(output_text)
+            if output_path.exists():
+                if output_path.is_file():
+                    if total_files > 1:
+                        raise RuntimeError("여러 파일을 처리할 때는 파일 하나가 아니라 저장 폴더를 선택해 주세요.")
+                    return output_path
+
+                return default_srt_path(media_source, output_path)
+
+            if total_files > 1:
+                if output_path.suffix:
+                    raise RuntimeError("여러 파일을 처리할 때는 파일 하나가 아니라 저장 폴더를 선택해 주세요.")
+                return default_srt_path(media_source, output_path)
+
+            return output_path
+
+        return default_srt_path(media_source)
+
+    def _cancel_file_job(self) -> None:
+        if self._is_file_running:
+            self.file_cancel_event.set()
+            self._append_log("파일 자막 작업 중지를 요청했습니다.")
+
+    def _start_record_job(self) -> None:
+        if self._is_asr_preparing or self._is_translation_preparing:
+            messagebox.showwarning(APP_NAME, "모델 준비가 끝날 때까지 기다려 주세요.")
+            return
+        if self._is_file_running or self._is_live_running:
+            messagebox.showwarning(APP_NAME, "현재 작업이 끝난 뒤 다시 시도해 주세요.")
+            return
+        if self._is_record_running:
+            return
+        if os.name != "nt":
+            messagebox.showwarning(APP_NAME, "화면 녹화는 Windows에서만 사용할 수 있습니다.")
+            return
+        if not find_ffmpeg():
+            messagebox.showwarning(APP_NAME, "화면 녹화에는 ffmpeg가 필요합니다.")
+            return
+        if self.record_audio_var.get() and not has_module("soundcard"):
+            messagebox.showwarning(APP_NAME, "PC 스피커 소리를 녹음하려면 soundcard가 필요합니다.")
+            return
+
+        output_text = self.record_output_var.get().strip()
+        output_path = Path(output_text).with_suffix(".mkv") if output_text else default_recording_path()
+        self.record_output_var.set(str(output_path))
+
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            messagebox.showwarning(APP_NAME, f"저장 폴더를 만들 수 없습니다: {exc}")
+            return
+
+        if output_path.exists() and not messagebox.askyesno(
+            APP_NAME,
+            "이미 같은 이름의 파일이 있습니다.\n덮어쓰고 계속할까요?",
+        ):
+            return
+
+        try:
+            fps = int(self.record_fps_var.get())
+        except ValueError:
+            fps = DEFAULT_RECORD_FPS
+
+        self.record_cancel_event = threading.Event()
+        self.record_cancel_event.clear()
+        self._emit("busy_record", True)
+        self._emit("record_status", "시작 중 ...")
+        self._emit("status", "화면 녹화 중")
+
+        def worker() -> None:
+            try:
+                self.record_service.start(
+                    output_path=output_path,
+                    fps=fps,
+                    capture_audio=bool(self.record_audio_var.get()),
+                    emit=self._emit,
+                    stop_event=self.record_cancel_event,
+                )
+            except Exception as exc:
+                self._emit("error", str(exc))
+                self._emit("busy_record", False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _stop_record_job(self) -> None:
+        if not self._is_record_running:
+            return
+
+        self._emit("record_status", "중지하는 중 ...")
+        try:
+            self.record_service.stop()
+        except Exception as exc:
+            self._append_log(f"화면 녹화 중지 오류: {exc}")
+
+    def _start_live_job(self) -> None:
+        if self._is_asr_preparing or self._is_translation_preparing:
+            messagebox.showwarning(APP_NAME, "모델 준비가 끝날 때까지 기다려 주세요.")
+            return
+
+        if self._is_live_running or self._is_file_running or self._is_record_running:
+            return
+
+        self.asr.set_model(self._whisper_model_from_selection())
+
+        live_source = self.live_source_var.get()
+        live_url = self.live_url_var.get().strip() if live_source == LIVE_SOURCE_URL else ""
+
+        if live_source == LIVE_SOURCE_URL:
+            if not live_url:
+                messagebox.showwarning(APP_NAME, "인터넷 URL을 입력해 주세요.")
+                return
+            if not is_http_media_source(live_url):
+                messagebox.showwarning(APP_NAME, "URL은 http, https, rtmp, rtmps, rtsp 중 하나로 시작해야 합니다.")
+                return
+            if not find_ffmpeg():
+                messagebox.showwarning(APP_NAME, "인터넷 실시간 캡처에는 ffmpeg가 필요합니다.")
+                return
+        else:
+            if not has_module("soundcard"):
+                messagebox.showwarning(APP_NAME, "PC 스피커 실시간 자막에는 soundcard가 필요합니다.")
+                return
+
+        self.live_cancel_event = threading.Event()
+        self.live_cancel_event.clear()
+        self._emit("busy_live", True)
+        self._emit("live_status", "연결 중 ...")
+        self._emit("status", "실시간 자막")
+
+        if self.show_overlay_var.get():
+            self.overlay = LiveSubtitleOverlay(self)
+            self.overlay.lift()
+
+        def worker() -> None:
+            try:
+                self.live_service.start(
+                    self._emit,
+                    self.live_cancel_event,
+                    internet_url=live_url if live_source == LIVE_SOURCE_URL else None,
+                )
+            except Exception as exc:
+                self._emit("error", str(exc))
+                self._emit("busy_live", False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _stop_live_job(self) -> None:
+        if not self._is_live_running:
+            return
+
+        self._emit("live_status", "중지하는 중 ...")
+        try:
+            self.live_service.stop()
+        except Exception as exc:
+            self._append_log(f"실시간 자막 중지 오류: {exc}")
+        self._emit("busy_live", False)
+        self._emit("live_status", "대기 중")
+        self._emit("status", "대기 중")
+
+    def _open_output(self) -> None:
+        if self.last_output is None or not self.last_output.exists():
+            messagebox.showwarning(APP_NAME, "아직 열 수 있는 결과 파일이 없습니다.")
+            return
+        if os.name == "nt":
+            os.startfile(str(self.last_output))
+        else:
+            self._emit("log", f"이 운영체제에서는 자동 열기를 사용할 수 없습니다: {self.last_output}")
+def main() -> None:
+    if not APP_ROOT.exists():
+        raise RuntimeError(f"앱 폴더를 확인할 수 없습니다: {APP_ROOT}")
 
     app = PapaStopApp()
-    app.update_idletasks()
-    window_size = [app.winfo_reqwidth(), app.winfo_reqheight()]
-    app.destroy()
-
-    result = {
-        "app": APP_NAME,
-        "frozen": is_frozen_app(),
-        "app_dir": str(APP_DIR),
-        "engine_status": engine_status,
-        "engine_imports": import_results,
-        "window_size": window_size,
-    }
-
-    if output_path:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    else:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+    app.mainloop()
 
 
 if __name__ == "__main__":
     main()
+
+
+
