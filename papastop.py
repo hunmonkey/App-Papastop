@@ -20,7 +20,9 @@ from typing import Callable
 from urllib.parse import urlparse
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
 
 
 APP_NAME = "PapaStop"
@@ -116,6 +118,48 @@ RESOURCE_MODE_LABELS = {
     "max": "최대 성능 (CPU/GPU 적극 사용)",
     "balanced": "균형 (PC 여유 남김)",
 }
+
+
+# ──────────────────────────────────────────────────────────────
+# 모던 라이트 UI 테마 색상 (Tailwind slate + indigo 계열)
+# ──────────────────────────────────────────────────────────────
+UI_BG = "#e6eaf2"            # 앱 전체 배경 (카드와 대비를 위해 약간 진한 회색)
+UI_SURFACE = "#ffffff"       # 입력/목록/로그 등 콘텐츠 표면
+UI_SURFACE_HOVER = "#eef2ff"  # 버튼 호버 등 옅은 강조 배경
+UI_BORDER = "#d6dbe6"        # 옅은 경계선
+UI_BORDER_STRONG = "#b9c1d1"  # 카드/입력 테두리 (또렷하게)
+UI_CARD_BORDER = "#c4ccda"   # 카드 구분용 테두리
+UI_TEXT = "#0f172a"          # 본문 텍스트
+UI_TEXT_MUTED = "#64748b"    # 보조 텍스트
+UI_ACCENT = "#4f46e5"        # 인디고 강조색
+UI_ACCENT_HOVER = "#4338ca"
+UI_ACCENT_ACTIVE = "#3730a3"
+OVERLAY_BG = "#0f172a"       # 자막 오버레이 배경 (어두운 톤 유지)
+OVERLAY_FG = "#f8fafc"
+
+_UI_FONT_FAMILY_CACHE: str | None = None
+
+
+def resolve_ui_font_family() -> str:
+    """현재 시스템에서 쓸 수 있는 가장 모던한 글꼴을 한 번만 골라 둡니다."""
+    global _UI_FONT_FAMILY_CACHE
+    if _UI_FONT_FAMILY_CACHE is not None:
+        return _UI_FONT_FAMILY_CACHE
+
+    family = "Segoe UI"
+    try:
+        import tkinter.font as tkfont
+
+        available = set(tkfont.families())
+        for candidate in ("Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", "Malgun Gothic"):
+            if candidate in available:
+                family = candidate
+                break
+    except Exception:
+        family = "Segoe UI"
+
+    _UI_FONT_FAMILY_CACHE = family
+    return family
 
 
 @dataclass
@@ -1604,6 +1648,18 @@ class LiveCaptionService:
         if self._srt_path is not None:
             self._srt_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # 첫 청크에서 모델을 로딩하면 10초 가까이 걸려 그 사이 들어온 앞 구간이 버려진다.
+        # 캡처를 시작하기 전에 음성 인식·번역 모델을 미리 올려 두어 첫 구간부터 따라잡게 한다.
+        emit("live_status", "음성 인식·번역 모델을 준비하는 중입니다 ...")
+        try:
+            self.asr.prepare_model()
+            self.translator.prepare_profile()
+        except Exception as exc:
+            emit("log", f"실시간 모델 사전 준비 중 경고: {exc}")
+        if stop_event.is_set():
+            return
+        emit("live_status", "실시간 자막을 시작합니다 ...")
+
         if self._source_url:
             capture_target = self._capture_from_url
             capture_args = (self._source_url, emit, stop_event)
@@ -2263,7 +2319,12 @@ class LiveSubtitleOverlay(tk.Toplevel):
         self.withdraw()
         self.overrideredirect(True)
         self.attributes("-topmost", True)
-        self.configure(bg="#0f172a")
+        try:
+            self.attributes("-alpha", 0.95)
+        except Exception:
+            pass
+        # 바깥 테두리를 인디고 액센트로 얇게 깔아 카드 느낌을 줍니다.
+        self.configure(bg=UI_ACCENT)
         self._drag_start_x = 0
         self._drag_start_y = 0
 
@@ -2274,15 +2335,17 @@ class LiveSubtitleOverlay(tk.Toplevel):
         self.label = tk.Label(
             self,
             text="",
-            fg="white",
-            bg="#0f172a",
-            font=("Arial", 26, "bold"),
+            fg=OVERLAY_FG,
+            bg=OVERLAY_BG,
+            font=(resolve_ui_font_family(), 26, "bold"),
             justify="center",
             wraplength=1000,
+            padx=28,
+            pady=20,
         )
         self.label.bind("<Button-1>", self._begin_drag)
         self.label.bind("<B1-Motion>", self._on_drag)
-        self.label.pack(fill="both", expand=True, padx=16, pady=16)
+        self.label.pack(fill="both", expand=True, padx=2, pady=2)
 
         screen_w = self.winfo_screenwidth()
         self.geometry(f"1100x220+{max(20, (screen_w - 1100) // 2)}+20")
@@ -2310,11 +2373,13 @@ class LiveSubtitleOverlay(tk.Toplevel):
             pass
 
 
-class PapaStopApp(tk.Tk):
+class PapaStopApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
         self._configure_main_window()
+        self._apply_theme()
+        self.configure(fg_color=UI_BG)
 
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
 
@@ -2345,6 +2410,46 @@ class PapaStopApp(tk.Tk):
         self._refresh_system_specs()
         self.after(80, self._process_events)
 
+    def _apply_theme(self) -> None:
+        """customtkinter 라이트 테마 + 인디고 액센트를 전역으로 설정합니다."""
+        ctk.set_appearance_mode("light")
+        ctk.set_default_color_theme("blue")
+
+        indigo = [UI_ACCENT, UI_ACCENT]
+        indigo_hover = [UI_ACCENT_HOVER, UI_ACCENT_HOVER]
+        indigo_active = [UI_ACCENT_ACTIVE, UI_ACCENT_ACTIVE]
+        scroll_color = [UI_BORDER_STRONG, UI_BORDER_STRONG]
+        scroll_hover = [UI_TEXT_MUTED, UI_TEXT_MUTED]
+
+        theme = ctk.ThemeManager.theme
+
+        def assign(widget: str, key: str, value: object) -> None:
+            if widget in theme and key in theme[widget]:
+                theme[widget][key] = value
+
+        assign("CTkButton", "fg_color", indigo)
+        assign("CTkButton", "hover_color", indigo_hover)
+        assign("CTkProgressBar", "progress_color", indigo)
+        assign("CTkOptionMenu", "fg_color", indigo)
+        assign("CTkOptionMenu", "button_color", indigo_hover)
+        assign("CTkOptionMenu", "button_hover_color", indigo_active)
+        assign("CTkCheckBox", "fg_color", indigo)
+        assign("CTkCheckBox", "hover_color", indigo_hover)
+        assign("CTkRadioButton", "fg_color", indigo)
+        assign("CTkRadioButton", "hover_color", indigo_hover)
+        assign("CTkSegmentedButton", "selected_color", ["#e0e7ff", "#e0e7ff"])
+        assign("CTkSegmentedButton", "selected_hover_color", ["#c7d2fe", "#c7d2fe"])
+        assign("CTkScrollbar", "button_color", scroll_color)
+        assign("CTkScrollbar", "button_hover_color", scroll_hover)
+
+        # customtkinter 기본 글꼴(Roboto)은 한글이 깨지므로 한글 지원 글꼴로 강제한다.
+        self._ui_font_family = resolve_ui_font_family()
+        try:
+            if isinstance(theme.get("CTkFont"), dict):
+                theme["CTkFont"]["family"] = self._ui_font_family
+        except Exception:
+            pass
+
     def _configure_main_window(self) -> None:
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
@@ -2355,30 +2460,23 @@ class PapaStopApp(tk.Tk):
         self.geometry(f"{width}x{height}+{x}+{y}")
         self.minsize(min(900, width), min(620, height))
 
-    def _create_scrollable_tab(self, notebook: ttk.Notebook) -> tuple[ttk.Frame, ttk.Frame]:
-        outer = ttk.Frame(notebook)
-        canvas = tk.Canvas(outer, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        inner = ttk.Frame(canvas)
-        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+    def _make_card(self, parent, title: str):
+        """제목이 달린 흰색 카드 프레임을 만들고 (카드, 내용 프레임)을 돌려줍니다."""
+        card = ctk.CTkFrame(
+            parent, fg_color=UI_SURFACE, corner_radius=12, border_width=1, border_color=UI_CARD_BORDER
+        )
+        ctk.CTkLabel(
+            card, text=title, font=self.font_section, text_color=UI_TEXT, anchor="w"
+        ).pack(fill="x", padx=16, pady=(12, 2))
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+        return card, body
 
-        def resize_scroll_area(_event: object | None = None) -> None:
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def resize_inner_width(event: tk.Event) -> None:
-            canvas.itemconfigure(window_id, width=event.width)
-
-        def on_mousewheel(event: tk.Event) -> None:
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        inner.bind("<Configure>", resize_scroll_area)
-        canvas.bind("<Configure>", resize_inner_width)
-        canvas.bind("<Enter>", lambda _event: canvas.bind_all("<MouseWheel>", on_mousewheel))
-        canvas.bind("<Leave>", lambda _event: canvas.unbind_all("<MouseWheel>"))
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        return outer, inner
+    def _live_label(self, parent, variable: tk.StringVar, **kwargs):
+        """StringVar 값이 바뀌면 자동으로 글자를 갱신하는 CTkLabel을 만듭니다."""
+        label = ctk.CTkLabel(parent, text=variable.get(), **kwargs)
+        variable.trace_add("write", lambda *_a, v=variable, w=label: w.configure(text=v.get()))
+        return label
 
     def _build_ui(self) -> None:
         root = self
@@ -2386,17 +2484,56 @@ class PapaStopApp(tk.Tk):
         root.grid_rowconfigure(0, weight=3)
         root.grid_rowconfigure(1, weight=2)
 
-        nb = ttk.Notebook(root)
-        nb.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
+        fam = self._ui_font_family
+        self.font_base = ctk.CTkFont(family=fam, size=13)
+        self.font_section = ctk.CTkFont(family=fam, size=14, weight="bold")
+        self.font_caption = ctk.CTkFont(family=fam, size=15)
 
-        self.system_tab = ttk.Frame(nb)
-        self.file_tab_container, self.file_tab = self._create_scrollable_tab(nb)
-        self.live_tab = ttk.Frame(nb)
-        self.record_tab = ttk.Frame(nb)
-        nb.add(self.file_tab_container, text="파일 자막")
-        nb.add(self.live_tab, text="실시간 자막")
-        nb.add(self.record_tab, text="화면 녹화")
-        nb.add(self.system_tab, text="시스템 사양")
+        self._ghost_btn = dict(
+            fg_color="transparent",
+            hover_color=UI_SURFACE_HOVER,
+            text_color=UI_ACCENT,
+            border_width=1,
+            border_color=UI_BORDER_STRONG,
+            corner_radius=8,
+        )
+        self._danger_btn = dict(fg_color="#dc2626", hover_color="#b91c1c", text_color="#ffffff")
+        self._entry_kw = dict(
+            height=34,
+            corner_radius=8,
+            border_color=UI_BORDER_STRONG,
+            fg_color="#ffffff",
+            text_color=UI_TEXT,
+            font=self.font_base,
+        )
+        self._option_kw = dict(height=34, corner_radius=8, font=self.font_base, dropdown_font=self.font_base)
+
+        # 모든 탭에서 똑같이 쓰는 주요 동작 버튼 규격 (시작 / 중지 / 결과 열기)
+        self._primary_btn_kw = dict(width=150, height=40, corner_radius=8, font=self.font_base)
+        self._stop_btn_kw = dict(width=96, height=40, corner_radius=8, **self._danger_btn)
+        self._open_btn_kw = dict(width=110, height=40, **self._ghost_btn)
+
+        self.tabview = ctk.CTkTabview(
+            root,
+            fg_color=UI_BG,
+            segmented_button_fg_color=UI_SURFACE,
+            segmented_button_unselected_color=UI_SURFACE,
+            segmented_button_unselected_hover_color=UI_SURFACE_HOVER,
+            text_color=UI_TEXT,
+            corner_radius=12,
+        )
+        self.tabview.grid(row=0, column=0, sticky="nsew", padx=14, pady=(12, 6))
+
+        file_tab_frame = self.tabview.add("파일 자막")
+        live_tab_frame = self.tabview.add("실시간 자막")
+        record_tab_frame = self.tabview.add("화면 녹화")
+        system_tab_frame = self.tabview.add("시스템 사양")
+
+        self.file_tab = ctk.CTkScrollableFrame(file_tab_frame, fg_color="transparent")
+        self.file_tab.pack(fill="both", expand=True)
+        self.live_tab = live_tab_frame
+        self.record_tab = record_tab_frame
+        self.system_tab = system_tab_frame
 
         self.system_cpu_var = tk.StringVar(value="확인 중 ...")
         self.system_ram_var = tk.StringVar(value="확인 중 ...")
@@ -2404,46 +2541,61 @@ class PapaStopApp(tk.Tk):
         self.resource_mode_var = tk.StringVar(value=RESOURCE_MODE_LABELS[DEFAULT_RESOURCE_MODE])
         self.resource_plan_var = tk.StringVar(value=build_resource_settings(DEFAULT_RESOURCE_MODE).summary)
 
-        system_frame = ttk.LabelFrame(self.system_tab, text="현재 PC 사양")
-        system_frame.pack(fill="x", padx=4, pady=(0, 8))
+        system_card, system_body = self._make_card(self.system_tab, "현재 PC 사양")
+        system_card.pack(fill="x", pady=(2, 10))
 
         def add_system_row(label: str, variable: tk.StringVar) -> None:
-            row = ttk.Frame(system_frame)
-            row.pack(fill="x", padx=8, pady=6)
-            ttk.Label(row, text=label, width=12).pack(side="left", anchor="n")
-            tk.Message(
+            row = ctk.CTkFrame(system_body, fg_color="transparent")
+            row.pack(fill="x", pady=4)
+            ctk.CTkLabel(
+                row, text=label, width=80, anchor="w", text_color=UI_TEXT_MUTED, font=self.font_base
+            ).pack(side="left", anchor="n")
+            self._live_label(
                 row,
-                textvariable=variable,
-                width=760,
-                bg=self.cget("bg"),
-                anchor="w",
+                variable,
+                font=self.font_base,
                 justify="left",
+                anchor="w",
+                wraplength=620,
+                text_color=UI_TEXT,
             ).pack(side="left", fill="x", expand=True)
 
         add_system_row("CPU", self.system_cpu_var)
         add_system_row("RAM", self.system_ram_var)
         add_system_row("VGA", self.system_vga_var)
 
-        resource_row = ttk.Frame(system_frame)
-        resource_row.pack(fill="x", padx=8, pady=6)
-        ttk.Label(resource_row, text="자원 사용", width=12).pack(side="left", anchor="n")
-        self.resource_mode_combo = ttk.Combobox(
+        resource_row = ctk.CTkFrame(system_body, fg_color="transparent")
+        resource_row.pack(fill="x", pady=4)
+        ctk.CTkLabel(
+            resource_row, text="자원 사용", width=80, anchor="w", text_color=UI_TEXT_MUTED, font=self.font_base
+        ).pack(side="left", anchor="n")
+        self.resource_mode_combo = ctk.CTkOptionMenu(
             resource_row,
-            textvariable=self.resource_mode_var,
+            variable=self.resource_mode_var,
             values=[RESOURCE_MODE_LABELS[key] for key in RESOURCE_MODE_ORDER],
-            state="readonly",
-            width=30,
+            command=self._on_resource_mode_selected,
+            width=280,
+            **self._option_kw,
         )
-        self.resource_mode_combo.bind("<<ComboboxSelected>>", self._on_resource_mode_selected)
-        self.resource_mode_combo.current(RESOURCE_MODE_ORDER.index(DEFAULT_RESOURCE_MODE))
-        self.resource_mode_combo.pack(side="left", padx=(0, 8))
-        ttk.Label(resource_row, textvariable=self.resource_plan_var).pack(side="left", fill="x", expand=True)
+        self.resource_mode_combo.pack(side="left", padx=(0, 10))
+        self._live_label(
+            resource_row,
+            self.resource_plan_var,
+            font=self.font_base,
+            justify="left",
+            anchor="w",
+            wraplength=520,
+            text_color=UI_TEXT_MUTED,
+        ).pack(side="left", fill="x", expand=True)
 
-        ttk.Button(
+        ctk.CTkButton(
             self.system_tab,
             text="사양 새로고침",
             command=self._refresh_system_specs,
-        ).pack(anchor="w", padx=4, pady=6)
+            width=120,
+            height=34,
+            **self._ghost_btn,
+        ).pack(anchor="w", pady=6)
 
         # File tab
         self.file_path_var = tk.StringVar()
@@ -2460,117 +2612,147 @@ class PapaStopApp(tk.Tk):
         self.record_audio_var = tk.BooleanVar(value=True)
         self.record_fps_var = tk.StringVar(value=str(DEFAULT_RECORD_FPS))
 
-        file_row0 = ttk.Frame(self.file_tab)
-        file_row0.pack(fill="x", pady=6)
-        ttk.Label(file_row0, text="원본 영상/음성").pack(side="left")
-        ttk.Entry(file_row0, textvariable=self.file_path_var, width=80).pack(
-            side="left", fill="x", expand=True, padx=8
+        def file_row() -> ctk.CTkFrame:
+            row = ctk.CTkFrame(self.file_tab, fg_color="transparent")
+            row.pack(fill="x", pady=6)
+            return row
+
+        def row_label(parent, text, **kw):
+            return ctk.CTkLabel(parent, text=text, font=self.font_base, text_color=UI_TEXT, **kw)
+
+        file_row0 = file_row()
+        row_label(file_row0, "원본 영상/음성").pack(side="left")
+        ctk.CTkEntry(file_row0, textvariable=self.file_path_var, **self._entry_kw).pack(
+            side="left", fill="x", expand=True, padx=10
         )
-        self.select_media_btn = ttk.Button(file_row0, text="선택", command=self._select_media)
+        self.select_media_btn = ctk.CTkButton(
+            file_row0, text="선택", command=self._select_media, width=70, height=34, **self._ghost_btn
+        )
         self.select_media_btn.pack(side="left")
-        self.add_file_btn = ttk.Button(file_row0, text="목록에 추가", command=self._add_input_to_queue)
-        self.add_file_btn.pack(side="left", padx=6)
-
-        file_row1 = ttk.Frame(self.file_tab)
-        file_row1.pack(fill="x", pady=6)
-        ttk.Label(file_row1, text="저장할 SRT / 폴더").pack(side="left")
-        ttk.Entry(file_row1, textvariable=self.output_path_var, width=80).pack(
-            side="left", fill="x", expand=True, padx=8
+        self.add_file_btn = ctk.CTkButton(
+            file_row0, text="목록에 추가", command=self._add_input_to_queue, width=100, height=34, **self._ghost_btn
         )
-        ttk.Button(file_row1, text="같은 이름으로", command=self._set_default_output).pack(side="left")
-        ttk.Button(file_row1, text="폴더 선택", command=self._select_output_dir).pack(side="left", padx=6)
+        self.add_file_btn.pack(side="left", padx=8)
 
-        file_row2 = ttk.Frame(self.file_tab)
-        file_row2.pack(fill="x", pady=8)
-        self.start_file_btn = ttk.Button(file_row2, text="자막 만들기 시작", command=self._start_file_job)
-        self.cancel_file_btn = ttk.Button(file_row2, text="중지", command=self._cancel_file_job, state="disabled")
+        file_row1 = file_row()
+        row_label(file_row1, "저장할 SRT / 폴더").pack(side="left")
+        ctk.CTkEntry(file_row1, textvariable=self.output_path_var, **self._entry_kw).pack(
+            side="left", fill="x", expand=True, padx=10
+        )
+        ctk.CTkButton(
+            file_row1, text="같은 이름으로", command=self._set_default_output, width=110, height=34, **self._ghost_btn
+        ).pack(side="left")
+        ctk.CTkButton(
+            file_row1, text="폴더 선택", command=self._select_output_dir, width=90, height=34, **self._ghost_btn
+        ).pack(side="left", padx=8)
+
+        file_row2 = file_row()
+        self.start_file_btn = ctk.CTkButton(
+            file_row2, text="자막 만들기 시작", command=self._start_file_job, **self._primary_btn_kw
+        )
+        self.cancel_file_btn = ctk.CTkButton(
+            file_row2, text="중지", command=self._cancel_file_job, state="disabled", **self._stop_btn_kw
+        )
         self.start_file_btn.pack(side="left")
-        self.cancel_file_btn.pack(side="left", padx=6)
-        ttk.Button(file_row2, text="결과 열기", command=self._open_output).pack(side="right")
+        self.cancel_file_btn.pack(side="left", padx=8)
+        ctk.CTkButton(
+            file_row2, text="결과 열기", command=self._open_output, **self._open_btn_kw
+        ).pack(side="right")
 
-        file_row3 = ttk.Frame(self.file_tab)
-        file_row3.pack(fill="x", pady=6)
-        ttk.Label(file_row3, text="음성 인식 모델").pack(side="left")
-        self.whisper_model_combo = ttk.Combobox(
+        file_row3 = file_row()
+        row_label(file_row3, "음성 인식 모델").pack(side="left")
+        self.whisper_model_combo = ctk.CTkOptionMenu(
             file_row3,
-            textvariable=self.whisper_model_var,
+            variable=self.whisper_model_var,
             values=[WHISPER_MODEL_LABELS[key] for key in WHISPER_MODEL_ORDER],
-            state="readonly",
-            width=30,
+            command=self._on_whisper_model_selected,
+            width=220,
+            **self._option_kw,
         )
-        self.whisper_model_combo.bind("<<ComboboxSelected>>", self._on_whisper_model_selected)
-        self.whisper_model_combo.current(WHISPER_MODEL_ORDER.index(DEFAULT_WHISPER_MODEL))
-        self.whisper_model_combo.pack(side="left", padx=8)
-        self.prepare_asr_btn = ttk.Button(
+        self.whisper_model_combo.pack(side="left", padx=10)
+        self.prepare_asr_btn = ctk.CTkButton(
             file_row3,
             text="위스퍼 모델 다운로드",
             command=self._prepare_asr_model,
+            width=150,
+            height=34,
+            **self._ghost_btn,
         )
         self.prepare_asr_btn.pack(side="left", padx=6)
-        ttk.Label(file_row3, text="원본 언어").pack(side="left", padx=(18, 0))
-        self.file_source_lang_combo = ttk.Combobox(
+        row_label(file_row3, "원본 언어").pack(side="left", padx=(18, 0))
+        self.file_source_lang_combo = ctk.CTkOptionMenu(
             file_row3,
-            textvariable=self.source_lang_var,
+            variable=self.source_lang_var,
             values=[SOURCE_LANG_LABELS[key] for key in SOURCE_LANG_ORDER],
-            state="readonly",
-            width=12,
+            command=self._on_source_lang_selected,
+            width=130,
+            **self._option_kw,
         )
-        self.file_source_lang_combo.bind("<<ComboboxSelected>>", self._on_source_lang_selected)
-        self.file_source_lang_combo.pack(side="left", padx=8)
+        self.file_source_lang_combo.pack(side="left", padx=10)
 
-        file_row4 = ttk.Frame(self.file_tab)
-        file_row4.pack(fill="x", pady=6)
-        ttk.Label(file_row4, text="번역 모델").pack(side="left")
-        self.translation_profile_combo = ttk.Combobox(
+        file_row4 = file_row()
+        row_label(file_row4, "번역 모델").pack(side="left")
+        self.translation_profile_combo = ctk.CTkOptionMenu(
             file_row4,
-            textvariable=self.translation_profile_var,
+            variable=self.translation_profile_var,
             values=[TRANSLATION_PROFILE_LABELS[key] for key in TRANSLATION_PROFILE_ORDER],
-            state="readonly",
-            width=45,
+            command=self._on_translation_profile_selected,
+            width=320,
+            **self._option_kw,
         )
-        self.translation_profile_combo.bind("<<ComboboxSelected>>", self._on_translation_profile_selected)
-        self.translation_profile_combo.current(0)
-        self.translation_profile_combo.pack(side="left", padx=8)
-        self.prepare_translation_btn = ttk.Button(
+        self.translation_profile_combo.pack(side="left", padx=10)
+        self.prepare_translation_btn = ctk.CTkButton(
             file_row4,
             text="번역 모델 다운로드",
             command=self._prepare_translation_model,
+            width=150,
+            height=34,
+            **self._ghost_btn,
         )
         self.prepare_translation_btn.pack(side="left", padx=6)
 
-        queue_frame = ttk.LabelFrame(self.file_tab, text="작업할 파일 목록")
-        queue_frame.pack(fill="both", expand=True, pady=(0, 8))
+        queue_card, queue_body = self._make_card(self.file_tab, "작업할 파일 목록")
+        queue_card.pack(fill="both", expand=True, pady=(4, 6))
 
-        list_area = ttk.Frame(queue_frame)
-        list_area.pack(fill="both", expand=True, padx=6, pady=6)
+        list_area = ctk.CTkFrame(queue_body, fg_color="transparent")
+        list_area.pack(fill="both", expand=True)
 
-        listbox_area = ttk.Frame(list_area)
-        listbox_area.pack(side="left", fill="both", expand=True)
+        listbox_wrap = ctk.CTkFrame(list_area, fg_color="#ffffff", corner_radius=8, border_width=1, border_color=UI_BORDER_STRONG)
+        listbox_wrap.pack(side="left", fill="both", expand=True)
         self.file_listbox = tk.Listbox(
-            listbox_area,
-            height=5,
+            listbox_wrap,
+            height=6,
             selectmode="extended",
             exportselection=False,
+            bg="#ffffff",
+            fg=UI_TEXT,
+            font=(self._ui_font_family, 10),
+            selectbackground=UI_ACCENT,
+            selectforeground="#ffffff",
+            activestyle="none",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
         )
-        list_scroll = ttk.Scrollbar(listbox_area, orient="vertical", command=self.file_listbox.yview)
+        self.file_listbox.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+        list_scroll = ctk.CTkScrollbar(listbox_wrap, command=self.file_listbox.yview)
+        list_scroll.pack(side="right", fill="y", padx=(2, 4), pady=8)
         self.file_listbox.configure(yscrollcommand=list_scroll.set)
-        self.file_listbox.pack(side="left", fill="both", expand=True)
-        list_scroll.pack(side="left", fill="y")
 
-        queue_button_frame = ttk.Frame(list_area)
-        queue_button_frame.pack(side="left", fill="y", padx=(8, 0))
-        self.add_queue_btn = ttk.Button(queue_button_frame, text="파일 추가", command=self._add_files_to_queue)
-        self.add_queue_btn.pack(fill="x")
-        self.add_folder_btn = ttk.Button(queue_button_frame, text="폴더 추가", command=self._add_folder_to_queue)
-        self.add_folder_btn.pack(fill="x", pady=4)
-        self.remove_queue_btn = ttk.Button(queue_button_frame, text="선택 삭제", command=self._remove_selected_files)
-        self.remove_queue_btn.pack(fill="x")
-        self.clear_queue_btn = ttk.Button(queue_button_frame, text="전체 비우기", command=self._clear_file_queue)
-        self.clear_queue_btn.pack(fill="x", pady=4)
-        self.move_up_btn = ttk.Button(queue_button_frame, text="위로", command=self._move_selected_up)
-        self.move_up_btn.pack(fill="x")
-        self.move_down_btn = ttk.Button(queue_button_frame, text="아래로", command=self._move_selected_down)
-        self.move_down_btn.pack(fill="x", pady=4)
+        queue_button_frame = ctk.CTkFrame(list_area, fg_color="transparent")
+        queue_button_frame.pack(side="left", fill="y", padx=(10, 0))
+
+        def queue_btn(text, command):
+            btn = ctk.CTkButton(queue_button_frame, text=text, command=command, width=110, height=32, **self._ghost_btn)
+            btn.pack(fill="x", pady=(0, 6))
+            return btn
+
+        self.add_queue_btn = queue_btn("파일 추가", self._add_files_to_queue)
+        self.add_folder_btn = queue_btn("폴더 추가", self._add_folder_to_queue)
+        self.remove_queue_btn = queue_btn("선택 삭제", self._remove_selected_files)
+        self.clear_queue_btn = queue_btn("전체 비우기", self._clear_file_queue)
+        self.move_up_btn = queue_btn("위로", self._move_selected_up)
+        self.move_down_btn = queue_btn("아래로", self._move_selected_down)
 
         self._batch_controls = [
             self.select_media_btn,
@@ -2589,26 +2771,35 @@ class PapaStopApp(tk.Tk):
             self.prepare_translation_btn,
         ]
 
-        file_info = ttk.Label(
+        ctk.CTkLabel(
             self.file_tab,
             text="영상이나 음성에서 한국어 SRT 자막을 만들어 저장합니다.",
+            font=self.font_base,
+            text_color=UI_TEXT_MUTED,
+            anchor="w",
+        ).pack(fill="x", pady=(8, 2))
+
+        status_row = ctk.CTkFrame(self.file_tab, fg_color="transparent")
+        status_row.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(status_row, text="파일 상태", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left")
+        self._live_label(status_row, self.file_status_var, font=self.font_base, text_color=UI_TEXT).pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(status_row, text="전체 진행", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left", padx=(20, 0))
+        self._live_label(status_row, self.batch_status_var, font=self.font_base, text_color=UI_TEXT).pack(side="left", padx=(8, 0))
+
+        preview_card, preview_body = self._make_card(self.file_tab, "실시간 추출 미리보기")
+        preview_card.pack(fill="both", expand=True, pady=(4, 2))
+        self.file_preview_text = ctk.CTkTextbox(
+            preview_body,
+            height=110,
+            wrap="word",
+            fg_color="#ffffff",
+            text_color=UI_TEXT,
+            border_color=UI_BORDER_STRONG,
+            border_width=1,
+            corner_radius=8,
+            font=self.font_base,
         )
-        file_info.pack(anchor="w", pady=6)
-
-        ttk.Label(self.file_tab, text="파일 상태").pack(anchor="w")
-        ttk.Label(self.file_tab, textvariable=self.file_status_var).pack(anchor="w")
-        ttk.Label(self.file_tab, text="전체 진행").pack(anchor="w")
-        ttk.Label(self.file_tab, textvariable=self.batch_status_var).pack(anchor="w")
-
-        preview_frame = ttk.LabelFrame(self.file_tab, text="실시간 추출 미리보기")
-        preview_frame.pack(fill="both", expand=True, pady=(8, 0))
-        preview_area = ttk.Frame(preview_frame)
-        preview_area.pack(fill="both", expand=True, padx=6, pady=6)
-        self.file_preview_text = tk.Text(preview_area, height=4, wrap="word")
-        preview_scroll = ttk.Scrollbar(preview_area, orient="vertical", command=self.file_preview_text.yview)
-        self.file_preview_text.configure(yscrollcommand=preview_scroll.set)
-        self.file_preview_text.pack(side="left", fill="both", expand=True)
-        preview_scroll.pack(side="left", fill="y")
+        self.file_preview_text.pack(fill="both", expand=True)
         self.file_preview_text.insert("end", "자막 만들기를 시작하면 추출된 문장이 여기에 표시됩니다.")
         self.file_preview_text.configure(state="disabled")
 
@@ -2620,126 +2811,148 @@ class PapaStopApp(tk.Tk):
         self.show_overlay_var = tk.BooleanVar(value=True)
         self.live_save_srt_var = tk.BooleanVar(value=True)
 
-        source_frame = ttk.LabelFrame(self.live_tab, text="실시간 소리 입력")
-        source_frame.pack(fill="x", padx=4, pady=(0, 8))
+        source_card, source_body = self._make_card(self.live_tab, "실시간 소리 입력")
+        source_card.pack(fill="x", pady=(2, 10))
 
-        live_row0 = ttk.Frame(source_frame)
-        live_row0.pack(fill="x", padx=8, pady=6)
-        ttk.Label(live_row0, text="입력:").pack(side="left")
-        ttk.Radiobutton(
+        live_row0 = ctk.CTkFrame(source_body, fg_color="transparent")
+        live_row0.pack(fill="x", pady=4)
+        ctk.CTkLabel(live_row0, text="입력", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left")
+        ctk.CTkRadioButton(
             live_row0,
             text="PC 스피커 소리",
             variable=self.live_source_var,
             value=LIVE_SOURCE_SPEAKER,
-        ).pack(side="left", padx=(8, 12))
-        ttk.Radiobutton(
+            font=self.font_base,
+        ).pack(side="left", padx=(12, 14))
+        ctk.CTkRadioButton(
             live_row0,
             text="인터넷 URL 스트림",
             variable=self.live_source_var,
             value=LIVE_SOURCE_URL,
+            font=self.font_base,
         ).pack(side="left")
-        ttk.Label(live_row0, text="원본 언어").pack(side="left", padx=(18, 0))
-        self.live_source_lang_combo = ttk.Combobox(
+        ctk.CTkLabel(live_row0, text="원본 언어", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left", padx=(18, 0))
+        self.live_source_lang_combo = ctk.CTkOptionMenu(
             live_row0,
-            textvariable=self.source_lang_var,
+            variable=self.source_lang_var,
             values=[SOURCE_LANG_LABELS[key] for key in SOURCE_LANG_ORDER],
-            state="readonly",
-            width=12,
+            command=self._on_source_lang_selected,
+            width=130,
+            **self._option_kw,
         )
-        self.live_source_lang_combo.bind("<<ComboboxSelected>>", self._on_source_lang_selected)
-        self.live_source_lang_combo.pack(side="left", padx=8)
+        self.live_source_lang_combo.pack(side="left", padx=10)
 
-        live_row_url = ttk.Frame(source_frame)
-        live_row_url.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Label(live_row_url, text="URL").pack(side="left")
-        ttk.Entry(live_row_url, textvariable=self.live_url_var, width=90).pack(
-            side="left", fill="x", expand=True, padx=8
+        live_row_url = ctk.CTkFrame(source_body, fg_color="transparent")
+        live_row_url.pack(fill="x", pady=4)
+        ctk.CTkLabel(live_row_url, text="URL", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left")
+        ctk.CTkEntry(live_row_url, textvariable=self.live_url_var, **self._entry_kw).pack(
+            side="left", fill="x", expand=True, padx=10
         )
 
-        live_row1 = ttk.Frame(self.live_tab)
+        live_row1 = ctk.CTkFrame(self.live_tab, fg_color="transparent")
         live_row1.pack(fill="x", pady=6)
-        self.start_live_btn = ttk.Button(live_row1, text="시작", command=self._start_live_job)
-        self.stop_live_btn = ttk.Button(live_row1, text="중지", command=self._stop_live_job, state="disabled")
-        self.start_live_btn.pack(side="left", padx=(12, 6))
-        self.stop_live_btn.pack(side="left")
+        self.start_live_btn = ctk.CTkButton(
+            live_row1, text="시작", command=self._start_live_job, **self._primary_btn_kw
+        )
+        self.stop_live_btn = ctk.CTkButton(
+            live_row1, text="중지", command=self._stop_live_job, state="disabled", **self._stop_btn_kw
+        )
+        self.start_live_btn.pack(side="left")
+        self.stop_live_btn.pack(side="left", padx=8)
+        ctk.CTkButton(
+            live_row1, text="결과 열기", command=self._open_output, **self._open_btn_kw
+        ).pack(side="right")
 
-        live_row2 = ttk.Frame(self.live_tab)
+        live_row2 = ctk.CTkFrame(self.live_tab, fg_color="transparent")
         live_row2.pack(fill="x", pady=6)
-        ttk.Checkbutton(
+        ctk.CTkCheckBox(
             live_row2,
             text="자막 창을 항상 위에 표시",
             variable=self.show_overlay_var,
             onvalue=True,
             offvalue=False,
+            font=self.font_base,
         ).pack(side="left")
-        ttk.Checkbutton(
+        ctk.CTkCheckBox(
             live_row2,
             text="자막 파일(.srt)로도 저장",
             variable=self.live_save_srt_var,
             onvalue=True,
             offvalue=False,
-        ).pack(side="left", padx=(18, 0))
+            font=self.font_base,
+        ).pack(side="left", padx=(20, 0))
 
-        ttk.Label(self.live_tab, text="실시간 자막 미리보기:").pack(anchor="w", pady=(12, 2))
-        self.live_preview = tk.Message(
-            self.live_tab,
-            textvariable=self.live_preview_var,
-            width=900,
-            font=("Arial", 14),
-            bg="#f8fafc",
-            relief="sunken",
-            padx=8,
-            pady=6,
+        ctk.CTkLabel(
+            self.live_tab, text="실시간 자막 미리보기", font=self.font_base, text_color=UI_TEXT_MUTED, anchor="w"
+        ).pack(fill="x", pady=(12, 2))
+        preview_card = ctk.CTkFrame(self.live_tab, fg_color=UI_SURFACE, corner_radius=12)
+        preview_card.pack(fill="x")
+        self.live_preview = self._live_label(
+            preview_card,
+            self.live_preview_var,
+            font=self.font_caption,
+            justify="left",
+            anchor="w",
+            wraplength=820,
+            text_color=UI_TEXT,
         )
-        self.live_preview.pack(fill="x")
-        ttk.Label(self.live_tab, textvariable=self.live_status_var).pack(anchor="w", pady=6)
+        self.live_preview.pack(fill="x", padx=16, pady=16)
+        self._live_label(
+            self.live_tab, self.live_status_var, font=self.font_base, text_color=UI_TEXT_MUTED, anchor="w"
+        ).pack(fill="x", pady=6)
 
         # Screen record tab
-        record_source_frame = ttk.LabelFrame(self.record_tab, text="녹화 설정")
-        record_source_frame.pack(fill="x", padx=4, pady=(0, 8))
+        record_card, record_body = self._make_card(self.record_tab, "녹화 설정")
+        record_card.pack(fill="x", pady=(2, 10))
 
-        record_row0 = ttk.Frame(record_source_frame)
-        record_row0.pack(fill="x", padx=8, pady=6)
-        ttk.Label(record_row0, text="저장할 MKV").pack(side="left")
-        self.record_output_entry = ttk.Entry(record_row0, textvariable=self.record_output_var, width=80)
-        self.record_output_entry.pack(side="left", fill="x", expand=True, padx=8)
-        self.browse_record_btn = ttk.Button(record_row0, text="찾아보기", command=self._select_record_output)
+        record_row0 = ctk.CTkFrame(record_body, fg_color="transparent")
+        record_row0.pack(fill="x", pady=4)
+        ctk.CTkLabel(record_row0, text="저장할 MKV", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left")
+        self.record_output_entry = ctk.CTkEntry(record_row0, textvariable=self.record_output_var, **self._entry_kw)
+        self.record_output_entry.pack(side="left", fill="x", expand=True, padx=10)
+        self.browse_record_btn = ctk.CTkButton(
+            record_row0, text="찾아보기", command=self._select_record_output, width=90, height=34, **self._ghost_btn
+        )
         self.browse_record_btn.pack(side="left")
 
-        record_row1 = ttk.Frame(record_source_frame)
-        record_row1.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Label(record_row1, text="초당 화면 수").pack(side="left")
-        self.record_fps_combo = ttk.Combobox(
+        record_row1 = ctk.CTkFrame(record_body, fg_color="transparent")
+        record_row1.pack(fill="x", pady=4)
+        ctk.CTkLabel(record_row1, text="초당 화면 수", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left")
+        self.record_fps_combo = ctk.CTkOptionMenu(
             record_row1,
-            textvariable=self.record_fps_var,
-            values=("24", "30", "60"),
-            state="readonly",
-            width=6,
+            variable=self.record_fps_var,
+            values=["24", "30", "60"],
+            width=90,
+            **self._option_kw,
         )
-        self.record_fps_combo.pack(side="left", padx=(8, 18))
-        self.record_audio_check = ttk.Checkbutton(
+        self.record_fps_combo.pack(side="left", padx=(10, 20))
+        self.record_audio_check = ctk.CTkCheckBox(
             record_row1,
             text="PC 스피커 소리도 녹음",
             variable=self.record_audio_var,
             onvalue=True,
             offvalue=False,
+            font=self.font_base,
         )
         self.record_audio_check.pack(side="left")
 
-        record_row2 = ttk.Frame(self.record_tab)
+        record_row2 = ctk.CTkFrame(self.record_tab, fg_color="transparent")
         record_row2.pack(fill="x", pady=6)
-        self.start_record_btn = ttk.Button(record_row2, text="녹화 시작", command=self._start_record_job)
-        self.stop_record_btn = ttk.Button(
-            record_row2,
-            text="중지",
-            command=self._stop_record_job,
-            state="disabled",
+        self.start_record_btn = ctk.CTkButton(
+            record_row2, text="녹화 시작", command=self._start_record_job, **self._primary_btn_kw
         )
-        self.start_record_btn.pack(side="left", padx=(12, 6))
-        self.stop_record_btn.pack(side="left")
-        ttk.Button(record_row2, text="결과 열기", command=self._open_output).pack(side="right", padx=(0, 12))
+        self.stop_record_btn = ctk.CTkButton(
+            record_row2, text="중지", command=self._stop_record_job, state="disabled", **self._stop_btn_kw
+        )
+        self.start_record_btn.pack(side="left")
+        self.stop_record_btn.pack(side="left", padx=8)
+        ctk.CTkButton(
+            record_row2, text="결과 열기", command=self._open_output, **self._open_btn_kw
+        ).pack(side="right")
 
-        ttk.Label(self.record_tab, textvariable=self.record_status_var).pack(anchor="w", pady=6)
+        self._live_label(
+            self.record_tab, self.record_status_var, font=self.font_base, text_color=UI_TEXT_MUTED, anchor="w"
+        ).pack(fill="x", pady=6)
         self._record_controls = [
             self.record_output_entry,
             self.browse_record_btn,
@@ -2750,31 +2963,56 @@ class PapaStopApp(tk.Tk):
         ]
 
         # Bottom common
-        common = ttk.LabelFrame(root, text="진행 상황과 작업 기록")
-        common.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        common = ctk.CTkFrame(
+            root, fg_color=UI_SURFACE, corner_radius=12, border_width=1, border_color=UI_CARD_BORDER
+        )
+        common.grid(row=1, column=0, sticky="nsew", padx=14, pady=(6, 14))
 
         self.progress_var = tk.DoubleVar(value=0)
         self.status_var = tk.StringVar(value="대기 중")
         self.eta_var = tk.StringVar(value="예상 시간: 대기 중")
 
-        ttk.Label(common, textvariable=self.status_var).pack(anchor="w", padx=8, pady=(6, 0))
-        ttk.Label(common, textvariable=self.eta_var).pack(anchor="w", padx=8, pady=(2, 0))
-        self.progress = ttk.Progressbar(common, variable=self.progress_var, maximum=100)
-        self.progress.pack(fill="x", padx=8, pady=6)
+        ctk.CTkLabel(common, text="진행 상황과 작업 기록", font=self.font_section, text_color=UI_TEXT, anchor="w").pack(
+            fill="x", padx=16, pady=(12, 2)
+        )
+        self._live_label(common, self.status_var, font=self.font_base, text_color=UI_TEXT, anchor="w").pack(
+            fill="x", padx=16
+        )
+        self._live_label(common, self.eta_var, font=self.font_base, text_color=UI_TEXT_MUTED, anchor="w").pack(
+            fill="x", padx=16, pady=(0, 6)
+        )
+        self.progress = ctk.CTkProgressBar(common, height=12, corner_radius=6, fg_color=UI_BORDER)
+        self.progress.set(0)
+        self.progress.pack(fill="x", padx=16, pady=(0, 8))
 
-        self.log_text = tk.Text(common, height=8, wrap="word")
-        self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
+        self.log_text = ctk.CTkTextbox(
+            common,
+            height=150,
+            wrap="word",
+            fg_color="#ffffff",
+            text_color=UI_TEXT,
+            border_color=UI_BORDER_STRONG,
+            border_width=1,
+            corner_radius=8,
+            font=self.font_base,
+        )
+        self.log_text.pack(fill="both", expand=True, padx=16, pady=(0, 14))
         self.log_text.configure(state="disabled")
 
         self._append_log("앱을 시작했습니다.")
 
     def _begin_timed_progress(self) -> None:
         self.progress_started_at = time.time()
-        self.progress_var.set(0)
+        self._set_progress(0)
         self.eta_var.set("예상 시간: 계산 중")
 
     def _update_eta(self, progress: float) -> None:
         self.eta_var.set(build_eta_text(progress, self.progress_started_at))
+
+    def _set_progress(self, value: float) -> None:
+        value = max(0.0, min(100.0, float(value)))
+        self.progress_var.set(value)
+        self.progress.set(value / 100.0)
 
     def _set_eta_status(self, text: str) -> None:
         self.eta_var.set(f"예상 시간: {text}")
@@ -2859,7 +3097,7 @@ class PapaStopApp(tk.Tk):
                 self.record_status_var.set(str(payload))
             elif kind == "progress":
                 progress = float(payload)
-                self.progress_var.set(progress)
+                self._set_progress(progress)
                 self._update_eta(progress)
             elif kind == "eta_status":
                 self.progress_started_at = None
@@ -2931,7 +3169,7 @@ class PapaStopApp(tk.Tk):
             if widget is self.start_file_btn and busy:
                 state = "disabled"
             if widget in (self.whisper_model_combo, self.translation_profile_combo) and not busy:
-                state = "readonly"
+                state = "normal"
             widget.configure(state=state)
         if self._is_asr_preparing:
             self.prepare_asr_btn.configure(state="disabled")
@@ -2951,7 +3189,7 @@ class PapaStopApp(tk.Tk):
             or self._is_asr_preparing
             or self._is_translation_preparing
         )
-        self.resource_mode_combo.configure(state="disabled" if busy else "readonly")
+        self.resource_mode_combo.configure(state="disabled" if busy else "normal")
 
     def _set_asr_preparing(self, preparing: bool) -> None:
         self._is_asr_preparing = preparing
@@ -3006,7 +3244,7 @@ class PapaStopApp(tk.Tk):
             if widget is self.stop_record_btn:
                 state = "normal" if busy else "disabled"
             if widget is self.record_fps_combo and not busy:
-                state = "readonly"
+                state = "normal"
             widget.configure(state=state)
         if self._is_asr_preparing or self._is_translation_preparing:
             self.start_record_btn.configure(state="disabled")
@@ -3521,7 +3759,7 @@ class PapaStopApp(tk.Tk):
         self.record_cancel_event = threading.Event()
         self.record_cancel_event.clear()
         self.progress_started_at = None
-        self.progress_var.set(0)
+        self._set_progress(0)
         self._set_eta_status("녹화 중에는 표시하지 않음")
         self._emit("busy_record", True)
         self._emit("record_status", "시작 중 ...")
@@ -3585,7 +3823,7 @@ class PapaStopApp(tk.Tk):
         self.live_cancel_event = threading.Event()
         self.live_cancel_event.clear()
         self.progress_started_at = None
-        self.progress_var.set(0)
+        self._set_progress(0)
         self._set_eta_status("실시간 작업은 표시하지 않음")
         self._emit("busy_live", True)
         self._emit("live_status", "연결 중 ...")
