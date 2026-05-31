@@ -996,24 +996,34 @@ def transcribe_media(
     on_progress(5)
     on_line("영상의 소리를 분석합니다.")
 
-    segments, info = model.transcribe(
-        str(media_path),
-        language=language_arg,
-        beam_size=beam_size,
-        vad_filter=True,
-    )
+    detected_language = language_code or "audio"
 
-    rows: list[tuple[float, float, str]] = []
-    duration = getattr(info, "duration", None)
-    detected_language = getattr(info, "language", None) or language_code or "audio"
+    def collect_rows(vad_filter: bool) -> list[tuple[float, float, str]]:
+        nonlocal detected_language
+        segments, info = model.transcribe(
+            str(media_path),
+            language=language_arg,
+            beam_size=beam_size,
+            vad_filter=vad_filter,
+        )
+        collected: list[tuple[float, float, str]] = []
+        duration = getattr(info, "duration", None)
+        detected_language = getattr(info, "language", None) or language_code or "audio"
+        for segment in segments:
+            ensure_not_cancelled(should_stop)
+            collected.append((float(segment.start), float(segment.end), str(segment.text)))
+            if duration:
+                on_progress(5 + min(90, float(segment.end) / float(duration) * 90))
+            elif len(collected) % 5 == 0:
+                on_progress(min(95, 5 + len(collected)))
+        return collected
 
-    for segment in segments:
+    rows = collect_rows(True)
+    if not rows:
         ensure_not_cancelled(should_stop)
-        rows.append((float(segment.start), float(segment.end), str(segment.text)))
-        if duration:
-            on_progress(5 + min(90, float(segment.end) / float(duration) * 90))
-        elif len(rows) % 5 == 0:
-            on_progress(min(95, 5 + len(rows)))
+        on_line("음성 구간을 찾지 못해, 무음 제거 없이 다시 분석합니다.")
+        on_progress(5)
+        rows = collect_rows(False)
 
     if not rows:
         raise RuntimeError("소리에서 자막으로 만들 문장을 찾지 못했습니다.")
