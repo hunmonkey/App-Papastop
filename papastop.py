@@ -456,6 +456,26 @@ def translation_engine_code(value: str) -> str:
     return "argos"
 
 
+DEVICE_OPTIONS = {
+    "auto": "자동 선택 (auto)",
+    "cpu": "CPU 사용 (cpu)",
+    "cuda": "GPU·NVIDIA (cuda)",
+}
+
+
+def device_values() -> list[str]:
+    return list(DEVICE_OPTIONS.values())
+
+
+def device_code(value: str) -> str:
+    if value in DEVICE_OPTIONS:
+        return value
+    for code, label in DEVICE_OPTIONS.items():
+        if value == label:
+            return code
+    return "auto"
+
+
 def detect_hardware() -> dict[str, str]:
     hardware = {
         "운영체제": platform.platform(),
@@ -512,19 +532,36 @@ def detect_hardware() -> dict[str, str]:
     return hardware
 
 
+def largest_gpu_memory_gb(nvidia_gpus: list[str]) -> float:
+    best = 0.0
+    for label in nvidia_gpus:
+        match = re.search(r"([\d.]+)\s*GB", label)
+        if match:
+            best = max(best, float(match.group(1)))
+    return best
+
+
 def recommend_transcribe_settings(nvidia_gpus: list[str] | None = None) -> tuple[dict[str, object], str]:
     if nvidia_gpus is None:
         nvidia_gpus = detect_nvidia_gpus()
 
     if nvidia_gpus:
+        memory_gb = largest_gpu_memory_gb(nvidia_gpus)
+        if memory_gb >= 8:
+            model = "large-v3-turbo"
+        elif memory_gb >= 5:
+            model = "small"
+        else:
+            model = "base"
+        memory_note = f"약 {memory_gb:.0f}GB" if memory_gb else "메모리 확인 필요"
         return (
             {
-                "model": "small",
+                "model": model,
                 "device": "cuda",
                 "compute": "float16",
                 "beam": 5,
             },
-            "NVIDIA 그래픽카드가 감지되어 GPU 중심 설정을 적용했습니다.",
+            f"NVIDIA 그래픽카드({memory_note})에 맞춰 {model} 모델 GPU 설정을 적용했습니다.",
         )
 
     return (
@@ -1047,7 +1084,7 @@ class PapaStopApp(tk.Tk):
         self.subtitle_path_var = tk.StringVar()
         self.model_var = tk.StringVar(value="base")
         self.source_lang_var = tk.StringVar(value=language_display("auto"))
-        self.device_var = tk.StringVar(value="auto")
+        self.device_var = tk.StringVar(value=DEVICE_OPTIONS["auto"])
         self.compute_var = tk.StringVar(value="auto")
         self.beam_var = tk.IntVar(value=5)
         self.auto_translate_var = tk.BooleanVar(value=False)
@@ -1259,7 +1296,7 @@ class PapaStopApp(tk.Tk):
         ttk.Combobox(
             frame,
             textvariable=self.device_var,
-            values=("auto", "cpu", "cuda"),
+            values=device_values(),
             state="readonly",
         ).grid(row=3, column=0, sticky=tk.EW, pady=(4, 8), padx=(0, 6))
 
@@ -1642,7 +1679,7 @@ class PapaStopApp(tk.Tk):
     def apply_recommended_settings(self) -> None:
         settings, reason = recommend_transcribe_settings()
         self.model_var.set(str(settings["model"]))
-        self.device_var.set(str(settings["device"]))
+        self.device_var.set(DEVICE_OPTIONS.get(str(settings["device"]), str(settings["device"])))
         self.compute_var.set(str(settings["compute"]))
         self.beam_var.set(int(settings["beam"]))
         self._append_log(reason)
@@ -1712,7 +1749,7 @@ class PapaStopApp(tk.Tk):
             ensure_not_cancelled(self.cancel_event.is_set)
             model = load_whisper_model(
                 self.model_var.get(),
-                self.device_var.get(),
+                device_code(self.device_var.get()),
                 self.compute_var.get(),
                 lambda line: self._emit("log", line),
             )
