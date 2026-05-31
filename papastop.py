@@ -99,6 +99,13 @@ CUDA_RUNTIME_PACKAGES = [
     "nvidia-cudnn-cu12",
 ]
 
+# 정밀 자막(WhisperX)은 PyTorch가 필요합니다. Windows의 일반 pip는 GPU(CUDA) 빌드를
+# 제대로 잡지 못하는 문제가 있어, NVIDIA가 있으면 공식 CUDA 인덱스에서 직접 설치합니다.
+# CTranslate2가 쓰는 cuDNN 9과 맞추기 위해 cuDNN 9 계열 빌드(2.5.1)를 고정합니다.
+TORCH_PACKAGES = ["torch==2.5.1", "torchaudio==2.5.1"]
+TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu124"
+TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+
 MEDIA_FILE_TYPES = [
     (
         "Video and audio files",
@@ -399,7 +406,42 @@ def install_python_engines(on_line: Callable[[str], None]) -> None:
     if exit_code != 0:
         raise RuntimeError("엔진 설치 명령이 실패했습니다. 로그의 마지막 줄을 확인해 주세요.")
 
+    install_whisperx_engine(on_line)
+
     on_line("엔진 설치가 끝났습니다. 앱을 다시 실행하면 새 엔진을 더 안정적으로 인식합니다.")
+
+
+def install_whisperx_engine(on_line: Callable[[str], None]) -> None:
+    """정밀 자막(WhisperX) 엔진을 추가로 설치합니다.
+    핵심 엔진(faster-whisper)과 분리된 best-effort 단계입니다 — PyTorch가 무겁고
+    Windows GPU에서 깨질 수 있으므로, 실패해도 예외를 올리지 않습니다.
+    실패 시 정밀 자막 토글만 비활성화되고 기본 자막 기능은 그대로 동작합니다."""
+    if is_frozen_app():
+        return
+
+    base = [sys.executable, "-m", "pip", "install", "--upgrade"]
+    if not is_running_in_venv():
+        base.append("--user")
+
+    has_nvidia = bool(detect_nvidia_gpus())
+    torch_index = TORCH_CUDA_INDEX if has_nvidia else TORCH_CPU_INDEX
+    on_line("정밀 자막(WhisperX)용 PyTorch를 설치합니다. 용량이 커서(약 2~3GB) 시간이 걸릴 수 있습니다.")
+    if has_nvidia:
+        on_line("NVIDIA 그래픽카드에 맞춰 GPU용 PyTorch를 받습니다.")
+
+    torch_command = base + TORCH_PACKAGES + ["--index-url", torch_index]
+    on_line(" ".join(torch_command))
+    if run_command(torch_command, on_line=on_line) != 0:
+        on_line("PyTorch 설치에 실패했습니다. 정밀 자막은 꺼지지만 기본 자막 기능은 그대로 쓸 수 있습니다.")
+        return
+
+    whisperx_command = base + ["whisperx"]
+    on_line(" ".join(whisperx_command))
+    if run_command(whisperx_command, on_line=on_line) != 0:
+        on_line("WhisperX 설치에 실패했습니다. 정밀 자막은 꺼지지만 기본 자막 기능은 그대로 쓸 수 있습니다.")
+        return
+
+    on_line("정밀 자막(WhisperX) 설치가 끝났습니다.")
 
 
 def run_powershell_json(command: str) -> object | None:
@@ -1269,6 +1311,133 @@ def transcribe_media(
     return output_path, detected_language
 
 
+# 언어별 정렬 모델은 불러오는 데 시간이 걸리므로, 한 번 받으면 재사용합니다.
+_whisperx_align_cache: dict[str, tuple[object, object]] = {}
+
+
+def load_whisperx_model(
+    model_size: str,
+    device: str,
+    compute_type: str,
+    on_line: Callable[[str], None],
+) -> object:
+    """정밀 자막(WhisperX) 전사 모델을 불러옵니다. 내부적으로 faster-whisper를 씁니다."""
+    if not has_module("whisperx"):
+        raise RuntimeError("WhisperX가 설치되어 있지 않습니다. 먼저 엔진 설치를 눌러 주세요.")
+
+    prepare_model_cache_environment()
+    prepare_cuda_library_path()
+
+    import whisperx
+
+    # WhisperX는 cuda에서 float16, cpu에서 int8을 기본으로 씁니다. 'auto'도 같은 규칙으로 매핑합니다.
+    if device == "cuda":
+        compute_arg = "float16" if compute_type in ("auto", "float16") else compute_type
+    else:
+        compute_arg = "int8" if compute_type in ("auto", "int8") else compute_type
+
+    on_line(f"정밀 자막 모델을 준비합니다: {model_size}")
+    return whisperx.load_model(model_size, device=device, compute_type=compute_arg)
+
+
+def decode_audio_16k_mono(media_path: Path, ffmpeg: str):
+    """WhisperX 입력용으로 오디오를 16kHz·모노·float32 배열로 디코딩합니다.
+    whisperx.load_audio는 PATH의 'ffmpeg' 명령을 직접 부르는데, 이 앱은 imageio-ffmpeg
+    (파일명이 ffmpeg.exe가 아님)를 쓸 수 있어 그 방식이 실패할 수 있습니다.
+    그래서 앱이 찾은 ffmpeg 경로로 직접 디코딩합니다."""
+    import numpy as np
+
+    command = [
+        ffmpeg, "-nostdin", "-threads", "0", "-i", str(media_path),
+        "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", "16000", "-",
+    ]
+    completed = subprocess.run(
+        command, capture_output=True, check=False, creationflags=windows_creation_flags()
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        message = completed.stderr.decode("utf-8", "replace")[-500:]
+        raise RuntimeError(f"오디오를 읽지 못했습니다: {message}")
+    return np.frombuffer(completed.stdout, np.int16).astype(np.float32) / 32768.0
+
+
+def transcribe_media_whisperx(
+    media_path: Path,
+    output_dir: Path,
+    model: object,
+    device: str,
+    language_code: str,
+    on_line: Callable[[str], None],
+    on_progress: Callable[[float], None],
+    should_stop: Callable[[], bool] | None = None,
+    max_line_chars: int = 42,
+    on_subtitle_preview: Callable[[str], None] | None = None,
+) -> tuple[Path, str]:
+    """WhisperX로 전사한 뒤 단어 단위로 타이밍을 정밀 정렬합니다.
+    돌려주는 값은 transcribe_media와 동일한 (자막 경로, 감지 언어)입니다."""
+    ensure_not_cancelled(should_stop)
+    validate_media_for_transcription(media_path)
+    ensure_not_cancelled(should_stop)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    language_arg = None if language_code == "auto" else language_code
+
+    import whisperx
+
+    on_progress(5)
+    on_line("영상의 소리를 분석합니다. (정밀 모드)")
+
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg를 찾지 못했습니다. 먼저 엔진 설치를 눌러 주세요.")
+    audio = decode_audio_16k_mono(media_path, ffmpeg)
+    ensure_not_cancelled(should_stop)
+    on_progress(15)
+
+    result = model.transcribe(audio, batch_size=16, language=language_arg)
+    detected_language = result.get("language") or language_code or "audio"
+    segments = result.get("segments", [])
+    on_progress(60)
+    ensure_not_cancelled(should_stop)
+
+    # 단어 단위 정렬은 best-effort입니다. 정렬 모델이 없거나 실패해도(예: cuDNN 문제)
+    # 정렬 전 결과를 그대로 써서 자막은 정상적으로 만들어집니다.
+    try:
+        if detected_language not in _whisperx_align_cache:
+            on_line(f"자막 타이밍을 정밀 정렬합니다: {detected_language}")
+            _whisperx_align_cache[detected_language] = whisperx.load_align_model(
+                language_code=detected_language, device=device
+            )
+        align_model, align_meta = _whisperx_align_cache[detected_language]
+        aligned = whisperx.align(
+            segments, align_model, align_meta, audio, device, return_char_alignments=False
+        )
+        segments = aligned.get("segments", segments)
+    except Exception as exc:
+        on_line(f"정밀 정렬은 건너뜁니다(자막에는 영향 없음): {exc}")
+    on_progress(90)
+
+    rows: list[tuple[float, float, str]] = []
+    for segment in segments:
+        ensure_not_cancelled(should_stop)
+        start = segment.get("start")
+        end = segment.get("end")
+        text = (segment.get("text") or "").strip()
+        if start is None or end is None or not text:
+            continue
+        rows.append((float(start), float(end), text))
+        if on_subtitle_preview:
+            on_subtitle_preview(render_srt(rows, max_line_chars))
+
+    if not rows:
+        raise RuntimeError("정밀 모드에서 자막으로 만들 문장을 찾지 못했습니다.")
+
+    output_path = output_dir / f"{media_path.stem}.srt"
+    output_path.write_text(render_srt(rows, max_line_chars), encoding="utf-8")
+    on_progress(100)
+    on_line(f"자막 저장 완료: {output_path}")
+    return output_path, detected_language
+
+
 def extract_embedded_subtitle(
     media_path: Path,
     output_dir: Path,
@@ -1365,6 +1534,7 @@ class PapaStopApp(tk.Tk):
         self.compute_var = tk.StringVar(value="auto")
         self.beam_var = tk.IntVar(value=5)
         self.max_line_chars_var = tk.IntVar(value=42)
+        self.whisperx_var = tk.BooleanVar(value=False)
         self.auto_translate_var = tk.BooleanVar(value=False)
         self.auto_translate_to_var = tk.StringVar(value=language_display("ko"))
         self.expert_mode_var = tk.BooleanVar(value=False)
@@ -1823,15 +1993,28 @@ class PapaStopApp(tk.Tk):
         self.max_line_chars_spinbox = ttk.Spinbox(frame, from_=0, to=100, textvariable=self.max_line_chars_var)
         self.max_line_chars_spinbox.grid(row=6, column=1, sticky=tk.EW, pady=(4, 10))
 
+        self.whisperx_check = ttk.Checkbutton(
+            frame,
+            text="정밀 자막 (WhisperX 정렬)",
+            variable=self.whisperx_var,
+        )
+        self.whisperx_check.grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(0, 6))
+        ToolTip(
+            self.whisperx_check,
+            "켜면 무음 구간에서 없는 말이 생기는 환각을 줄이고, 자막 타이밍을 단어 단위로 정밀 정렬합니다. "
+            "자원을 더 쓰며 Windows GPU에서는 실험적입니다. 문제가 생기면 자동으로 기본 모드로 처리하므로 "
+            "자막은 항상 만들어집니다. (엔진 설치 시 함께 받은 PyTorch가 필요합니다.)",
+        )
+
         self.recommend_button = ttk.Button(
             frame,
             text="권장 설정 적용",
             command=self.apply_recommended_settings,
         )
-        self.recommend_button.grid(row=7, column=0, columnspan=2, sticky=tk.EW)
+        self.recommend_button.grid(row=8, column=0, columnspan=2, sticky=tk.EW)
 
         translate_row = ttk.Frame(frame)
-        translate_row.grid(row=8, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
+        translate_row.grid(row=9, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
         translate_row.columnconfigure(1, weight=1)
         auto_translate_check = ttk.Checkbutton(
             translate_row,
@@ -2384,6 +2567,7 @@ class PapaStopApp(tk.Tk):
             self.beam_spinbox,
             self.max_line_chars_label,
             self.max_line_chars_spinbox,
+            self.whisperx_check,
             self.recommend_button,
         ]
 
@@ -2447,12 +2631,25 @@ class PapaStopApp(tk.Tk):
             subtitle_weight = 0.6 if auto_translate else 1.0
 
             ensure_not_cancelled(self.cancel_event.is_set)
-            model = load_whisper_model(
-                self.model_var.get(),
-                device_code(self.device_var.get()),
-                self.compute_var.get(),
-                lambda line: self._emit("log", line),
-            )
+            model_size = self.model_var.get()
+            device = device_code(self.device_var.get())
+            compute = self.compute_var.get()
+            log = lambda line: self._emit("log", line)
+
+            # 정밀 자막(WhisperX)을 켰고 설치돼 있으면 그 모델을 준비합니다.
+            # 준비가 실패하면 곧바로 기본 모델로 내려가므로 자막 작업은 멈추지 않습니다.
+            use_whisperx = bool(self.whisperx_var.get()) and has_module("whisperx")
+            whisperx_model = None
+            faster_model = None
+            if use_whisperx:
+                try:
+                    whisperx_model = load_whisperx_model(model_size, device, compute, log)
+                    log("정밀 자막(WhisperX) 모드로 진행합니다.")
+                except Exception as exc:
+                    log(f"정밀 자막 준비 실패 → 기본 모드로 진행합니다: {exc}")
+                    use_whisperx = False
+            if not use_whisperx:
+                faster_model = load_whisper_model(model_size, device, compute, log)
             self._emit("step", ("model", "완료"))
 
             for index, (media_path, output_dir) in enumerate(jobs, start=1):
@@ -2461,21 +2658,50 @@ class PapaStopApp(tk.Tk):
                 self._emit("log", f"[{index}/{total}] 자막 생성 시작: {media_path.name}")
                 self._emit("subtitle_preview", "")
                 try:
-                    output_path, detected_language = transcribe_media(
-                        media_path=media_path,
-                        output_dir=output_dir,
-                        model=model,
-                        language_code=source_lang,
-                        beam_size=int(self.beam_var.get()),
-                        on_line=lambda line: self._emit("log", line),
-                        on_progress=lambda value, item_index=index: self._emit(
-                            "progress",
-                            ((item_index - 1) + (value / 100) * subtitle_weight) / total * 100,
-                        ),
-                        should_stop=self.cancel_event.is_set,
-                        max_line_chars=int(self.max_line_chars_var.get()),
-                        on_subtitle_preview=lambda text: self._emit("subtitle_preview", text),
+                    on_progress_cb = lambda value, item_index=index: self._emit(
+                        "progress",
+                        ((item_index - 1) + (value / 100) * subtitle_weight) / total * 100,
                     )
+                    on_preview_cb = lambda text: self._emit("subtitle_preview", text)
+
+                    def run_faster() -> tuple[Path, str]:
+                        nonlocal faster_model
+                        if faster_model is None:
+                            faster_model = load_whisper_model(model_size, device, compute, log)
+                        return transcribe_media(
+                            media_path=media_path,
+                            output_dir=output_dir,
+                            model=faster_model,
+                            language_code=source_lang,
+                            beam_size=int(self.beam_var.get()),
+                            on_line=log,
+                            on_progress=on_progress_cb,
+                            should_stop=self.cancel_event.is_set,
+                            max_line_chars=int(self.max_line_chars_var.get()),
+                            on_subtitle_preview=on_preview_cb,
+                        )
+
+                    if use_whisperx and whisperx_model is not None:
+                        try:
+                            output_path, detected_language = transcribe_media_whisperx(
+                                media_path=media_path,
+                                output_dir=output_dir,
+                                model=whisperx_model,
+                                device=device,
+                                language_code=source_lang,
+                                on_line=log,
+                                on_progress=on_progress_cb,
+                                should_stop=self.cancel_event.is_set,
+                                max_line_chars=int(self.max_line_chars_var.get()),
+                                on_subtitle_preview=on_preview_cb,
+                            )
+                        except OperationCancelled:
+                            raise
+                        except Exception as exc:
+                            log(f"정밀 모드 실패 → 기본 모드로 다시 시도합니다: {exc}")
+                            output_path, detected_language = run_faster()
+                    else:
+                        output_path, detected_language = run_faster()
                     saved_paths.append(output_path)
                     self._emit("subtitle_path", str(output_path))
                     if iid:

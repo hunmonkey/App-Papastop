@@ -7,3 +7,9 @@ transformers
 # GPU(NVIDIA) 가속 라이브러리 — 그래픽카드가 있을 때만 필요합니다.
 # 앱의 "엔진 설치"는 NVIDIA가 감지되면 아래 패키지를 자동으로 함께 설치합니다.
 # 수동 설치: pip install nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cudnn-cu12
+#
+# 정밀 자막(WhisperX)은 PyTorch가 필요해 용량이 큽니다(약 2~3GB).
+# Windows의 일반 pip가 GPU 빌드를 못 잡는 문제 때문에 이 목록에 넣지 않고,
+# 앱의 "엔진 설치"(install_whisperx_engine)와 install_engines.ps1에서 별도로 설치합니다.
+# 수동 설치(NVIDIA): pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+#                    pip install whisperx
