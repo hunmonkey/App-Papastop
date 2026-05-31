@@ -611,7 +611,8 @@ def recommend_transcribe_settings(nvidia_gpus: list[str] | None = None) -> tuple
     if nvidia_gpus:
         memory_gb = largest_gpu_memory_gb(nvidia_gpus)
         if memory_gb >= 8:
-            model = "large-v3-turbo"
+            # 정확도 최우선: 원본 large-v3를 씁니다. (turbo는 속도용 경량판이라 정확도를 약간 양보합니다.)
+            model = "large-v3"
         elif memory_gb >= 5:
             model = "small"
         else:
@@ -1233,6 +1234,9 @@ def transcribe_media(
             language=language_arg,
             beam_size=beam_size,
             vad_filter=vad_filter,
+            # 직전 자막을 다음 추론의 힌트로 쓰지 않습니다. 한 번 잘못 받아쓰면
+            # 그 뒤로 헛소리가 줄줄이 이어지는 "환각 루프"를 끊어 정확도를 높입니다.
+            condition_on_previous_text=False,
         )
         collected: list[tuple[float, float, str]] = []
         duration = getattr(info, "duration", None)
@@ -1739,7 +1743,7 @@ class PapaStopApp(tk.Tk):
         self._label_with_help(
             frame,
             "자막 품질",
-            "소리를 글자로 바꾸는 모델입니다. base는 첫 테스트에 좋고, large 계열은 더 정확하지만 시간이 더 걸립니다.",
+            "소리를 글자로 바꾸는 모델입니다. base는 첫 테스트에 좋고, large 계열은 더 정확하지만 시간이 더 걸립니다. 정확도 최우선이면 large-v3를 고르세요(turbo보다 정확).",
         ).grid(row=1, column=0, sticky=tk.W)
         model_frame = ttk.Frame(frame)
         model_frame.grid(row=2, column=0, sticky=tk.EW, pady=(4, 8), padx=(0, 6))
