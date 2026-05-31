@@ -924,6 +924,38 @@ def translate_srt_file_nllb(
     on_line(f"번역 자막 저장 완료: {target_path}")
 
 
+def whisper_model_repo(model_size: str) -> str | None:
+    try:
+        from faster_whisper.utils import _MODELS
+    except Exception:
+        return None
+    return _MODELS.get(model_size)
+
+
+def whisper_model_is_downloaded(model_size: str) -> bool:
+    repo = whisper_model_repo(model_size)
+    if not repo:
+        return False
+    prepare_model_cache_environment()
+    cache = Path(os.environ.get("HF_HUB_CACHE", str(HF_CACHE_DIR / "hub")))
+    snapshots = cache / ("models--" + repo.replace("/", "--")) / "snapshots"
+    if not snapshots.is_dir():
+        return False
+    return any(snapshots.glob("*/model.bin"))
+
+
+def download_whisper_model(model_size: str, on_line: Callable[[str], None]) -> None:
+    if not has_module("faster_whisper"):
+        raise RuntimeError("faster-whisper가 설치되어 있지 않습니다. 먼저 엔진 설치를 눌러 주세요.")
+    prepare_model_cache_environment()
+    prepare_cuda_library_path()
+    from faster_whisper import WhisperModel
+
+    on_line(f"{model_size} 모델을 다운로드합니다. 크기에 따라 시간이 걸릴 수 있습니다.")
+    WhisperModel(model_size, device="cpu", compute_type="int8")
+    on_line(f"{model_size} 모델 다운로드가 끝났습니다.")
+
+
 def load_whisper_model(
     model_size: str,
     device: str,
@@ -1083,6 +1115,7 @@ class PapaStopApp(tk.Tk):
         self.output_dir_var = tk.StringVar()
         self.subtitle_path_var = tk.StringVar()
         self.model_var = tk.StringVar(value="base")
+        self.model_status_var = tk.StringVar(value="")
         self.source_lang_var = tk.StringVar(value=language_display("auto"))
         self.device_var = tk.StringVar(value=DEVICE_OPTIONS["auto"])
         self.compute_var = tk.StringVar(value="auto")
@@ -1103,6 +1136,7 @@ class PapaStopApp(tk.Tk):
         self.after(100, self._process_events)
         self.after(250, self.refresh_hardware)
         self.after(450, self.refresh_engines)
+        self.after(650, self.refresh_model_status)
 
     def _configure_style(self) -> None:
         style = ttk.Style(self)
@@ -1273,12 +1307,23 @@ class PapaStopApp(tk.Tk):
             "소리를 글자로 바꾸는 인공지능 모델입니다. tiny/base는 빠르고, small 이상은 더 정확합니다. "
             "large-v3-turbo는 large급 정확도에 더 빠르고, distil-large-v3는 영어에 특화된 고속 모델입니다.",
         ).grid(row=0, column=0, sticky=tk.W)
-        ttk.Combobox(
-            frame,
+        model_frame = ttk.Frame(frame)
+        model_frame.grid(row=1, column=0, sticky=tk.EW, pady=(4, 8), padx=(0, 6))
+        model_frame.columnconfigure(0, weight=1)
+        model_combo = ttk.Combobox(
+            model_frame,
             textvariable=self.model_var,
             values=("tiny", "base", "small", "medium", "large-v3", "large-v3-turbo", "distil-large-v3"),
             state="readonly",
-        ).grid(row=1, column=0, sticky=tk.EW, pady=(4, 8), padx=(0, 6))
+        )
+        model_combo.grid(row=0, column=0, sticky=tk.EW)
+        model_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_model_status())
+        ttk.Button(model_frame, text="받기", width=6, command=self.download_selected_model).grid(
+            row=0, column=1, padx=(4, 0)
+        )
+        ttk.Label(model_frame, textvariable=self.model_status_var, style="Subtle.TLabel").grid(
+            row=1, column=0, columnspan=2, sticky=tk.W, pady=(2, 0)
+        )
 
         ttk.Label(frame, text="원본 언어").grid(row=0, column=1, sticky=tk.W)
         ttk.Combobox(
@@ -1683,6 +1728,29 @@ class PapaStopApp(tk.Tk):
         self.compute_var.set(str(settings["compute"]))
         self.beam_var.set(int(settings["beam"]))
         self._append_log(reason)
+        self.refresh_model_status()
+
+    def refresh_model_status(self) -> None:
+        model = self.model_var.get()
+        if whisper_model_is_downloaded(model):
+            self.model_status_var.set(f"✓ {model} 모델 받음")
+        else:
+            self.model_status_var.set(f"✗ {model} 모델 없음 — '받기'로 미리 받을 수 있어요")
+
+    def download_selected_model(self) -> None:
+        model = self.model_var.get()
+        if whisper_model_is_downloaded(model):
+            messagebox.showinfo(APP_NAME, f"{model} 모델은 이미 받아져 있습니다.")
+            return
+
+        def work() -> None:
+            self._emit("status", f"{model} 모델 다운로드 중")
+            download_whisper_model(model, lambda line: self._emit("log", line))
+            self._emit("status", "대기 중")
+            self._emit("model_status", None)
+            self._emit("done", f"{model} 모델 다운로드가 끝났습니다.")
+
+        self._run_worker(work)
 
     def stop_current_work(self) -> None:
         if not self.busy:
@@ -2109,6 +2177,8 @@ class PapaStopApp(tk.Tk):
                 self._fill_tree(self.engine_tree, payload)  # type: ignore[arg-type]
             elif kind == "subtitle_path":
                 self.subtitle_path_var.set(str(payload))
+            elif kind == "model_status":
+                self.refresh_model_status()
             elif kind == "busy":
                 self.busy = bool(payload)
             elif kind == "done":
