@@ -131,9 +131,9 @@ UI_BORDER_STRONG = "#b9c1d1"  # 카드/입력 테두리 (또렷하게)
 UI_CARD_BORDER = "#c4ccda"   # 카드 구분용 테두리
 UI_TEXT = "#0f172a"          # 본문 텍스트
 UI_TEXT_MUTED = "#64748b"    # 보조 텍스트
-UI_ACCENT = "#4f46e5"        # 인디고 강조색
-UI_ACCENT_HOVER = "#4338ca"
-UI_ACCENT_ACTIVE = "#3730a3"
+UI_ACCENT = "#6366f1"        # 옅은 인디고 강조색 (자극적이지 않게)
+UI_ACCENT_HOVER = "#5457e6"
+UI_ACCENT_ACTIVE = "#4548c9"
 OVERLAY_BG = "#0f172a"       # 자막 오버레이 배경 (어두운 톤 유지)
 OVERLAY_FG = "#f8fafc"
 
@@ -2429,9 +2429,14 @@ class PapaStopApp(ctk.CTk):
         assign("CTkButton", "fg_color", indigo)
         assign("CTkButton", "hover_color", indigo_hover)
         assign("CTkProgressBar", "progress_color", indigo)
-        assign("CTkOptionMenu", "fg_color", indigo)
-        assign("CTkOptionMenu", "button_color", indigo_hover)
-        assign("CTkOptionMenu", "button_hover_color", indigo_active)
+        # 드롭다운은 입력칸처럼 흰 배경 + 본문 글자색으로 두고, 오른쪽 화살표 칸에만 옅은 인디고를 쓴다.
+        assign("CTkOptionMenu", "fg_color", [UI_SURFACE, UI_SURFACE])
+        assign("CTkOptionMenu", "text_color", [UI_TEXT, UI_TEXT])
+        assign("CTkOptionMenu", "button_color", indigo)
+        assign("CTkOptionMenu", "button_hover_color", indigo_hover)
+        assign("CTkOptionMenu", "dropdown_fg_color", [UI_SURFACE, UI_SURFACE])
+        assign("CTkOptionMenu", "dropdown_hover_color", [UI_SURFACE_HOVER, UI_SURFACE_HOVER])
+        assign("CTkOptionMenu", "dropdown_text_color", [UI_TEXT, UI_TEXT])
         assign("CTkCheckBox", "fg_color", indigo)
         assign("CTkCheckBox", "hover_color", indigo_hover)
         assign("CTkRadioButton", "fg_color", indigo)
@@ -2480,8 +2485,9 @@ class PapaStopApp(ctk.CTk):
     def _build_ui(self) -> None:
         root = self
         root.grid_columnconfigure(0, weight=1)
-        root.grid_rowconfigure(0, weight=3)
-        root.grid_rowconfigure(1, weight=2)
+        # 작업 탭(위)에 세로 공간을 더 주어 파일 목록 카드가 잘리지 않게 한다.
+        root.grid_rowconfigure(0, weight=2)
+        root.grid_rowconfigure(1, weight=1)
 
         fam = self._ui_font_family
         self.font_base = ctk.CTkFont(family=fam, size=13)
@@ -2505,7 +2511,20 @@ class PapaStopApp(ctk.CTk):
             text_color=UI_TEXT,
             font=self.font_base,
         )
-        self._option_kw = dict(height=34, corner_radius=8, font=self.font_base, dropdown_font=self.font_base)
+        # 선택창은 입력칸처럼: 흰 배경 + 본문 글자색, 오른쪽 화살표 칸에만 옅은 인디고.
+        self._option_kw = dict(
+            height=34,
+            corner_radius=8,
+            font=self.font_base,
+            dropdown_font=self.font_base,
+            fg_color=UI_SURFACE,
+            text_color=UI_TEXT,
+            button_color=UI_ACCENT,
+            button_hover_color=UI_ACCENT_HOVER,
+            dropdown_fg_color=UI_SURFACE,
+            dropdown_hover_color=UI_SURFACE_HOVER,
+            dropdown_text_color=UI_TEXT,
+        )
 
         # 모든 탭에서 똑같이 쓰는 주요 동작 버튼 규격 (시작 / 중지 / 결과 열기)
         self._primary_btn_kw = dict(width=150, height=40, corner_radius=8, font=self.font_base)
@@ -2969,7 +2988,7 @@ class PapaStopApp(ctk.CTk):
 
         self.log_text = ctk.CTkTextbox(
             common,
-            height=150,
+            height=120,
             wrap="word",
             fg_color="#ffffff",
             text_color=UI_TEXT,
