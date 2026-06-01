@@ -2393,7 +2393,6 @@ class PapaStopApp(ctk.CTk):
         self.live_cancel_event = threading.Event()
         self.record_cancel_event = threading.Event()
         self.file_queue: list[str] = []
-        self.file_preview_lines: list[str] = []
         self._batch_outputs: list[Path] = []
         self._batch_current = 0
         self.last_output: Path | None = None
@@ -2786,23 +2785,6 @@ class PapaStopApp(ctk.CTk):
         ctk.CTkLabel(status_row, text="전체 진행", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left", padx=(20, 0))
         self._live_label(status_row, self.batch_status_var, font=self.font_base, text_color=UI_TEXT).pack(side="left", padx=(8, 0))
 
-        preview_card, preview_body = self._make_card(self.file_tab, "실시간 추출 미리보기")
-        preview_card.pack(fill="both", expand=True, pady=(4, 2))
-        self.file_preview_text = ctk.CTkTextbox(
-            preview_body,
-            height=110,
-            wrap="word",
-            fg_color="#ffffff",
-            text_color=UI_TEXT,
-            border_color=UI_BORDER_STRONG,
-            border_width=1,
-            corner_radius=8,
-            font=self.font_base,
-        )
-        self.file_preview_text.pack(fill="both", expand=True)
-        self.file_preview_text.insert("end", "자막 만들기를 시작하면 추출된 문장이 여기에 표시됩니다.")
-        self.file_preview_text.configure(state="disabled")
-
         self._refresh_file_queue()
 
         # Live tab
@@ -3042,24 +3024,14 @@ class PapaStopApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _clear_file_preview(self) -> None:
-        self.file_preview_lines.clear()
-        self.file_preview_text.configure(state="normal")
-        self.file_preview_text.delete("1.0", tk.END)
-        self.file_preview_text.configure(state="disabled")
+        # 별도 미리보기 박스를 없앴으므로 작업 기록은 지우지 않고 그대로 둡니다.
+        pass
 
     def _append_file_preview(self, line: object) -> None:
         text = str(line).strip()
         if not text:
             return
-        self.file_preview_lines.append(text)
-        if len(self.file_preview_lines) > 300:
-            self.file_preview_lines = self.file_preview_lines[-300:]
-
-        self.file_preview_text.configure(state="normal")
-        self.file_preview_text.delete("1.0", tk.END)
-        self.file_preview_text.insert("end", "\n".join(self.file_preview_lines))
-        self.file_preview_text.see("end")
-        self.file_preview_text.configure(state="disabled")
+        self._append_log(f"[추출 미리보기] {text}")
 
     def _emit(self, kind: str, payload: object) -> None:
         self.event_queue.put((kind, payload))
@@ -3882,6 +3854,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 
