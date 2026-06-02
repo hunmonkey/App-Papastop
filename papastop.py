@@ -127,6 +127,13 @@ TRANSLATION_PROFILE_ORDER_STEPS = {
     "live": (("nllb", NLLB_LIVE_MODEL), ("nllb", NLLB_FAST_MODEL), ("argos", None)),
 }
 
+# 실시간 탭 번역 모델 선택: 품질 우선(1.3B)이 기본, 속도 우선(600M)을 선택할 수 있다.
+LIVE_TRANSLATION_ORDER = ("balanced", "live")
+LIVE_TRANSLATION_LABELS = {
+    "balanced": "정확 (NLLB 1.3B)",
+    "live": "빠름 (NLLB 600M)",
+}
+
 DEFAULT_RESOURCE_MODE = "max"
 RESOURCE_MODE_ORDER = ("max", "balanced")
 RESOURCE_MODE_LABELS = {
@@ -2569,8 +2576,8 @@ class PapaStopApp(ctk.CTk):
         # 실시간은 속도(tiny), 파일은 정확도(base 이상)로 모델을 따로 쓰도록 엔진을 분리한다.
         self.live_asr = ASREngine(model_name="tiny")
         self.translator = TranslationEngine(preferred="auto")
-        # 실시간 번역은 더 가벼운 NLLB 600M(약 1.8배 빠름)로, 파일 번역은 정확도 우선으로 분리한다.
-        self.live_translator = TranslationEngine(preferred="live")
+        # 실시간 번역도 파일과 따로 둔다. 기본은 품질 우선(1.3B), 실시간 탭 콤보에서 600M(빠름)로 바꿀 수 있다.
+        self.live_translator = TranslationEngine(preferred="balanced")
         self.file_workflow = FileSubtitleWorkflow(self.asr, self.translator)
         self.live_service = LiveCaptionService(self.live_asr, self.live_translator)
         self.record_service = ScreenRecorderService()
@@ -3073,6 +3080,7 @@ class PapaStopApp(ctk.CTk):
         self.show_overlay_var = tk.BooleanVar(value=True)
         self.live_save_srt_var = tk.BooleanVar(value=True)
         self.live_whisper_model_var = tk.StringVar(value=WHISPER_MODEL_LABELS[self.live_asr.model_name])
+        self.live_translation_var = tk.StringVar(value=LIVE_TRANSLATION_LABELS[self.live_translator.preferred])
 
         source_card, source_body = self._make_card(self.live_tab, "실시간 소리 입력")
         source_card.pack(fill="x", pady=(2, 10))
@@ -3130,6 +3138,23 @@ class PapaStopApp(ctk.CTk):
         live_model_holder.pack(side="left", padx=10)
         ctk.CTkLabel(
             live_row_model, text="실시간은 빠른 tiny/base 권장", font=self.font_base, text_color=UI_TEXT_MUTED
+        ).pack(side="left", padx=(6, 0))
+
+        live_row_trans = ctk.CTkFrame(source_body, fg_color="transparent")
+        live_row_trans.pack(fill="x", pady=4)
+        ctk.CTkLabel(
+            live_row_trans, text="번역 모델", font=self.font_base, text_color=UI_TEXT_MUTED, width=self._label_w, anchor="w"
+        ).pack(side="left")
+        live_trans_holder, self.live_translation_combo = self._make_option_menu(
+            live_row_trans,
+            variable=self.live_translation_var,
+            values=[LIVE_TRANSLATION_LABELS[key] for key in LIVE_TRANSLATION_ORDER],
+            command=self._on_live_translation_profile_selected,
+            width=MODEL_COMBO_W,
+        )
+        live_trans_holder.pack(side="left", padx=10)
+        ctk.CTkLabel(
+            live_row_trans, text="정확=1.3B, 빠름=600M", font=self.font_base, text_color=UI_TEXT_MUTED
         ).pack(side="left", padx=(6, 0))
 
         live_row1 = ctk.CTkFrame(self.live_tab, fg_color="transparent")
@@ -3720,6 +3745,24 @@ class PapaStopApp(ctk.CTk):
         self.live_asr.set_model(model_name)
         self._append_log(f"실시간 음성 인식 모델을 바꿨습니다: {self.live_asr.model_label(model_name)}")
 
+    def _live_translation_profile_from_selection(self) -> str:
+        label = self.live_translation_var.get()
+        for key, value in LIVE_TRANSLATION_LABELS.items():
+            if value == label:
+                return key
+        return "balanced"
+
+    def _on_live_translation_profile_selected(self, _event: object | None = None) -> None:
+        if self._is_live_running or self._is_translation_preparing:
+            self.live_translation_var.set(
+                LIVE_TRANSLATION_LABELS.get(self.live_translator.preferred, LIVE_TRANSLATION_LABELS["balanced"])
+            )
+            messagebox.showwarning(APP_NAME, "현재 작업이 끝난 뒤 번역 모델을 바꿔 주세요.")
+            return
+        profile = self._live_translation_profile_from_selection()
+        self.live_translator.set_profile(profile)
+        self._append_log(f"실시간 번역 모델을 바꿨습니다: {self.live_translator.profile_label(profile)}")
+
     def _source_lang_id_from_label(self, label: str) -> str:
         for key, value in SOURCE_LANG_LABELS.items():
             if value == label:
@@ -4187,6 +4230,7 @@ class PapaStopApp(ctk.CTk):
             return
 
         self.live_asr.set_model(self._live_whisper_model_from_selection())
+        self.live_translator.set_profile(self._live_translation_profile_from_selection())
         self._apply_resource_mode_from_selection()
 
         live_source = self.live_source_var.get()

@@ -363,3 +363,15 @@ AI 작업 인수인계용 진행 기록 / To-Do Done
    수정 불필요(NLLB 번들 코드 자체가 현재 없음). EXE 배포 시 .papastop_data에 600M 폴더 동반 필요(1.3B와 동일 조건).
   검증: 속도 측정 600M 1.7~1.9배 빠름(8회 평균). py_compile·unittest 27개 통과. 인스턴스 점검: live_translator≠translator,
    live_service.translator is live_translator, preferred="live", _load_nllb(600M) backend=ct2(fallback 아님). 실사용 체감은 사용자 환경 필요.
+
+[완료] 실시간 번역 모델 콤보 추가(품질/속도 사용자 선택)  (2026-06-02)
+  어디: papastop.py (LIVE_TRANSLATION_ORDER/LABELS 상수, PapaStopApp.live_translator 기본 balanced,
+   live_translation_var, 실시간 탭 번역 모델 콤보(live_translation_combo),
+   _live_translation_profile_from_selection/_on_live_translation_profile_selected, _start_live_job).
+  배경: 사용자가 실시간 600M 적용 후 "번역 품질이 떨어진다" 보고. 600M(빠름/품질↓)과 1.3B(정확/느림)는 trade-off라
+   동시 만족 불가 → 음성 인식 모델처럼 사용자가 직접 고르게.
+  무엇/어떻게: 실시간 탭 "소리 입력" 카드에 번역 모델 콤보 추가. 선택지 LIVE_TRANSLATION_ORDER=("balanced","live"),
+   라벨 "정확 (NLLB 1.3B)"/"빠름 (NLLB 600M)". 기본 balanced(1.3B, 품질 우선)로 변경(이전엔 live 고정이었음).
+   콤보 변경·실시간 시작 시 live_translator.set_profile(선택). 작업 중 변경은 경고로 거부. 파일 번역기(self.translator)는 무관.
+  검증: py_compile·unittest 27개 통과. 인스턴스 점검(창 withdraw): 기본 1.3B(balanced), 콤보로 600M(live)↔1.3B 전환 동작,
+   파일 번역기 auto 유지 확인. 실사용 체감은 사용자 환경 필요.
