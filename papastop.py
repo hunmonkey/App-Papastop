@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import os
@@ -35,6 +36,15 @@ DEFAULT_SAMPLE_RATE = 16_000
 DEFAULT_CHUNK_SECONDS = 5.0
 DEFAULT_RECORD_SAMPLE_RATE = 48_000
 DEFAULT_RECORD_FPS = 30
+
+# 실시간 자막: 시계 기준 고정 분할 대신 silero VAD로 발화(말소리) 단위로 자른다.
+LIVE_FRAME_SECONDS = 0.5            # 캡처 프레임 크기(이 단위로 모아 VAD 검사)
+LIVE_MIN_SILENCE_MS = 400          # 이만큼 침묵하면 문장 끝으로 간주(빠른 반응 우선)
+LIVE_MAX_UTTERANCE_SECONDS = 8.0   # 말이 계속 이어져도 이 길이에서 강제 분할
+LIVE_SPEECH_PAD_MS = 200           # 발화 앞뒤 여유 패딩
+# 실시간은 이미 발화 단위로 잘려 들어오므로 디코딩 폭(beam)을 좁혀 속도를 높인다.
+# 파일 자막은 정확도 우선이라 영향받지 않는다. 더 빠르게 하려면 1(greedy)로 낮출 수 있다.
+LIVE_BEAM_SIZE = 2
 
 WHISPER_MODEL_ORDER = ("tiny", "base", "small", "medium", "large-v3", "large-v3-turbo")
 WHISPER_MODEL_LABELS = {
@@ -344,7 +354,10 @@ def get_torch_cuda_available() -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
 def get_primary_cuda_vram_bytes() -> int | None:
+    # 총 VRAM은 실행 중 바뀌지 않는다. torch 없으면 nvidia-smi 서브프로세스(약 110ms)를 타는데,
+    # build_resource_settings가 발화·번역마다 호출하므로 캐시해 매번 재조회하는 낭비를 없앤다.
     if has_module("torch"):
         try:
             import torch
@@ -1234,10 +1247,12 @@ class ASREngine:
 
     def transcribe(
         self,
-        audio_path: Path,
+        audio,
         on_line=None,
         should_stop: Callable[[], bool] | None = None,
         on_segment: Callable[[SubtitleSegment], None] | None = None,
+        vad_filter: bool = True,
+        beam_size: int | None = None,
     ) -> tuple[list[SubtitleSegment], str]:
         self._load_model(on_line=on_line)
         assert self._model is not None
@@ -1247,18 +1262,20 @@ class ASREngine:
 
         settings = build_resource_settings(self.resource_mode)
         forced_language = None if self.source_language == SOURCE_LANG_AUTO else self.source_language
+        # 파일 경로면 문자열로, 실시간 numpy 파형이면 그대로 넘긴다(faster-whisper가 둘 다 지원).
+        audio_input = str(audio) if isinstance(audio, (str, Path)) else audio
         transcribe_kwargs = {
             "language": forced_language,
-            "beam_size": settings.asr_beam_size,
-            "vad_filter": True,
+            "beam_size": beam_size if beam_size is not None else settings.asr_beam_size,
+            "vad_filter": vad_filter,
             "condition_on_previous_text": False,
         }
         if self._batched_model is not None:
             transcribe_kwargs["batch_size"] = settings.asr_batch_size
             transcribe_kwargs["without_timestamps"] = False
-            segments, info = self._batched_model.transcribe(str(audio_path), **transcribe_kwargs)
+            segments, info = self._batched_model.transcribe(audio_input, **transcribe_kwargs)
         else:
-            segments, info = self._model.transcribe(str(audio_path), **transcribe_kwargs)
+            segments, info = self._model.transcribe(audio_input, **transcribe_kwargs)
 
         detected_language = getattr(info, "language", "auto")
         rows: list[SubtitleSegment] = []
@@ -1592,6 +1609,111 @@ class FileSubtitleWorkflow:
         return output_srt
 
 
+def _default_speech_timestamps(audio, sample_rate: int, min_silence_ms: int, max_utterance_s: float, speech_pad_ms: int):
+    # faster-whisper 내장 silero VAD를 그대로 재활용한다(추가 설치 없음).
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    options = VadOptions(
+        min_silence_duration_ms=min_silence_ms,
+        max_speech_duration_s=max_utterance_s,
+        speech_pad_ms=speech_pad_ms,
+    )
+    return get_speech_timestamps(audio, options, sampling_rate=sample_rate)
+
+
+class _UtteranceSegmenter:
+    """작은 오디오 프레임을 모아 침묵 지점에서 '발화' 단위로 잘라 내보낸다.
+
+    on_utterance(start_seconds, clip)로 확정된 발화를 전달한다. start_seconds는 캡처
+    시작 기준 절대 시각, clip은 mono float32 1D numpy 배열이다. VAD 함수는 테스트에서
+    교체할 수 있도록 speech_timestamps_fn으로 주입한다(기본은 silero VAD).
+    """
+
+    def __init__(
+        self,
+        sample_rate: int,
+        on_utterance: Callable[[float, object], None],
+        min_silence_ms: int = LIVE_MIN_SILENCE_MS,
+        max_utterance_s: float = LIVE_MAX_UTTERANCE_SECONDS,
+        speech_pad_ms: int = LIVE_SPEECH_PAD_MS,
+        speech_timestamps_fn: Callable[[object, int], list[dict]] | None = None,
+    ):
+        import numpy as np
+
+        self._np = np
+        self.sample_rate = sample_rate
+        self.on_utterance = on_utterance
+        self.min_silence_samples = int(sample_rate * min_silence_ms / 1000)
+        self.max_utterance_samples = int(sample_rate * max_utterance_s)
+        if speech_timestamps_fn is not None:
+            self._speech_timestamps = speech_timestamps_fn
+        else:
+            self._speech_timestamps = lambda audio, sr: _default_speech_timestamps(
+                audio, sr, min_silence_ms, max_utterance_s, speech_pad_ms
+            )
+        self._buffer = np.zeros(0, dtype=np.float32)
+        self._consumed_seconds = 0.0
+
+    def _to_mono(self, frame):
+        array = self._np.asarray(frame, dtype=self._np.float32)
+        if array.ndim == 2:
+            array = array.mean(axis=1)
+        return array.reshape(-1)
+
+    def add_frame(self, frame) -> None:
+        mono = self._to_mono(frame)
+        if mono.size:
+            self._buffer = self._np.concatenate((self._buffer, mono))
+        self._drain(final=False)
+
+    def flush_remaining(self) -> None:
+        # 정지/스트림 종료 시 버퍼에 남은 음성을 모두 내보낸다.
+        self._drain(final=True)
+        self._buffer = self._np.zeros(0, dtype=self._np.float32)
+        self._consumed_seconds = 0.0
+
+    def _drain(self, final: bool) -> None:
+        if self._buffer.size == 0:
+            return
+
+        timestamps = self._speech_timestamps(self._buffer, self.sample_rate)
+        if not timestamps:
+            # 음성이 없는데 버퍼만 길어지면(잡음/무음) 앞부분을 버려 메모리 상한을 지킨다.
+            if not final and self._buffer.size > self.max_utterance_samples:
+                drop = self._buffer.size - self.max_utterance_samples
+                self._consumed_seconds += drop / self.sample_rate
+                self._buffer = self._buffer[drop:]
+            return
+
+        if final:
+            closed = timestamps
+        else:
+            trailing = self._buffer.size - timestamps[-1]["end"]
+            last_open = trailing < self.min_silence_samples
+            force_split = self._buffer.size >= self.max_utterance_samples
+            if last_open and not force_split:
+                closed = timestamps[:-1]
+            else:
+                closed = timestamps
+
+        if not closed:
+            return
+
+        # 절대 시각은 트림 이전 버퍼 기준으로 계산한 뒤, 마지막에 한 번 트림한다.
+        for segment in closed:
+            start = int(segment["start"])
+            end = int(segment["end"])
+            clip = self._buffer[start:end]
+            if clip.size == 0:
+                continue
+            start_seconds = self._consumed_seconds + start / self.sample_rate
+            self.on_utterance(start_seconds, clip.copy())
+
+        cut_at = int(closed[-1]["end"])
+        self._consumed_seconds += cut_at / self.sample_rate
+        self._buffer = self._buffer[cut_at:]
+
+
 class LiveCaptionService:
     def __init__(
         self,
@@ -1604,12 +1726,13 @@ class LiveCaptionService:
         self.translator = translator
         self.sample_rate = sample_rate
         self.chunk_seconds = chunk_seconds
-        self.chunk_frames = int(sample_rate * chunk_seconds)
+        # 캡처는 작은 프레임으로 받아 _UtteranceSegmenter가 발화 단위로 모아 자른다.
+        self.frame_frames = int(sample_rate * LIVE_FRAME_SECONDS)
         self._capture_thread: threading.Thread | None = None
         self._worker_thread: threading.Thread | None = None
         self._stop_event: threading.Event | None = None
-        self._chunk_queue: queue.Queue[tuple[int | None, Path | None]] | None = None
-        self._temp_dir: Path | None = None
+        self._chunk_queue: queue.Queue[tuple[float | None, object | None]] | None = None
+        self._segmenter: _UtteranceSegmenter | None = None
         self._ffmpeg_process: subprocess.Popen | None = None
         self._source_url: str | None = None
         self._loopback_recorder: object | None = None
@@ -1638,7 +1761,6 @@ class LiveCaptionService:
         self._stop_event = stop_event
         stop_event.clear()
         self._chunk_queue = queue.Queue(maxsize=8)
-        self._temp_dir = Path(tempfile.mkdtemp(prefix="papastop_live_"))
         self._source_url = internet_url.strip() if internet_url else None
         self._srt_path = save_srt_path
         self._srt_rows = []
@@ -1659,6 +1781,12 @@ class LiveCaptionService:
         if stop_event.is_set():
             return
         emit("live_status", "실시간 자막을 시작합니다 ...")
+
+        # 캡처 두 경로(PC 소리/URL)가 같은 분할기를 공유한다. 확정된 발화를 워커 큐로 넘긴다.
+        self._segmenter = _UtteranceSegmenter(
+            self.sample_rate,
+            lambda start_seconds, clip: self._safe_put_chunk((start_seconds, clip)),
+        )
 
         if self._source_url:
             capture_target = self._capture_from_url
@@ -1721,29 +1849,19 @@ class LiveCaptionService:
         self._capture_thread = None
         self._worker_thread = None
         self._stop_event = None
+        self._segmenter = None
         if self._chunk_queue is not None:
+            # 남은 발화는 메모리상 numpy 배열이라 별도 파일 정리가 필요 없다.
             while True:
                 try:
-                    _, leftover = self._chunk_queue.get_nowait()
-                    if leftover and leftover.exists():
-                        try:
-                            leftover.unlink(missing_ok=True)
-                        except OSError:
-                            pass
+                    self._chunk_queue.get_nowait()
                 except queue.Empty:
                     break
             self._chunk_queue = None
 
         self._source_url = None
 
-        if self._temp_dir is not None:
-            try:
-                shutil.rmtree(self._temp_dir, ignore_errors=True)
-            except OSError:
-                pass
-            self._temp_dir = None
-
-    def _safe_put_chunk(self, item: tuple[int | None, Path | None]) -> None:
+    def _safe_put_chunk(self, item: tuple[float | None, object | None]) -> None:
         if self._chunk_queue is None:
             return
         try:
@@ -1785,26 +1903,22 @@ class LiveCaptionService:
             with loopback.recorder(samplerate=self.sample_rate) as recorder:
                 self._loopback_recorder = recorder
                 try:
-                    chunk_index = 0
                     while not stop_event.is_set():
                         with warnings.catch_warnings():
                             warnings.filterwarnings(
                                 "ignore",
                                 message="data discontinuity in recording",
                             )
-                            audio = recorder.record(numframes=self.chunk_frames)
+                            audio = recorder.record(numframes=self.frame_frames)
 
                         if stop_event.is_set():
                             break
-                        if self._temp_dir is None:
+                        if self._segmenter is None:
                             break
                         if not getattr(audio, "size", 1):
                             continue
 
-                        chunk_path = self._temp_dir / f"chunk-{chunk_index:06d}.wav"
-                        save_float_audio_to_wav(audio, self.sample_rate, chunk_path)
-                        self._safe_put_chunk((chunk_index, chunk_path))
-                        chunk_index += 1
+                        self._segmenter.add_frame(audio)
                 finally:
                     self._loopback_recorder = None
         except OperationCancelled:
@@ -1815,6 +1929,11 @@ class LiveCaptionService:
             else:
                 emit("error", f"실시간 캡처 오류: {exc}")
         finally:
+            if self._segmenter is not None:
+                try:
+                    self._segmenter.flush_remaining()
+                except Exception:
+                    pass
             self._safe_put_chunk((None, None))
 
     def _capture_from_url(
@@ -1874,11 +1993,13 @@ class LiveCaptionService:
             if process.stdout is None:
                 raise RuntimeError("ffmpeg에서 오디오 스트림을 읽지 못했습니다.")
 
-            chunk_bytes = self.chunk_frames * 2
+            import numpy as np
+
+            # ffmpeg가 16kHz mono s16le로 내보내므로 작은 프레임으로 모아 float32로 변환해 분할기에 넘긴다.
+            frame_bytes = self.frame_frames * 2
             pending = bytearray()
-            chunk_index = 0
             while not stop_event.is_set():
-                need = chunk_bytes - len(pending)
+                need = frame_bytes - len(pending)
                 if need > 0:
                     chunk = process.stdout.read(need)
                     if chunk:
@@ -1886,24 +2007,19 @@ class LiveCaptionService:
                     elif not pending:
                         break
 
-                if len(pending) < chunk_bytes:
+                if len(pending) < frame_bytes:
                     continue
 
-                data = bytes(pending[:chunk_bytes])
-                del pending[:chunk_bytes]
+                data = bytes(pending[:frame_bytes])
+                del pending[:frame_bytes]
 
                 if stop_event.is_set():
                     break
-                if not self._temp_dir:
+                if self._segmenter is None:
                     break
 
-                chunk_path = self._temp_dir / f"chunk-url-{chunk_index:06d}.wav"
-                try:
-                    write_pcm16_to_wav(data, self.sample_rate, chunk_path)
-                except Exception:
-                    break
-                self._safe_put_chunk((chunk_index, chunk_path))
-                chunk_index += 1
+                frame = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                self._segmenter.add_frame(frame)
         except OperationCancelled:
             emit("log", "실시간 캡처가 취소되었습니다.")
         except Exception as exc:
@@ -1917,6 +2033,11 @@ class LiveCaptionService:
                     pass
                 try:
                     process.terminate()
+                except Exception:
+                    pass
+            if self._segmenter is not None:
+                try:
+                    self._segmenter.flush_remaining()
                 except Exception:
                     pass
             self._safe_put_chunk((None, None))
@@ -1933,19 +2054,23 @@ class LiveCaptionService:
                     break
                 continue
 
-            chunk_index, chunk_path = chunk
-            if chunk_index is None:
+            start_seconds, audio = chunk
+            if start_seconds is None:
                 break
-            if chunk_path is None:
+            if audio is None:
                 continue
             if stop_event.is_set():
                 break
 
             work_started_at = time.monotonic()
             try:
+                # 이미 발화 단위로 잘라 침묵이 제거됐으므로 위스퍼 쪽 VAD는 끄고(이중 처리 방지),
+                # 디코딩 폭(beam)도 좁혀 실시간 속도를 높인다.
                 segments, source_language = self.asr.transcribe(
-                    chunk_path,
+                    audio,
                     should_stop=stop_event.is_set,
+                    vad_filter=False,
+                    beam_size=LIVE_BEAM_SIZE,
                 )
                 if segments:
                     translated = self.translator.translate_texts(
@@ -1959,29 +2084,26 @@ class LiveCaptionService:
                     if lines:
                         emit("live_caption", "\n".join(lines[-2:]))
                     if self._srt_path is not None and pairs:
-                        self._append_live_srt(chunk_index, pairs, emit)
-                self._report_processing_lag(time.monotonic() - work_started_at, emit)
+                        self._append_live_srt(start_seconds, pairs, emit)
+                utterance_seconds = len(audio) / self.sample_rate
+                self._report_processing_lag(time.monotonic() - work_started_at, utterance_seconds, emit)
             except OperationCancelled:
                 emit("log", "실시간 번역이 취소되었습니다.")
             except Exception as exc:
-                emit("error", f"실시간 번역 오류: {chunk_path.name} - {exc}")
-            finally:
-                if chunk_path.exists():
-                    try:
-                        chunk_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                emit("error", f"실시간 번역 오류: {exc}")
 
-    def _report_processing_lag(self, elapsed: float, emit: Callable[[str, object], None]) -> None:
-        # 한 청크 분석 시간이 입력 간격보다 길면 따라가지 못해 일부 구간을 건너뛴다.
-        if elapsed <= self.chunk_seconds * 1.15:
+    def _report_processing_lag(self, elapsed: float, utterance_seconds: float, emit: Callable[[str, object], None]) -> None:
+        # 한 발화 분석 시간이 그 발화 길이보다 길면 실시간을 따라가지 못해 일부 구간을 건너뛴다.
+        # 짧은 발화는 모델 고정 오버헤드 탓에 비율만 보면 오경고가 잦아 1.5초 바닥값을 둔다.
+        threshold = max(utterance_seconds * 1.15, 1.5)
+        if elapsed <= threshold:
             return
         now = time.monotonic()
         if now - self._lag_warned_at < 10.0:
             return
         self._lag_warned_at = now
         message = (
-            f"⏱ 실시간 분석이 느립니다: 분석 {elapsed:.1f}초 > 입력 간격 {self.chunk_seconds:.1f}초. "
+            f"⏱ 실시간 분석이 느립니다: 분석 {elapsed:.1f}초 > 발화 길이 {utterance_seconds:.1f}초. "
             "따라가지 못해 일부 구간을 건너뜁니다"
         )
         if self._dropped_chunks:
@@ -1992,13 +2114,13 @@ class LiveCaptionService:
 
     def _append_live_srt(
         self,
-        chunk_index: int,
+        start_seconds: float,
         pairs: list[tuple[SubtitleSegment, str]],
         emit: Callable[[str, object], None],
     ) -> None:
         if self._srt_path is None:
             return
-        offset = chunk_index * self.chunk_seconds
+        offset = start_seconds
         for segment, text in pairs:
             self._srt_rows.append(
                 SubtitleSegment(
@@ -2324,9 +2446,16 @@ class LiveSubtitleOverlay(tk.Toplevel):
         except Exception:
             pass
         # 바깥 테두리를 인디고 액센트로 얇게 깔아 카드 느낌을 줍니다.
-        self.configure(bg=UI_ACCENT)
+        self.configure(
+            bg=UI_ACCENT,
+            cursor="fleur",
+            highlightbackground=UI_ACCENT_ACTIVE,
+            highlightcolor=UI_ACCENT_ACTIVE,
+            highlightthickness=2,
+        )
         self._drag_start_x = 0
         self._drag_start_y = 0
+        self._visible = False
 
         # 윈도우 상단 바가 없는 상태에서도 마우스로 위치를 이동할 수 있게 드래그 이벤트 등록
         self.bind("<Button-1>", self._begin_drag)
@@ -2342,15 +2471,16 @@ class LiveSubtitleOverlay(tk.Toplevel):
             wraplength=1000,
             padx=28,
             pady=20,
+            cursor="fleur",
         )
         self.label.bind("<Button-1>", self._begin_drag)
         self.label.bind("<B1-Motion>", self._on_drag)
-        self.label.pack(fill="both", expand=True, padx=2, pady=2)
+        self.label.pack(fill="both", expand=True, padx=6, pady=6)
 
         screen_w = self.winfo_screenwidth()
         self.geometry(f"1100x220+{max(20, (screen_w - 1100) // 2)}+20")
         self.label.config(text="실시간 자막 준비 완료")
-        self.deiconify()
+        self.show()
 
     def _begin_drag(self, event: tk.Event) -> None:
         self._drag_start_x = event.x_root
@@ -2366,8 +2496,21 @@ class LiveSubtitleOverlay(tk.Toplevel):
             return
         self.label.config(text=text)
 
+    def show(self) -> None:
+        self.deiconify()
+        self.lift()
+        self._visible = True
+
+    def hide(self) -> None:
+        self.withdraw()
+        self._visible = False
+
+    def is_visible(self) -> bool:
+        return self._visible
+
     def close(self) -> None:
         try:
+            self._visible = False
             self.destroy()
         except Exception:
             pass
@@ -2566,7 +2709,7 @@ class PapaStopApp(ctk.CTk):
         right = ctk.CTkFrame(root, fg_color="transparent")
         right.grid(row=0, column=1, sticky="nsew", padx=(7, 14), pady=14)
         right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(0, weight=2)
+        right.grid_rowconfigure(0, weight=3)
         right.grid_rowconfigure(1, weight=1)
 
         content = ctk.CTkFrame(right, fg_color="transparent")
@@ -2582,7 +2725,7 @@ class PapaStopApp(ctk.CTk):
         for host in (file_tab_host, live_tab_host, record_tab_host, system_tab_host):
             host.grid(row=0, column=0, sticky="nsew")
 
-        self.file_tab = ctk.CTkScrollableFrame(file_tab_host, fg_color="transparent")
+        self.file_tab = ctk.CTkFrame(file_tab_host, fg_color="transparent")
         self.file_tab.pack(fill="both", expand=True)
         self.live_tab = live_tab_host
         self.record_tab = record_tab_host
@@ -2829,9 +2972,8 @@ class PapaStopApp(ctk.CTk):
             highlightthickness=0,
         )
         self.file_listbox.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
-        list_scroll = ctk.CTkScrollbar(listbox_wrap, command=self.file_listbox.yview)
-        list_scroll.pack(side="right", fill="y", padx=(2, 4), pady=8)
-        self.file_listbox.configure(yscrollcommand=list_scroll.set)
+        self.file_list_scroll = ctk.CTkScrollbar(listbox_wrap, command=self.file_listbox.yview)
+        self.file_listbox.configure(yscrollcommand=self.file_list_scroll.set)
 
         queue_button_frame = ctk.CTkFrame(list_area, fg_color="transparent")
         queue_button_frame.pack(side="left", fill="y", padx=(10, 0))
@@ -2951,6 +3093,7 @@ class PapaStopApp(ctk.CTk):
             variable=self.show_overlay_var,
             onvalue=True,
             offvalue=False,
+            command=self._apply_live_overlay_preference,
             font=self.font_base,
         ).pack(side="left")
         ctk.CTkCheckBox(
@@ -2961,6 +3104,16 @@ class PapaStopApp(ctk.CTk):
             offvalue=False,
             font=self.font_base,
         ).pack(side="left", padx=(20, 0))
+        self.toggle_overlay_btn = ctk.CTkButton(
+            live_row2,
+            text="자막창 보이기",
+            command=self._toggle_live_overlay,
+            width=120,
+            height=32,
+            state="disabled",
+            **self._ghost_btn,
+        )
+        self.toggle_overlay_btn.pack(side="left", padx=(12, 0))
 
         ctk.CTkLabel(
             self.live_tab, text="실시간 자막 미리보기", font=self.font_base, text_color=UI_TEXT_MUTED, anchor="w"
@@ -3322,7 +3475,65 @@ class PapaStopApp(ctk.CTk):
         if not busy and self.overlay is not None:
             self.overlay.close()
             self.overlay = None
+        self._sync_live_overlay_button()
         self._refresh_resource_mode_control_state()
+
+    def _live_overlay_is_visible(self) -> bool:
+        if self.overlay is None:
+            return False
+        try:
+            return bool(self.overlay.winfo_exists()) and self.overlay.is_visible()
+        except tk.TclError:
+            return False
+
+    def _show_live_overlay(self) -> None:
+        if self.overlay is None:
+            self.overlay = LiveSubtitleOverlay(self)
+        else:
+            try:
+                if not self.overlay.winfo_exists():
+                    self.overlay = LiveSubtitleOverlay(self)
+            except tk.TclError:
+                self.overlay = LiveSubtitleOverlay(self)
+
+        preview_text = self.live_preview_var.get().strip()
+        if preview_text:
+            self.overlay.set_text(preview_text)
+        self.overlay.show()
+
+    def _hide_live_overlay(self) -> None:
+        if self.overlay is None:
+            return
+        try:
+            if self.overlay.winfo_exists():
+                self.overlay.hide()
+        except tk.TclError:
+            self.overlay = None
+
+    def _apply_live_overlay_preference(self) -> None:
+        if not self._is_live_running:
+            self._sync_live_overlay_button()
+            return
+        if self.show_overlay_var.get():
+            self._show_live_overlay()
+        else:
+            self._hide_live_overlay()
+        self._sync_live_overlay_button()
+
+    def _toggle_live_overlay(self) -> None:
+        if not self._is_live_running:
+            return
+        self.show_overlay_var.set(not self._live_overlay_is_visible())
+        self._apply_live_overlay_preference()
+
+    def _sync_live_overlay_button(self) -> None:
+        if not hasattr(self, "toggle_overlay_btn"):
+            return
+        visible = self._live_overlay_is_visible()
+        self.toggle_overlay_btn.configure(
+            text="자막창 숨기기" if visible else "자막창 보이기",
+            state="normal" if self._is_live_running else "disabled",
+        )
 
     def _set_record_busy(self, busy: bool) -> None:
         self._is_record_running = busy
@@ -3637,7 +3848,16 @@ class PapaStopApp(ctk.CTk):
         self.file_listbox.delete(0, tk.END)
         for source in self.file_queue:
             self.file_listbox.insert(tk.END, source)
+        self._sync_file_list_scrollbar()
         self.batch_status_var.set(f"{len(self.file_queue)}개 파일 대기 중")
+
+    def _sync_file_list_scrollbar(self) -> None:
+        visible_rows = int(self.file_listbox.cget("height"))
+        needs_scroll = len(self.file_queue) > visible_rows
+        if needs_scroll and not self.file_list_scroll.winfo_manager():
+            self.file_list_scroll.pack(side="right", fill="y", padx=(2, 4), pady=8)
+        elif not needs_scroll:
+            self.file_list_scroll.pack_forget()
 
     def _collect_batch_sources(self) -> list[str]:
         if self.file_queue:
@@ -3917,8 +4137,8 @@ class PapaStopApp(ctk.CTk):
         self._emit("status", "실시간 자막")
 
         if self.show_overlay_var.get():
-            self.overlay = LiveSubtitleOverlay(self)
-            self.overlay.lift()
+            self._show_live_overlay()
+        self._sync_live_overlay_button()
 
         save_srt_path = default_live_srt_path() if self.live_save_srt_var.get() else None
 

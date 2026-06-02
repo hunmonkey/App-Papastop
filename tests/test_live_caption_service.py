@@ -9,7 +9,7 @@ from unittest import mock
 
 import numpy as np
 
-from papastop import LiveCaptionService, SubtitleSegment
+from papastop import LiveCaptionService, SubtitleSegment, _UtteranceSegmenter
 
 
 class FakeRecorder:
@@ -54,19 +54,20 @@ class LiveCaptionServiceTests(unittest.TestCase):
         previous_soundcard = sys.modules.get("soundcard")
         sys.modules["soundcard"] = soundcard
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                service._temp_dir = Path(temp_dir)
-                service._chunk_queue = queue.Queue(maxsize=8)
+            service._chunk_queue = queue.Queue(maxsize=8)
+            # 실제 silero VAD 로딩을 피하려고 발화가 없다고 답하는 가짜 분할기를 주입한다.
+            service._segmenter = _UtteranceSegmenter(
+                service.sample_rate,
+                on_utterance=lambda s, c: service._safe_put_chunk((s, c)),
+                speech_timestamps_fn=lambda audio, sr: [],
+            )
 
-                with mock.patch("papastop.os.name", "nt"), mock.patch("papastop.has_module", return_value=True):
-                    service._capture_loop(lambda kind, payload: events.append((kind, payload)), stop_event)
+            with mock.patch("papastop.os.name", "nt"), mock.patch("papastop.has_module", return_value=True):
+                service._capture_loop(lambda kind, payload: events.append((kind, payload)), stop_event)
 
-                chunk_index, chunk_path = service._chunk_queue.get_nowait()
-                sentinel = service._chunk_queue.get_nowait()
-
-                self.assertEqual(chunk_index, 0)
-                self.assertTrue(chunk_path.exists())
-                self.assertEqual(sentinel, (None, None))
+            # 무음만 들어왔으므로 발화 청크는 없고 종료 신호만 큐에 남는다.
+            sentinel = service._chunk_queue.get_nowait()
+            self.assertEqual(sentinel, (None, None))
         finally:
             if previous_soundcard is None:
                 sys.modules.pop("soundcard", None)
@@ -99,13 +100,13 @@ class LiveCaptionServiceTests(unittest.TestCase):
         events = []
         emit = lambda kind, payload: events.append((kind, payload))
 
-        # 빠르면 경고 없음
-        service._report_processing_lag(1.0, emit)
+        # 발화 길이보다 빠르게 처리하면 경고 없음
+        service._report_processing_lag(1.0, 5.0, emit)
         self.assertEqual(events, [])
 
-        # 느리면 경고(live_status + log), 한 번만
+        # 발화 길이보다 느리면 경고(live_status + log), 한 번만
         service._dropped_chunks = 3
-        service._report_processing_lag(8.0, emit)
+        service._report_processing_lag(8.0, 5.0, emit)
         kinds = [k for k, _ in events]
         self.assertIn("live_status", kinds)
         self.assertIn("log", kinds)
@@ -113,10 +114,10 @@ class LiveCaptionServiceTests(unittest.TestCase):
 
         # 10초 throttle: 곧바로 다시 호출하면 추가 경고 없음
         before = len(events)
-        service._report_processing_lag(9.0, emit)
+        service._report_processing_lag(9.0, 5.0, emit)
         self.assertEqual(len(events), before)
 
-    def test_append_live_srt_offsets_by_chunk_index(self):
+    def test_append_live_srt_offsets_by_start_time(self):
         service = LiveCaptionService(asr=object(), translator=object(), sample_rate=16000, chunk_seconds=5.0)
         events = []
         emit = lambda kind, payload: events.append((kind, payload))
@@ -127,20 +128,74 @@ class LiveCaptionServiceTests(unittest.TestCase):
             service._srt_rows = []
             service._srt_emitted = False
 
-            # 청크 2 (오프셋 10초), 청크 4 (오프셋 20초)
-            service._append_live_srt(2, [(SubtitleSegment(0.0, 1.5, "원문무시"), "안녕하세요")], emit)
-            service._append_live_srt(4, [(SubtitleSegment(0.5, 2.0, "원문무시"), "반갑습니다")], emit)
+            # 발화 시작 시각(절대 초)을 직접 오프셋으로 사용한다.
+            service._append_live_srt(10.0, [(SubtitleSegment(0.0, 1.5, "원문무시"), "안녕하세요")], emit)
+            service._append_live_srt(20.0, [(SubtitleSegment(0.5, 2.0, "원문무시"), "반갑습니다")], emit)
 
             content = srt_path.read_text(encoding="utf-8")
 
         # 누적·시간 보정 확인
         self.assertEqual(len(service._srt_rows), 2)
-        self.assertIn("00:00:10,000 --> 00:00:11,500", content)  # 청크 2 = 0+10 ~ 1.5+10
-        self.assertIn("00:00:20,500 --> 00:00:22,000", content)  # 청크 4 = 0.5+20 ~ 2.0+20
+        self.assertIn("00:00:10,000 --> 00:00:11,500", content)  # 10 + 0.0 ~ 10 + 1.5
+        self.assertIn("00:00:20,500 --> 00:00:22,000", content)  # 20 + 0.5 ~ 20 + 2.0
         self.assertIn("안녕하세요", content)
         self.assertIn("반갑습니다", content)
         # 저장 경로는 한 번만 알림
         self.assertEqual([k for k, _ in events].count("live_subtitle_output"), 1)
+
+
+class UtteranceSegmenterTests(unittest.TestCase):
+    def _make(self, fake_fn, **kwargs):
+        results = []
+        segmenter = _UtteranceSegmenter(
+            16000,
+            on_utterance=lambda start, clip: results.append((start, len(clip))),
+            speech_timestamps_fn=fake_fn,
+            **kwargs,
+        )
+        return segmenter, results
+
+    def test_emits_utterance_after_trailing_silence(self):
+        # 버퍼가 1초(16000샘플) 이상이면 [0,16000) 구간이 음성이라고 답하는 가짜 VAD
+        fake = lambda audio, sr: [{"start": 0, "end": 16000}] if len(audio) >= 16000 else []
+        segmenter, results = self._make(fake, min_silence_ms=400, max_utterance_s=8.0)
+        frame = np.zeros(8000, dtype=np.float32)  # 0.5초
+
+        segmenter.add_frame(frame)   # 버퍼 8000: 음성 없음
+        self.assertEqual(results, [])
+        segmenter.add_frame(frame)   # 버퍼 16000: 마지막 구간이 끝에 닿아 진행 중 → 보류
+        self.assertEqual(results, [])
+        segmenter.add_frame(frame)   # 버퍼 24000: 끝에 침묵(8000) 확보 → 확정 방출
+        self.assertEqual(results, [(0.0, 16000)])
+
+    def test_force_flush_at_max_utterance(self):
+        # 버퍼 전체가 늘 음성(침묵이 안 끝남)이면 최대 길이에서 강제 분할
+        fake = lambda audio, sr: [{"start": 0, "end": len(audio)}]
+        segmenter, results = self._make(fake, min_silence_ms=2000, max_utterance_s=1.0)
+        frame = np.zeros(8000, dtype=np.float32)
+
+        segmenter.add_frame(frame)   # 버퍼 8000 < 최대(16000): 진행 중 → 보류
+        self.assertEqual(results, [])
+        segmenter.add_frame(frame)   # 버퍼 16000 >= 최대: 강제 확정
+        self.assertEqual(results, [(0.0, 16000)])
+
+    def test_flush_remaining_emits_pending(self):
+        fake = lambda audio, sr: [{"start": 0, "end": len(audio)}]
+        segmenter, results = self._make(fake, min_silence_ms=2000, max_utterance_s=8.0)
+
+        segmenter.add_frame(np.zeros(8000, dtype=np.float32))  # 진행 중 → 보류
+        self.assertEqual(results, [])
+        segmenter.flush_remaining()  # 종료 시 남은 음성 방출
+        self.assertEqual(results, [(0.0, 8000)])
+
+    def test_stereo_frame_is_downmixed_to_mono(self):
+        # 스테레오(2채널) 프레임이 들어와도 mono로 합쳐 길이가 채널 수만큼 줄지 않는다.
+        fake = lambda audio, sr: [{"start": 0, "end": len(audio)}]
+        segmenter, results = self._make(fake, min_silence_ms=2000, max_utterance_s=8.0)
+
+        segmenter.add_frame(np.zeros((8000, 2), dtype=np.float32))
+        segmenter.flush_remaining()
+        self.assertEqual(results, [(0.0, 8000)])
 
 
 if __name__ == "__main__":

@@ -289,3 +289,38 @@ AI 작업 인수인계용 진행 기록 / To-Do Done
    _worker_loop가 청크 처리시간을 측정해 입력 간격의 1.15배 초과 시 10초 throttle로 live_status+log에 경고
    ("분석 N초 > 입력 M초, 일부 구간 건너뜀(누적 K), 더 빠른 모델/균형 모드 권장").
   검증: py_compile 통과. unittest 23개 통과(드롭 카운트·경고/throttle 테스트 추가). 앱 빌드 스모크 통과.
+
+------------------------------------------------------------
+※ 작업 묶음: 실시간 번역 정확도·속도 개선 — 발화 단위(VAD) 분할.
+  배경: 황재훈 님이 "실시간 번역 속도·정확도 개선" 요청. 진단 결과 기존은 시계 기준 5초 고정 분할이라
+   문장이 경계에서 토막나 STT 오인식·번역 어색의 1순위 원인. 또 매 청크를 WAV로 디스크에 썼다 읽는 낭비.
+   방향 선택: "발화 단위 분할(추천)" + 성향 "빠른 반응 우선"(침묵 0.4초, 최대 발화 8초). 추가 의존성 없음
+   (faster-whisper 내장 silero VAD 재활용). 저위험 튜닝(beam 축소)·번역 문맥 살리기는 후속 주제로 분리.
+  보관: 2026-06-02
+
+[완료] 실시간 발화 단위(VAD) 분할 전환  (2026-06-02)
+  어디: papastop.py (상수 4개, _default_speech_timestamps(), _UtteranceSegmenter 신규,
+   ASREngine.transcribe, LiveCaptionService(__init__/start/stop/_safe_put_chunk/_capture_loop/
+   _capture_from_url/_worker_loop/_report_processing_lag/_append_live_srt)),
+   tests/test_live_caption_service.py.
+  무엇/어떻게:
+   · 상수 추가: LIVE_FRAME_SECONDS=0.5, LIVE_MIN_SILENCE_MS=400, LIVE_MAX_UTTERANCE_SECONDS=8.0, LIVE_SPEECH_PAD_MS=200.
+   · _UtteranceSegmenter: 작은 프레임을 모아 silero VAD(get_speech_timestamps)로 발화 경계를 찾아
+     on_utterance(start_seconds, clip) 콜백으로 확정 발화를 방출. 마지막 구간이 버퍼 끝에 닿으면(진행 중) 보류,
+     최대 길이 초과 시 강제 확정, flush_remaining()으로 종료 시 잔여 방출. VAD 함수는 speech_timestamps_fn으로 주입 가능(테스트용).
+   · ASREngine.transcribe: 첫 인자를 audio(Path|numpy)로 받아 둘 다 지원. vad_filter 인자 추가(기본 True, 파일 동작 보존).
+   · LiveCaptionService: 캡처를 작은 프레임으로(PC 소리/URL 공통) 받아 분할기에 전달, 디스크 WAV 저장 제거(_temp_dir 제거).
+     큐 아이템을 (chunk_index,Path) → (start_seconds:float, audio:numpy)로 변경. 워커는 numpy를 vad_filter=False로 transcribe.
+     SRT 오프셋은 발화 절대 시작시각(start_seconds) 사용. _report_processing_lag는 발화 길이 기준(1.5초 바닥값)으로 비교.
+   · save_float_audio_to_wav/write_pcm16_to_wav는 test_subtitle_utils에서 직접 검증되어 유지(고아 아님).
+  검증: unittest 27개 통과(_UtteranceSegmenter 신규 4개: 침묵 후 확정·최대길이 강제분할·flush 잔여·스테레오 다운믹스).
+   py_compile 통과. silero VAD가 numpy 입력을 에러 없이 처리함을 스모크로 확인(순수 사인파는 음성 미검출 — 정상).
+   실제 음성 재생 환경에서의 체감(문장 경계 분할·SRT 타이밍·temp WAV 미생성)은 사용자 환경 필요해 미검증.
+
+[완료] 실시간 GPU 자원조회 캐시(발화당 0.2~0.3초 낭비 제거)  (2026-06-02)
+  어디: papastop.py (import functools 추가, get_primary_cuda_vram_bytes).
+  무엇/어떻게: build_resource_settings()가 ASREngine.transcribe(발화마다)·TranslationEngine._translate_nllb(번역마다)에서
+   호출되는데, 내부 get_primary_cuda_vram_bytes()가 이 환경(torch=CPU판)에서 매번 nvidia-smi 서브프로세스를 띄워 약 110ms 소요.
+   총 VRAM은 실행 중 불변이므로 @functools.lru_cache(maxsize=1)로 캐시. 테스트는 mock.patch로 함수 이름을 교체하므로 충돌 없음.
+  검증: build_resource_settings 113ms → 0.03ms (약 3700배). unittest 27개 그대로 통과.
+   측정은 워밍업 후 30회 평균(.venv python, tmp_out 임시 스크립트, 측정 후 삭제).
