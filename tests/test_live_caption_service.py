@@ -100,21 +100,24 @@ class LiveCaptionServiceTests(unittest.TestCase):
         events = []
         emit = lambda kind, payload: events.append((kind, payload))
 
-        # 발화 길이보다 빠르게 처리하면 경고 없음
-        service._report_processing_lag(1.0, 5.0, emit)
+        # 발화 길이보다 빠르게 처리하면 경고 없음 (elapsed, 발화길이, 인식시간, 번역시간)
+        service._report_processing_lag(1.0, 5.0, 0.5, 0.5, emit)
         self.assertEqual(events, [])
 
         # 발화 길이보다 느리면 경고(live_status + log), 한 번만
         service._dropped_chunks = 3
-        service._report_processing_lag(8.0, 5.0, emit)
+        service._report_processing_lag(8.0, 5.0, 3.0, 5.0, emit)
         kinds = [k for k, _ in events]
         self.assertIn("live_status", kinds)
         self.assertIn("log", kinds)
         self.assertIn("건너뜀 3", events[0][1])
+        # 경고에 인식·번역 분리 시간이 표시된다
+        self.assertIn("인식 3.0초", events[0][1])
+        self.assertIn("번역 5.0초", events[0][1])
 
         # 10초 throttle: 곧바로 다시 호출하면 추가 경고 없음
         before = len(events)
-        service._report_processing_lag(9.0, 5.0, emit)
+        service._report_processing_lag(9.0, 5.0, 3.0, 6.0, emit)
         self.assertEqual(len(events), before)
 
     def test_append_live_srt_offsets_by_start_time(self):

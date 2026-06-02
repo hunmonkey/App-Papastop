@@ -100,10 +100,12 @@ NLLB_LANGUAGE_MAP = {
     "ru": "rus_Cyrl",
 }
 
+NLLB_LIVE_MODEL = "facebook/nllb-200-distilled-600M"
 NLLB_FAST_MODEL = "facebook/nllb-200-distilled-1.3B"
 NLLB_ACCURATE_MODEL = "facebook/nllb-200-3.3B"
 NLLB_TOKENIZER_MODEL = NLLB_ACCURATE_MODEL
 NLLB_CT2_MODEL_DIRS = {
+    NLLB_LIVE_MODEL: PAPASTOP_DATA / "nllb-200-distilled-600M-ct2",
     NLLB_FAST_MODEL: PAPASTOP_DATA / "nllb-200-distilled-1.3B-ct2",
     NLLB_ACCURATE_MODEL: PAPASTOP_DATA / "nllb-200-3.3B-ct2",
 }
@@ -114,12 +116,15 @@ TRANSLATION_PROFILE_LABELS = {
     "fast": "빠름 (Argos 번역)",
     "balanced": "균형 (NLLB 1.3B)",
     "accurate": "정확도 우선 (NLLB 3.3B)",
+    "live": "실시간 빠름 (NLLB 600M)",
 }
 TRANSLATION_PROFILE_ORDER_STEPS = {
     "auto": (("nllb", NLLB_FAST_MODEL), ("argos", None)),
     "fast": (("argos", None),),
     "balanced": (("nllb", NLLB_FAST_MODEL),),
     "accurate": (("nllb", NLLB_ACCURATE_MODEL), ("nllb", NLLB_FAST_MODEL)),
+    # 실시간 전용: 600M 우선, 없으면 1.3B로, 그래도 안 되면 Argos로 내려간다.
+    "live": (("nllb", NLLB_LIVE_MODEL), ("nllb", NLLB_FAST_MODEL), ("argos", None)),
 }
 
 DEFAULT_RESOURCE_MODE = "max"
@@ -1776,6 +1781,7 @@ class LiveCaptionService:
         try:
             self.asr.prepare_model()
             self.translator.prepare_profile()
+            self._warmup(emit)
         except Exception as exc:
             emit("log", f"실시간 모델 사전 준비 중 경고: {exc}")
         if stop_event.is_set():
@@ -1804,6 +1810,19 @@ class LiveCaptionService:
 
         self._capture_thread.start()
         self._worker_thread.start()
+
+    def _warmup(self, emit: Callable[[str, object], None]) -> None:
+        # 첫 추론은 CUDA 커널 준비로 유독 느리다. 시작할 때 짧은 더미 입력으로 인식·번역을 한 번씩
+        # 미리 돌려, 그 준비 비용을 첫 실제 발화가 떠안지 않게 한다.
+        try:
+            import numpy as np
+
+            dummy = np.zeros(int(self.sample_rate * 1.0), dtype=np.float32)
+            self.asr.transcribe(dummy, vad_filter=False, beam_size=LIVE_BEAM_SIZE)
+            self.translator.translate_texts(["warm up"], "en")
+            emit("log", "실시간 엔진 준비 운동 완료.")
+        except Exception as exc:
+            emit("log", f"준비 운동 경고: {exc}")
 
     def stop(self, timeout: float = 2.0) -> None:
         if self._stop_event is not None:
@@ -2066,17 +2085,22 @@ class LiveCaptionService:
             try:
                 # 이미 발화 단위로 잘라 침묵이 제거됐으므로 위스퍼 쪽 VAD는 끄고(이중 처리 방지),
                 # 디코딩 폭(beam)도 좁혀 실시간 속도를 높인다.
+                asr_started_at = time.monotonic()
                 segments, source_language = self.asr.transcribe(
                     audio,
                     should_stop=stop_event.is_set,
                     vad_filter=False,
                     beam_size=LIVE_BEAM_SIZE,
                 )
+                asr_elapsed = time.monotonic() - asr_started_at
+                translate_elapsed = 0.0
                 if segments:
+                    translate_started_at = time.monotonic()
                     translated = self.translator.translate_texts(
                         [s.text for s in segments],
                         source_language,
                     )
+                    translate_elapsed = time.monotonic() - translate_started_at
                     if len(translated) != len(segments):
                         translated = translated + ["" for _ in range(len(segments) - len(translated))]
                     pairs = [(s, (t.strip() or s.text.strip())) for s, t in zip(segments, translated) if (t or s.text).strip()]
@@ -2086,13 +2110,26 @@ class LiveCaptionService:
                     if self._srt_path is not None and pairs:
                         self._append_live_srt(start_seconds, pairs, emit)
                 utterance_seconds = len(audio) / self.sample_rate
-                self._report_processing_lag(time.monotonic() - work_started_at, utterance_seconds, emit)
+                self._report_processing_lag(
+                    time.monotonic() - work_started_at,
+                    utterance_seconds,
+                    asr_elapsed,
+                    translate_elapsed,
+                    emit,
+                )
             except OperationCancelled:
                 emit("log", "실시간 번역이 취소되었습니다.")
             except Exception as exc:
                 emit("error", f"실시간 번역 오류: {exc}")
 
-    def _report_processing_lag(self, elapsed: float, utterance_seconds: float, emit: Callable[[str, object], None]) -> None:
+    def _report_processing_lag(
+        self,
+        elapsed: float,
+        utterance_seconds: float,
+        asr_elapsed: float,
+        translate_elapsed: float,
+        emit: Callable[[str, object], None],
+    ) -> None:
         # 한 발화 분석 시간이 그 발화 길이보다 길면 실시간을 따라가지 못해 일부 구간을 건너뛴다.
         # 짧은 발화는 모델 고정 오버헤드 탓에 비율만 보면 오경고가 잦아 1.5초 바닥값을 둔다.
         threshold = max(utterance_seconds * 1.15, 1.5)
@@ -2103,7 +2140,9 @@ class LiveCaptionService:
             return
         self._lag_warned_at = now
         message = (
-            f"⏱ 실시간 분석이 느립니다: 분석 {elapsed:.1f}초 > 발화 길이 {utterance_seconds:.1f}초. "
+            f"⏱ 실시간 분석이 느립니다: 분석 {elapsed:.1f}초"
+            f"(인식 {asr_elapsed:.1f}초 + 번역 {translate_elapsed:.1f}초)"
+            f" > 발화 길이 {utterance_seconds:.1f}초. "
             "따라가지 못해 일부 구간을 건너뜁니다"
         )
         if self._dropped_chunks:
@@ -2527,9 +2566,13 @@ class PapaStopApp(ctk.CTk):
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
 
         self.asr = ASREngine()
+        # 실시간은 속도(tiny), 파일은 정확도(base 이상)로 모델을 따로 쓰도록 엔진을 분리한다.
+        self.live_asr = ASREngine(model_name="tiny")
         self.translator = TranslationEngine(preferred="auto")
+        # 실시간 번역은 더 가벼운 NLLB 600M(약 1.8배 빠름)로, 파일 번역은 정확도 우선으로 분리한다.
+        self.live_translator = TranslationEngine(preferred="live")
         self.file_workflow = FileSubtitleWorkflow(self.asr, self.translator)
-        self.live_service = LiveCaptionService(self.asr, self.translator)
+        self.live_service = LiveCaptionService(self.live_asr, self.live_translator)
         self.record_service = ScreenRecorderService()
 
         self.file_cancel_event = threading.Event()
@@ -3029,6 +3072,7 @@ class PapaStopApp(ctk.CTk):
         self.live_preview_var = tk.StringVar(value="실시간 한국어 자막이 여기에 표시됩니다.")
         self.show_overlay_var = tk.BooleanVar(value=True)
         self.live_save_srt_var = tk.BooleanVar(value=True)
+        self.live_whisper_model_var = tk.StringVar(value=WHISPER_MODEL_LABELS[self.live_asr.model_name])
 
         source_card, source_body = self._make_card(self.live_tab, "실시간 소리 입력")
         source_card.pack(fill="x", pady=(2, 10))
@@ -3070,6 +3114,23 @@ class PapaStopApp(ctk.CTk):
         ctk.CTkEntry(live_row_url, textvariable=self.live_url_var, **self._entry_kw).pack(
             side="left", fill="x", expand=True, padx=10
         )
+
+        live_row_model = ctk.CTkFrame(source_body, fg_color="transparent")
+        live_row_model.pack(fill="x", pady=4)
+        ctk.CTkLabel(
+            live_row_model, text="음성 인식 모델", font=self.font_base, text_color=UI_TEXT_MUTED, width=self._label_w, anchor="w"
+        ).pack(side="left")
+        live_model_holder, self.live_whisper_model_combo = self._make_option_menu(
+            live_row_model,
+            variable=self.live_whisper_model_var,
+            values=[WHISPER_MODEL_LABELS[key] for key in WHISPER_MODEL_ORDER],
+            command=self._on_live_whisper_model_selected,
+            width=MODEL_COMBO_W,
+        )
+        live_model_holder.pack(side="left", padx=10)
+        ctk.CTkLabel(
+            live_row_model, text="실시간은 빠른 tiny/base 권장", font=self.font_base, text_color=UI_TEXT_MUTED
+        ).pack(side="left", padx=(6, 0))
 
         live_row1 = ctk.CTkFrame(self.live_tab, fg_color="transparent")
         live_row1.pack(fill="x", pady=6)
@@ -3588,8 +3649,12 @@ class PapaStopApp(ctk.CTk):
         tools.append("argostranslate: " + ("정상" if has_module("argostranslate") else "없음"))
         tools.append("soundcard: " + ("정상" if has_module("soundcard") else "없음"))
         tools.append("ffmpeg: " + ("정상" if find_ffmpeg() else "없음"))
-        tools.append("음성 인식 모델: " + self.asr.model_label())
-        tools.append("번역 방식: " + self.translator.profile_label())
+        tools.append(
+            "음성 인식 모델: 파일 " + self.asr.model_label() + " / 실시간 " + self.live_asr.model_label()
+        )
+        tools.append(
+            "번역 방식: 파일 " + self.translator.profile_label() + " / 실시간 " + self.live_translator.profile_label()
+        )
         tools.append("자원 사용: " + build_resource_settings(self._resource_mode_from_selection()).summary)
         self._append_log(" | ".join(tools))
 
@@ -3605,7 +3670,9 @@ class PapaStopApp(ctk.CTk):
     def _apply_resource_mode_from_selection(self) -> None:
         mode = self._resource_mode_from_selection()
         self.asr.set_resource_mode(mode)
+        self.live_asr.set_resource_mode(mode)
         self.translator.set_resource_mode(mode)
+        self.live_translator.set_resource_mode(mode)
         self._refresh_resource_plan_label()
 
     def _on_resource_mode_selected(self, _event: object | None = None) -> None:
@@ -3641,6 +3708,18 @@ class PapaStopApp(ctk.CTk):
         self.asr.set_model(model_name)
         self._append_log(f"음성 인식 모델을 바꿨습니다: {self.asr.model_label(model_name)}")
 
+    def _live_whisper_model_from_selection(self) -> str:
+        return self._whisper_model_id_from_label(self.live_whisper_model_var.get())
+
+    def _on_live_whisper_model_selected(self, _event: object | None = None) -> None:
+        if self._is_file_running or self._is_live_running or self._is_asr_preparing:
+            self.live_whisper_model_var.set(self.live_asr.model_label())
+            messagebox.showwarning(APP_NAME, "현재 작업이 끝난 뒤 모델을 바꿔 주세요.")
+            return
+        model_name = self._live_whisper_model_from_selection()
+        self.live_asr.set_model(model_name)
+        self._append_log(f"실시간 음성 인식 모델을 바꿨습니다: {self.live_asr.model_label(model_name)}")
+
     def _source_lang_id_from_label(self, label: str) -> str:
         for key, value in SOURCE_LANG_LABELS.items():
             if value == label:
@@ -3654,6 +3733,7 @@ class PapaStopApp(ctk.CTk):
             return
         code = self._source_lang_id_from_label(self.source_lang_var.get())
         self.asr.set_source_language(code)
+        self.live_asr.set_source_language(code)
         self._append_log(f"원본 언어: {SOURCE_LANG_LABELS.get(code, code)}")
 
     def _prepare_asr_model(self) -> None:
@@ -4106,7 +4186,7 @@ class PapaStopApp(ctk.CTk):
         if self._is_live_running or self._is_file_running or self._is_record_running:
             return
 
-        self.asr.set_model(self._whisper_model_from_selection())
+        self.live_asr.set_model(self._live_whisper_model_from_selection())
         self._apply_resource_mode_from_selection()
 
         live_source = self.live_source_var.get()
