@@ -30,7 +30,7 @@ Write-Host "Building PapaStop package (single EXE)..."
     --noconfirm `
     --clean `
     --windowed `
-    --onefile `
+    --onedir `
     --name PapaStop `
     --collect-all faster_whisper `
     --collect-all argostranslate `
@@ -43,6 +43,8 @@ Write-Host "Building PapaStop package (single EXE)..."
     --collect-all av `
     --collect-all sentencepiece `
     --collect-all transformers `
+    --collect-all torch `
+    --collect-all llama_cpp `
     --exclude-module tests `
     --exclude-module stanza.tests `
     --exclude-module torch.utils.tensorboard `
@@ -51,7 +53,7 @@ Write-Host "Building PapaStop package (single EXE)..."
     .\papastop.py
 
 Write-Host "Assembling external data folder (.papastop_data)..."
-$DataDir = Join-Path $AppDir "dist\.papastop_data"
+$DataDir = Join-Path $AppDir "dist\PapaStop\.papastop_data"
 $NvidiaSrc = Join-Path $AppDir ".venv\Lib\site-packages\nvidia"
 $WhisperSrc = Join-Path $AppDir ".papastop_data\huggingface"
 
@@ -67,5 +69,5 @@ if (Test-Path $WhisperSrc) {
 
 Write-Host ""
 Write-Host "Package created:"
-Write-Host "  EXE   : dist\PapaStop.exe"
-Write-Host "  Data  : dist\.papastop_data\  (keep this next to the EXE)"
+Write-Host "  EXE   : dist\PapaStop\PapaStop.exe"
+Write-Host "  Data  : dist\PapaStop\.papastop_data\  (keep this next to the EXE)"

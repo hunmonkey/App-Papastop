@@ -1,3 +1,5 @@
+# llama.cpp(GGUF) GPU 휠: PyPI 기본은 CPU 전용이라 아래 인덱스에서 CUDA 휠을 받는다.
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
 customtkinter
 faster-whisper
 ctranslate2
@@ -11,3 +13,7 @@ numpy
 torch
 nvidia-cublas-cu12
 nvidia-cudnn-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cuda-nvrtc-cu12
+llama-cpp-python
+huggingface_hub

@@ -27,7 +27,12 @@ import customtkinter as ctk
 
 
 APP_NAME = "PapaStop"
-APP_ROOT = Path(__file__).resolve().parent
+# 배포(PyInstaller EXE)에서 __file__은 임시 추출 폴더를 가리킨다.
+# EXE 옆에 동봉한 .papastop_data(모델·CUDA 라이브러리)를 찾으려면 실행 파일 기준 경로를 써야 한다.
+if getattr(sys, "frozen", False):
+    APP_ROOT = Path(sys.executable).resolve().parent
+else:
+    APP_ROOT = Path(__file__).resolve().parent
 PAPASTOP_DATA = APP_ROOT / ".papastop_data"
 HF_HOME = PAPASTOP_DATA / "huggingface"
 
@@ -36,6 +41,18 @@ DEFAULT_SAMPLE_RATE = 16_000
 DEFAULT_CHUNK_SECONDS = 5.0
 DEFAULT_RECORD_SAMPLE_RATE = 48_000
 DEFAULT_RECORD_FPS = 30
+
+# 화면 녹화 영상 형식: 무손실(FFV1)과 고화질 압축(H.264) 중 선택.
+RECORD_CODEC_ORDER = ("ffv1", "h264")
+RECORD_CODEC_LABELS = {
+    "ffv1": "무손실 (FFV1·매우 큼)",
+    "h264": "고화질 압축 (H.264)",
+}
+DEFAULT_RECORD_CODEC = "ffv1"
+
+# 캡처 대상 드롭다운 고정 라벨(나머지 "모니터 N ..."은 실행 시 동적 생성).
+CAPTURE_FULL_LABEL = "전체 화면"
+CAPTURE_REGION_LABEL = "영역 지정 (드래그)"
 
 # 실시간 자막: 시계 기준 고정 분할 대신 silero VAD로 발화(말소리) 단위로 자른다.
 LIVE_FRAME_SECONDS = 0.5            # 캡처 프레임 크기(이 단위로 모아 VAD 검사)
@@ -110,7 +127,73 @@ NLLB_CT2_MODEL_DIRS = {
     NLLB_ACCURATE_MODEL: PAPASTOP_DATA / "nllb-200-3.3B-ct2",
 }
 
-TRANSLATION_PROFILE_ORDER = ("auto", "fast", "balanced", "accurate")
+# llama.cpp(GGUF) 기반 LLM 번역 모델 — 파일 자막 품질 우선용.
+# 16GB VRAM에 Q4_K_M 양자화로 전 레이어 GPU 적재 기준(모두 단일 파일 GGUF).
+LLM_GGUF_DIR = PAPASTOP_DATA / "gguf"
+LLM_MODEL_ORDER = ("exaone-7.8b", "qwen2.5-7b", "gemma2-9b", "qwen2.5-14b")
+LLM_MODELS = {
+    "exaone-7.8b": {
+        "repo": "LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct-GGUF",
+        "file": "EXAONE-3.5-7.8B-Instruct-Q4_K_M.gguf",
+        "label": "EXAONE 3.5 7.8B (한국어 특화)",
+        "vram_gb": 5,
+    },
+    "qwen2.5-7b": {
+        "repo": "bartowski/Qwen2.5-7B-Instruct-GGUF",
+        "file": "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+        "label": "Qwen2.5 7B (다국어·가벼움)",
+        "vram_gb": 5,
+    },
+    "gemma2-9b": {
+        "repo": "bartowski/gemma-2-9b-it-GGUF",
+        "file": "gemma-2-9b-it-Q4_K_M.gguf",
+        "label": "Gemma 2 9B (범용 고품질)",
+        "vram_gb": 6,
+    },
+    "qwen2.5-14b": {
+        "repo": "bartowski/Qwen2.5-14B-Instruct-GGUF",
+        "file": "Qwen2.5-14B-Instruct-Q4_K_M.gguf",
+        "label": "Qwen2.5 14B (최고 품질)",
+        "vram_gb": 9,
+    },
+}
+
+# OPUS-MT(Marian) — 실시간용 경량 1차 번역(원본→영어).
+# 한국어 직결 모델이 마땅치 않아 영어를 거친 뒤 2차 번역기로 한국어화한다.
+OPUS_MT_MODELS = {
+    "ja": "Helsinki-NLP/opus-mt-ja-en",
+    "zh": "Helsinki-NLP/opus-mt-zh-en",
+}
+
+# LLM 번역 프롬프트에 원본 언어를 명시해 정확도를 높인다.
+LLM_LANG_NAMES = {
+    "ja": "Japanese",
+    "zh": "Chinese",
+    "en": "English",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "ru": "Russian",
+}
+
+# OPUS 1차 번역 후 영어→한국어 2차 번역에 쓸 엔진 선택지.
+LIVE_SECONDARY_ORDER = ("nllb600", "nllb1.3", "argos")
+LIVE_SECONDARY_LABELS = {
+    "nllb600": "NLLB 600M (빠름)",
+    "nllb1.3": "NLLB 1.3B (정확)",
+    "argos": "Argos (초경량)",
+}
+LIVE_SECONDARY_STEPS = {
+    "nllb600": ("nllb", NLLB_LIVE_MODEL),
+    "nllb1.3": ("nllb", NLLB_FAST_MODEL),
+    "argos": ("argos", None),
+}
+
+TRANSLATION_PROFILE_ORDER = ("auto", "fast", "balanced", "accurate") + tuple(
+    f"llm-{key}" for key in LLM_MODEL_ORDER
+)
 TRANSLATION_PROFILE_LABELS = {
     "auto": "자동 (NLLB 우선, 실패 시 Argos)",
     "fast": "빠름 (Argos 번역)",
@@ -126,12 +209,23 @@ TRANSLATION_PROFILE_ORDER_STEPS = {
     # 실시간 전용: 600M 우선, 없으면 1.3B로, 그래도 안 되면 Argos로 내려간다.
     "live": (("nllb", NLLB_LIVE_MODEL), ("nllb", NLLB_FAST_MODEL), ("argos", None)),
 }
+# 파일 자막 LLM 프로필을 자동 생성한다. LLM 실패 시 NLLB 1.3B로 안전하게 내려간다.
+for _llm_key in LLM_MODEL_ORDER:
+    TRANSLATION_PROFILE_LABELS[f"llm-{_llm_key}"] = "고품질 LLM · " + LLM_MODELS[_llm_key]["label"]
+    TRANSLATION_PROFILE_ORDER_STEPS[f"llm-{_llm_key}"] = (
+        ("llama", _llm_key),
+        ("nllb", NLLB_FAST_MODEL),
+    )
+# OPUS 2단계 프로필 진입점(set_profile 검증 통과용). 실제 2단계 처리는 엔진에서 분기한다.
+TRANSLATION_PROFILE_ORDER_STEPS["opus"] = (("opus", None),)
+TRANSLATION_PROFILE_LABELS["opus"] = "OPUS-MT (영어 1차→2차)"
 
-# 실시간 탭 번역 모델 선택: 품질 우선(1.3B)이 기본, 속도 우선(600M)을 선택할 수 있다.
-LIVE_TRANSLATION_ORDER = ("balanced", "live")
+# 실시간 탭 번역 모델 선택: 품질(1.3B)·속도(600M)·OPUS 2단계(영어 경유) 중 선택.
+LIVE_TRANSLATION_ORDER = ("balanced", "live", "opus")
 LIVE_TRANSLATION_LABELS = {
     "balanced": "정확 (NLLB 1.3B)",
     "live": "빠름 (NLLB 600M)",
+    "opus": "OPUS-MT (영어 1차→2차)",
 }
 
 DEFAULT_RESOURCE_MODE = "max"
@@ -293,6 +387,18 @@ def configure_cuda_dll_paths() -> None:
         return
 
     candidates: list[Path] = []
+
+    # 배포(EXE)에서는 .papastop_data/nvidia에 CUDA 라이브러리를 동봉한다(개발 환경엔 없으므로 무시됨).
+    bundled_root = PAPASTOP_DATA / "nvidia"
+    candidates.extend(
+        [
+            bundled_root / "cublas" / "bin",
+            bundled_root / "cudnn" / "bin",
+            bundled_root / "cuda_runtime" / "bin",
+            bundled_root / "cuda_nvrtc" / "bin",
+        ]
+    )
+
     try:
         import nvidia
 
@@ -931,6 +1037,34 @@ def ensure_cache_dirs() -> None:
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
+def hf_file_cached(repo_id: str, filename: str) -> bool:
+    """HF 허브 캐시에 해당 파일이 실제로 내려받아져 있으면 True(네트워크 접근 없음)."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        ensure_cache_dirs()
+        result = try_to_load_from_cache(repo_id, filename, cache_dir=str(HF_HOME / "hub"))
+        return isinstance(result, str) and os.path.exists(result)
+    except Exception:
+        return False
+
+
+def format_hms(seconds: float) -> str:
+    total = int(max(0, seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def format_file_size(num_bytes: int) -> str:
+    size = float(max(0, num_bytes))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
 def format_srt_time(total_seconds: float) -> str:
     milliseconds = max(0, int(round(total_seconds * 1000)))
     hours, remainder = divmod(milliseconds, 3_600_000)
@@ -954,8 +1088,68 @@ def default_live_srt_path(output_dir: Path | None = None) -> Path:
     return folder / f"live-{time.strftime('%Y%m%d-%H%M%S')}.ko.srt"
 
 
-def build_lossless_screen_capture_command(ffmpeg: str, output_path: Path, fps: int) -> list[str]:
-    return [
+def enumerate_monitors() -> list[dict]:
+    """가상 데스크톱 내 각 모니터의 위치·크기를 반환한다(Windows 전용, 실패 시 빈 리스트).
+
+    좌표는 gdigrab의 -offset_x/-offset_y와 같은 가상 데스크톱 절대 좌표(보조 모니터는 음수 가능).
+    """
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        results: list[dict] = []
+
+        def _callback(hmon, hdc, lprc, lparam):
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                rect = info.rcMonitor
+                results.append(
+                    {
+                        "x": int(rect.left),
+                        "y": int(rect.top),
+                        "w": int(rect.right - rect.left),
+                        "h": int(rect.bottom - rect.top),
+                        "primary": bool(info.dwFlags & 1),  # MONITORINFOF_PRIMARY
+                    }
+                )
+            return 1
+
+        proc_type = ctypes.WINFUNCTYPE(
+            ctypes.c_int, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.LPARAM
+        )
+        user32.EnumDisplayMonitors(0, 0, proc_type(_callback), 0)
+        # 주 모니터를 맨 앞에, 나머지는 좌->우·상->하 순서로 정렬한다.
+        results.sort(key=lambda m: (not m["primary"], m["x"], m["y"]))
+        return results
+    except Exception:
+        return []
+
+
+def build_screen_capture_command(
+    ffmpeg: str,
+    output_path: Path,
+    fps: int,
+    region: tuple[int, int, int, int] | None = None,
+    codec: str = DEFAULT_RECORD_CODEC,
+) -> list[str]:
+    command = [
         ffmpeg,
         "-y",
         "-hide_banner",
@@ -967,19 +1161,32 @@ def build_lossless_screen_capture_command(ffmpeg: str, output_path: Path, fps: i
         str(max(1, fps)),
         "-draw_mouse",
         "1",
-        "-i",
-        "desktop",
-        "-an",
-        "-c:v",
-        "ffv1",
-        "-level",
-        "3",
-        "-g",
-        "1",
-        "-pix_fmt",
-        "bgra",
-        str(output_path),
     ]
+    if region is not None:
+        x, y, w, h = region
+        # H.264(yuv420p)는 가로·세로가 짝수여야 하므로 영역도 짝수로 맞춘다.
+        w -= w % 2
+        h -= h % 2
+        command += ["-offset_x", str(int(x)), "-offset_y", str(int(y)), "-video_size", f"{int(w)}x{int(h)}"]
+    command += ["-i", "desktop", "-an"]
+    if codec == "h264":
+        # crop으로 홀수 해상도를 짝수로 보정(전체 화면 캡처 시 대비).
+        command += [
+            "-vf",
+            "crop=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+    else:
+        command += ["-c:v", "ffv1", "-level", "3", "-g", "1", "-pix_fmt", "bgra"]
+    command += [str(output_path)]
+    return command
 
 
 def float_audio_to_pcm16_bytes(audio: object) -> tuple[bytes, int, int]:
@@ -1177,6 +1384,17 @@ class ASREngine:
         target = model_name or self.model_name
         return WHISPER_MODEL_LABELS.get(target, target)
 
+    def is_model_ready(self, model_name: str | None = None) -> bool:
+        """선택한 음성 인식 모델이 이미 내려받아져 바로 쓸 수 있으면 True."""
+        size = model_name or self.model_name
+        try:
+            from faster_whisper.utils import _MODELS
+
+            repo = _MODELS.get(size, f"Systran/faster-whisper-{size}")
+        except Exception:
+            repo = f"Systran/faster-whisper-{size}"
+        return hf_file_cached(repo, "model.bin")
+
     def resource_summary(self) -> str:
         return self._resource_summary
 
@@ -1321,9 +1539,21 @@ class TranslationEngine:
         self._nllb_pipelines: dict[str, object] = {}
         self._nllb_ct2_translators: dict[str, object] = {}
         self._nllb_tokenizer = None
+        self._llama_models: dict[str, object] = {}
+        self._opus_pipelines: dict[str, object] = {}
+        # OPUS 2단계(영어 경유) 설정: 2차 번역기와 사용 여부.
+        self.opus_secondary = "nllb600"
+        self.opus_use_secondary = True
         self._pipeline_lock = threading.Lock()
         self._prepare_lock = threading.Lock()
         self._resource_summary = build_resource_settings(self.resource_mode).summary
+
+    def set_opus_secondary(self, key: str | None) -> None:
+        if key in LIVE_SECONDARY_STEPS:
+            self.opus_secondary = key
+
+    def set_opus_use_secondary(self, enabled: bool) -> None:
+        self.opus_use_secondary = bool(enabled)
 
     def set_profile(self, profile: str) -> None:
         if profile not in TRANSLATION_PROFILE_ORDER_STEPS:
@@ -1361,6 +1591,13 @@ class TranslationEngine:
                 if engine == "nllb":
                     assert model_name is not None
                     self._load_nllb(model_name)
+                elif engine == "llama":
+                    assert model_name is not None
+                    self._load_llama(model_name)
+                    break  # LLM 주 모델만 미리 받고, 보조 NLLB는 실패 시 그때 내려받는다.
+                elif engine == "opus":
+                    self._prepare_opus()
+                    break
                 else:
                     raise RuntimeError(f"알 수 없는 번역 방식입니다: {engine}")
 
@@ -1525,6 +1762,163 @@ class TranslationEngine:
 
         return result
 
+    # ── llama.cpp(GGUF) LLM 번역 ─────────────────────────────────
+    def _llama_model_path(self, key: str, download: bool = False) -> str:
+        spec = LLM_MODELS.get(key)
+        if spec is None:
+            raise RuntimeError(f"알 수 없는 LLM 모델입니다: {key}")
+        ensure_cache_dirs()
+        from huggingface_hub import hf_hub_download
+
+        kwargs = {
+            "repo_id": spec["repo"],
+            "filename": spec["file"],
+            "cache_dir": str(HF_HOME / "hub"),
+        }
+        if not download:
+            kwargs["local_files_only"] = True
+        return hf_hub_download(**kwargs)
+
+    def _load_llama(self, key: str):
+        cached = self._llama_models.get(key)
+        if cached is not None:
+            return cached
+
+        with self._pipeline_lock:
+            cached = self._llama_models.get(key)
+            if cached is not None:
+                return cached
+
+            if not has_module("llama_cpp"):
+                raise RuntimeError("llama-cpp-python이 설치되어 있지 않습니다.")
+
+            # llama.cpp의 ggml-cuda.dll이 CUDA 런타임 DLL을 찾으려면 import 전에 PATH 등록이 필요하다.
+            configure_cuda_dll_paths()
+            try:
+                model_path = self._llama_model_path(key, download=False)
+            except Exception:
+                model_path = self._llama_model_path(key, download=True)
+
+            # 한 번에 하나의 LLM만 VRAM에 유지한다(16GB에 여러 개 동시 적재 방지).
+            for other in list(self._llama_models):
+                if other != key:
+                    self._llama_models.pop(other, None)
+
+            from llama_cpp import Llama
+
+            settings = build_resource_settings(self.resource_mode)
+            n_gpu = -1 if get_ctranslate2_cuda_available() else 0
+            llm = Llama(
+                model_path=model_path,
+                n_gpu_layers=n_gpu,
+                n_ctx=4096,
+                n_threads=settings.cpu_threads,
+                verbose=False,
+            )
+            self._llama_models[key] = llm
+            self._resource_summary = settings.summary
+            return llm
+
+    def _translate_llama(self, texts: list[str], source_code: str, key: str) -> list[str]:
+        if not texts:
+            return []
+        llm = self._load_llama(key)
+        src = (source_code or "").split("-")[0].lower()
+        lang = LLM_LANG_NAMES.get(src, "the source")
+
+        results: list[str] = []
+        for text in texts:
+            stripped = text.strip()
+            if not stripped:
+                results.append("")
+                continue
+            prompt = (
+                "You are a professional subtitle translator. "
+                f"Translate the following {lang} text into natural, fluent Korean. "
+                "Output ONLY the Korean translation, with no explanations, notes, or romanization.\n\n"
+                f"{stripped}"
+            )
+            out = llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=512,
+                temperature=0.2,
+                top_p=0.9,
+            )
+            results.append(out["choices"][0]["message"]["content"].strip())
+        return results
+
+    # ── OPUS-MT 2단계(원본→영어→한국어) ─────────────────────────
+    def _load_opus(self, source: str):
+        # 이 환경의 transformers에는 "translation" 파이프라인이 없어 MarianMT 모델을 직접 로드한다.
+        model_name = OPUS_MT_MODELS.get(source)
+        if model_name is None:
+            return None
+        cached = self._opus_pipelines.get(source)
+        if cached is not None:
+            return cached
+        if not has_module("transformers"):
+            raise RuntimeError("transformers가 설치되어 있지 않습니다.")
+
+        with self._pipeline_lock:
+            cached = self._opus_pipelines.get(source)
+            if cached is not None:
+                return cached
+            from transformers import MarianMTModel, MarianTokenizer
+
+            ensure_cache_dirs()
+            cache = str(HF_HOME / "hub")
+            tokenizer = MarianTokenizer.from_pretrained(model_name, cache_dir=cache)
+            model = MarianMTModel.from_pretrained(model_name, cache_dir=cache)
+            model.eval()
+            self._opus_pipelines[source] = (tokenizer, model)
+            return self._opus_pipelines[source]
+
+    def _prepare_opus(self) -> None:
+        for src in OPUS_MT_MODELS:
+            self._load_opus(src)
+        if self.opus_use_secondary:
+            engine, model = LIVE_SECONDARY_STEPS[self.opus_secondary]
+            if engine == "nllb":
+                assert model is not None
+                self._load_nllb(model)
+
+    def _opus_to_english(self, texts: list[str], source: str) -> list[str]:
+        import torch
+
+        tokenizer, model = self._load_opus(source)
+        settings = build_resource_settings(self.resource_mode)
+        batch_size = max(1, settings.translation_batch_size)
+        english: list[str] = []
+        with torch.no_grad():
+            for start in range(0, len(texts), batch_size):
+                chunk = texts[start : start + batch_size]
+                encoded = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=400)
+                generated = model.generate(**encoded, max_length=400, num_beams=4)
+                english.extend(t.strip() for t in tokenizer.batch_decode(generated, skip_special_tokens=True))
+        return english
+
+    def _translate_opus(self, texts: list[str], source_code: str) -> list[str]:
+        if not texts:
+            return []
+        src = (source_code or "en").split("-")[0].lower()
+
+        # 1차: 원본 → 영어 (영어 입력이면 그대로, OPUS 미지원 언어는 NLLB로 바로 한국어 번역)
+        if src == "en":
+            english = [t.strip() for t in texts]
+        elif src in OPUS_MT_MODELS:
+            english = self._opus_to_english(texts, src)
+        else:
+            return self._translate_nllb(texts, source_code, NLLB_LIVE_MODEL)
+
+        # 2차: 영어 → 한국어 (체크 해제 시 영어 자막을 그대로 표시)
+        if not self.opus_use_secondary:
+            return english
+        engine, model = LIVE_SECONDARY_STEPS[self.opus_secondary]
+        if engine == "argos":
+            return self._translate_argos(english, "en")
+        assert model is not None
+        return self._translate_nllb(english, "en", model)
+
     def translate_texts(self, texts: list[str], source_code: str) -> list[str]:
         if not texts:
             return []
@@ -1536,6 +1930,11 @@ class TranslationEngine:
                     return self._translate_nllb(texts, source_code, model_name)
                 if engine == "argos":
                     return self._translate_argos(texts, source_code)
+                if engine == "llama":
+                    assert model_name is not None
+                    return self._translate_llama(texts, source_code, model_name)
+                if engine == "opus":
+                    return self._translate_opus(texts, source_code)
                 raise RuntimeError(f"알 수 없는 번역 방식입니다: {engine}")
             except Exception:
                 if self.preferred == "fast":
@@ -1548,6 +1947,53 @@ class TranslationEngine:
     def profile_label(self, profile: str | None = None) -> str:
         target = profile or self.preferred
         return TRANSLATION_PROFILE_LABELS.get(target, target)
+
+    # ── 모델 다운로드 상태 확인 ──────────────────────────────────
+    def is_profile_ready(self, profile: str | None = None) -> bool:
+        """해당 번역 프로필의 주 엔진/모델이 이미 내려받아져 바로 쓸 수 있으면 True."""
+        steps = self._profile_steps(profile)
+        if not steps:
+            return False
+        engine, model = steps[0]
+        return self._engine_ready(engine, model)
+
+    def _engine_ready(self, engine: str, model: str | None) -> bool:
+        if engine == "argos":
+            return self._argos_ready()
+        if engine == "nllb":
+            return model is not None and self._nllb_ready(model)
+        if engine == "llama":
+            return model is not None and self._llama_ready(model)
+        if engine == "opus":
+            return self._opus_ready()
+        return False
+
+    def _argos_ready(self) -> bool:
+        if not has_module("argostranslate"):
+            return False
+        try:
+            import argostranslate.translate as argostranslate_translate
+
+            codes = {lang.code for lang in argostranslate_translate.get_installed_languages()}
+            return "ko" in codes and len(codes) >= 2
+        except Exception:
+            return False
+
+    def _nllb_ready(self, model_name: str) -> bool:
+        # 사전 변환된 CT2 모델이 있으면 바로 사용 가능. 없으면 transformers 캐시 여부로 판단.
+        if self._nllb_ct2_path(model_name) is not None:
+            return True
+        return hf_file_cached(model_name, "config.json")
+
+    def _llama_ready(self, key: str) -> bool:
+        spec = LLM_MODELS.get(key)
+        if spec is None:
+            return False
+        return hf_file_cached(spec["repo"], spec["file"])
+
+    def _opus_ready(self) -> bool:
+        # ja/zh OPUS 1차 모델이 모두 받아져 있어야 사용 가능.
+        return all(hf_file_cached(repo, "pytorch_model.bin") for repo in OPUS_MT_MODELS.values())
 
 
 class FileSubtitleWorkflow:
@@ -2108,6 +2554,14 @@ class LiveCaptionService:
                         source_language,
                     )
                     translate_elapsed = time.monotonic() - translate_started_at
+                    # [임시 진단] 번역이 느린 경우 입력 텍스트의 길이·내용을 남긴다(원인 파악용).
+                    if translate_elapsed > 0.8:
+                        total_chars = sum(len(s.text) for s in segments)
+                        emit(
+                            "log",
+                            f"[진단] 번역 {translate_elapsed:.1f}초 | 언어={source_language} | "
+                            f"조각 {len(segments)}개·{total_chars}자 | 첫 텍스트: {segments[0].text[:60]!r}",
+                        )
                     if len(translated) != len(segments):
                         translated = translated + ["" for _ in range(len(segments) - len(translated))]
                     pairs = [(s, (t.strip() or s.text.strip())) for s, t in zip(segments, translated) if (t or s.text).strip()]
@@ -2204,6 +2658,8 @@ class ScreenRecorderService:
         self._output_path: Path | None = None
         self._capture_audio = True
         self._audio_has_data = False
+        self._codec = DEFAULT_RECORD_CODEC
+        self._record_started_at: float | None = None
 
     def is_running(self) -> bool:
         process_running = self._video_process is not None and self._video_process.poll() is None
@@ -2218,6 +2674,8 @@ class ScreenRecorderService:
         capture_audio: bool,
         emit: Callable[[str, object], None],
         stop_event: threading.Event,
+        region: tuple[int, int, int, int] | None = None,
+        codec: str = DEFAULT_RECORD_CODEC,
     ) -> None:
         if self.is_running():
             raise RuntimeError("화면 녹화가 이미 실행 중입니다.")
@@ -2241,8 +2699,10 @@ class ScreenRecorderService:
         self._output_path = output_path
         self._capture_audio = capture_audio
         self._audio_has_data = False
+        self._codec = codec if codec in RECORD_CODEC_LABELS else DEFAULT_RECORD_CODEC
+        self._record_started_at = None
 
-        command = build_lossless_screen_capture_command(ffmpeg, self._video_path, fps)
+        command = build_screen_capture_command(ffmpeg, self._video_path, fps, region, self._codec)
         self._video_process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -2336,13 +2796,28 @@ class ScreenRecorderService:
             if self._output_path is None or self._video_path is None:
                 raise RuntimeError("화면 녹화 준비가 끝나지 않았습니다.")
 
-            emit("record_status", "녹화 중")
-            emit("log", f"무손실 화면 녹화를 시작했습니다: {self._output_path}")
+            codec_text = "MKV · " + ("H.264" if self._codec == "h264" else "FFV1 무손실")
+            self._record_started_at = time.monotonic()
+            emit("record_status", f"녹화 중 · 00:00:00 · 0 B · {codec_text}")
+            emit("log", f"화면 녹화를 시작했습니다({codec_text}): {self._output_path}")
 
             process = self._video_process
+            last_report = 0.0
             while self._stop_event is not None and not self._stop_event.is_set():
                 if process is None or process.poll() is not None:
                     break
+                now = time.monotonic()
+                if now - last_report >= 1.0:
+                    last_report = now
+                    elapsed = now - (self._record_started_at or now)
+                    try:
+                        size = self._video_path.stat().st_size if self._video_path.exists() else 0
+                    except OSError:
+                        size = 0
+                    emit(
+                        "record_status",
+                        f"녹화 중 · {format_hms(elapsed)} · {format_file_size(size)} · {codec_text}",
+                    )
                 time.sleep(0.3)
 
             emit("record_status", "녹화를 정리하는 중 ...")
@@ -2759,8 +3234,9 @@ class PapaStopApp(ctk.CTk):
         right = ctk.CTkFrame(root, fg_color="transparent")
         right.grid(row=0, column=1, sticky="nsew", padx=(7, 14), pady=14)
         right.grid_columnconfigure(0, weight=1)
+        # 진행·작업 기록 박스를 더 키운다(탭 콘텐츠 : 진행·기록 = 3 : 2).
         right.grid_rowconfigure(0, weight=3)
-        right.grid_rowconfigure(1, weight=1)
+        right.grid_rowconfigure(1, weight=2)
 
         content = ctk.CTkFrame(right, fg_color="transparent")
         content.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
@@ -2887,6 +3363,11 @@ class PapaStopApp(ctk.CTk):
         self.record_status_var = tk.StringVar(value="대기 중")
         self.record_audio_var = tk.BooleanVar(value=True)
         self.record_fps_var = tk.StringVar(value=str(DEFAULT_RECORD_FPS))
+        self._monitors = enumerate_monitors()
+        self.record_target_var = tk.StringVar(value=CAPTURE_FULL_LABEL)
+        self.record_codec_var = tk.StringVar(value=RECORD_CODEC_LABELS[DEFAULT_RECORD_CODEC])
+        self.record_region: tuple[int, int, int, int] | None = None
+        self.record_region_info_var = tk.StringVar(value="(영역 미지정)")
 
         def row_label(parent, text, **kw):
             return ctk.CTkLabel(parent, text=text, font=self.font_base, text_color=UI_TEXT, **kw)
@@ -2997,6 +3478,25 @@ class PapaStopApp(ctk.CTk):
             **self._ghost_btn,
         )
         self.prepare_translation_btn.grid(row=1, column=2, sticky="w", pady=6)
+        ctk.CTkLabel(
+            model_form,
+            text="고품질 LLM은 GPU·VRAM 사용 / 첫 선택 시 수 GB 다운로드",
+            font=self.font_base,
+            text_color=UI_TEXT_MUTED,
+        ).grid(row=1, column=3, sticky="w", padx=(12, 0), pady=6)
+
+        file_status_row = ctk.CTkFrame(self.file_tab, fg_color="transparent")
+        file_status_row.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(
+            file_status_row, text="모델 상태 —  음성 인식:", font=self.font_base, text_color=UI_TEXT_MUTED
+        ).pack(side="left")
+        self.file_asr_status_lbl = ctk.CTkLabel(file_status_row, text="확인 중", font=self.font_base, text_color=UI_TEXT_MUTED)
+        self.file_asr_status_lbl.pack(side="left", padx=(4, 0))
+        ctk.CTkLabel(
+            file_status_row, text="     번역:", font=self.font_base, text_color=UI_TEXT_MUTED
+        ).pack(side="left")
+        self.file_trans_status_lbl = ctk.CTkLabel(file_status_row, text="확인 중", font=self.font_base, text_color=UI_TEXT_MUTED)
+        self.file_trans_status_lbl.pack(side="left", padx=(4, 0))
 
         queue_card, queue_body = self._make_card(self.file_tab, "작업할 파일 목록")
         queue_card.pack(fill="both", expand=True, pady=(4, 6))
@@ -3078,9 +3578,11 @@ class PapaStopApp(ctk.CTk):
         self.live_status_var = tk.StringVar(value="대기 중")
         self.live_preview_var = tk.StringVar(value="실시간 한국어 자막이 여기에 표시됩니다.")
         self.show_overlay_var = tk.BooleanVar(value=True)
-        self.live_save_srt_var = tk.BooleanVar(value=True)
+        self.live_save_srt_var = tk.BooleanVar(value=False)
         self.live_whisper_model_var = tk.StringVar(value=WHISPER_MODEL_LABELS[self.live_asr.model_name])
         self.live_translation_var = tk.StringVar(value=LIVE_TRANSLATION_LABELS[self.live_translator.preferred])
+        self.live_use_secondary_var = tk.BooleanVar(value=self.live_translator.opus_use_secondary)
+        self.live_secondary_var = tk.StringVar(value=LIVE_SECONDARY_LABELS[self.live_translator.opus_secondary])
 
         source_card, source_body = self._make_card(self.live_tab, "실시간 소리 입력")
         source_card.pack(fill="x", pady=(2, 10))
@@ -3154,8 +3656,50 @@ class PapaStopApp(ctk.CTk):
         )
         live_trans_holder.pack(side="left", padx=10)
         ctk.CTkLabel(
-            live_row_trans, text="정확=1.3B, 빠름=600M", font=self.font_base, text_color=UI_TEXT_MUTED
+            live_row_trans, text="정확=1.3B, 빠름=600M, OPUS=영어 경유", font=self.font_base, text_color=UI_TEXT_MUTED
         ).pack(side="left", padx=(6, 0))
+
+        # OPUS-MT(영어 1차) 선택 시 영어→한국어 2차 번역 설정
+        live_row_opus = ctk.CTkFrame(source_body, fg_color="transparent")
+        live_row_opus.pack(fill="x", pady=4)
+        ctk.CTkLabel(
+            live_row_opus, text="OPUS 2차 번역", font=self.font_base, text_color=UI_TEXT_MUTED, width=self._label_w, anchor="w"
+        ).pack(side="left")
+        self.live_secondary_check = ctk.CTkCheckBox(
+            live_row_opus,
+            text="영어→한국어 2차 번역",
+            variable=self.live_use_secondary_var,
+            onvalue=True,
+            offvalue=False,
+            command=self._on_live_secondary_toggled,
+            font=self.font_base,
+        )
+        self.live_secondary_check.pack(side="left", padx=(0, 12))
+        live_secondary_holder, self.live_secondary_combo = self._make_option_menu(
+            live_row_opus,
+            variable=self.live_secondary_var,
+            values=[LIVE_SECONDARY_LABELS[key] for key in LIVE_SECONDARY_ORDER],
+            command=self._on_live_secondary_selected,
+            width=MODEL_COMBO_W,
+        )
+        live_secondary_holder.pack(side="left", padx=2)
+        ctk.CTkLabel(
+            live_row_opus, text="OPUS 선택 시에만 적용(일·중→영→한)", font=self.font_base, text_color=UI_TEXT_MUTED
+        ).pack(side="left", padx=(6, 0))
+        self._update_live_secondary_state()
+
+        live_status_row = ctk.CTkFrame(source_body, fg_color="transparent")
+        live_status_row.pack(fill="x", pady=(2, 0))
+        ctk.CTkLabel(
+            live_status_row, text="모델 상태 —  음성 인식:", font=self.font_base, text_color=UI_TEXT_MUTED
+        ).pack(side="left")
+        self.live_asr_status_lbl = ctk.CTkLabel(live_status_row, text="확인 중", font=self.font_base, text_color=UI_TEXT_MUTED)
+        self.live_asr_status_lbl.pack(side="left", padx=(4, 0))
+        ctk.CTkLabel(
+            live_status_row, text="     번역:", font=self.font_base, text_color=UI_TEXT_MUTED
+        ).pack(side="left")
+        self.live_trans_status_lbl = ctk.CTkLabel(live_status_row, text="확인 중", font=self.font_base, text_color=UI_TEXT_MUTED)
+        self.live_trans_status_lbl.pack(side="left", padx=(4, 0))
 
         live_row1 = ctk.CTkFrame(self.live_tab, fg_color="transparent")
         live_row1.pack(fill="x", pady=6)
@@ -3238,6 +3782,46 @@ class PapaStopApp(ctk.CTk):
         )
         self.browse_record_btn.pack(side="left")
 
+        # 캡처 대상: 전체 화면 / 모니터별 / 영역 지정
+        record_row_target = ctk.CTkFrame(record_body, fg_color="transparent")
+        record_row_target.pack(fill="x", pady=4)
+        ctk.CTkLabel(
+            record_row_target, text="캡처 대상", font=self.font_base, text_color=UI_TEXT_MUTED, width=self._label_w, anchor="w"
+        ).pack(side="left")
+        target_holder, self.record_target_combo = self._make_option_menu(
+            record_row_target,
+            variable=self.record_target_var,
+            values=self._capture_target_labels(),
+            command=self._on_capture_target_selected,
+            width=MODEL_COMBO_W,
+        )
+        target_holder.pack(side="left", padx=10)
+        self.select_region_btn = ctk.CTkButton(
+            record_row_target, text="영역 선택", command=self._select_capture_region_dialog,
+            width=90, height=34, state="disabled", **self._ghost_btn,
+        )
+        self.select_region_btn.pack(side="left")
+        ctk.CTkLabel(
+            record_row_target, textvariable=self.record_region_info_var, font=self.font_base, text_color=UI_TEXT_MUTED
+        ).pack(side="left", padx=(8, 0))
+
+        # 녹화 형식: 무손실(FFV1) / 고화질 압축(H.264)
+        record_row_codec = ctk.CTkFrame(record_body, fg_color="transparent")
+        record_row_codec.pack(fill="x", pady=4)
+        ctk.CTkLabel(
+            record_row_codec, text="녹화 형식", font=self.font_base, text_color=UI_TEXT_MUTED, width=self._label_w, anchor="w"
+        ).pack(side="left")
+        codec_holder, self.record_codec_combo = self._make_option_menu(
+            record_row_codec,
+            variable=self.record_codec_var,
+            values=[RECORD_CODEC_LABELS[key] for key in RECORD_CODEC_ORDER],
+            width=MODEL_COMBO_W,
+        )
+        codec_holder.pack(side="left", padx=10)
+        ctk.CTkLabel(
+            record_row_codec, text="무손실=원본화질·대용량, H.264=용량 1/10~", font=self.font_base, text_color=UI_TEXT_MUTED
+        ).pack(side="left", padx=(6, 0))
+
         record_row1 = ctk.CTkFrame(record_body, fg_color="transparent")
         record_row1.pack(fill="x", pady=4)
         ctk.CTkLabel(
@@ -3280,6 +3864,9 @@ class PapaStopApp(ctk.CTk):
         self._record_controls = [
             self.record_output_entry,
             self.browse_record_btn,
+            self.record_target_combo,
+            self.select_region_btn,
+            self.record_codec_combo,
             self.record_fps_combo,
             self.record_audio_check,
             self.start_record_btn,
@@ -3311,7 +3898,7 @@ class PapaStopApp(ctk.CTk):
 
         self.log_text = ctk.CTkTextbox(
             common,
-            height=100,
+            height=170,
             wrap="word",
             fg_color="#ffffff",
             text_color=UI_TEXT,
@@ -3324,6 +3911,7 @@ class PapaStopApp(ctk.CTk):
         self.log_text.configure(state="disabled")
 
         self._append_log("앱을 시작했습니다.")
+        self._refresh_model_status()
         self._show_tab("file")
 
     def _show_tab(self, key: str) -> None:
@@ -3468,11 +4056,13 @@ class PapaStopApp(ctk.CTk):
             elif kind == "asr_prepare_done":
                 payload_data = payload
                 self._set_asr_preparing(False)
+                self._refresh_model_status()
                 if isinstance(payload_data, dict) and payload_data.get("message"):
                     self._append_log(payload_data["message"])
             elif kind == "translation_prepare_done":
                 payload_data = payload
                 self._set_translation_preparing(False)
+                self._refresh_model_status()
                 if isinstance(payload_data, dict) and payload_data.get("message"):
                     self._append_log(payload_data["message"])
 
@@ -3646,6 +4236,120 @@ class PapaStopApp(ctk.CTk):
             return
         self.record_output_var.set(str(Path(path).with_suffix(".mkv")))
 
+    def _capture_target_labels(self) -> list[str]:
+        labels = [CAPTURE_FULL_LABEL]
+        for index, monitor in enumerate(self._monitors, start=1):
+            tag = ", 주" if monitor["primary"] else ""
+            labels.append(f"모니터 {index} ({monitor['w']}×{monitor['h']}{tag})")
+        labels.append(CAPTURE_REGION_LABEL)
+        return labels
+
+    def _on_capture_target_selected(self, _event: object | None = None) -> None:
+        is_region = self.record_target_var.get() == CAPTURE_REGION_LABEL
+        try:
+            self.select_region_btn.configure(state="normal" if is_region else "disabled")
+        except Exception:
+            pass
+        # 영역 지정을 고르면 곧바로 드래그 선택창을 띄운다(재선택 시에도 항상 새로 지정).
+        if is_region:
+            self._select_capture_region_dialog()
+
+    def _resolve_capture_region(self) -> tuple[tuple[int, int, int, int] | None, bool]:
+        """선택한 캡처 대상으로부터 (region, ok)를 돌려준다. ok=False면 영역 미지정."""
+        label = self.record_target_var.get()
+        if label == CAPTURE_FULL_LABEL:
+            return None, True
+        if label == CAPTURE_REGION_LABEL:
+            return self.record_region, self.record_region is not None
+        for index, monitor in enumerate(self._monitors, start=1):
+            if label.startswith(f"모니터 {index} ("):
+                return (monitor["x"], monitor["y"], monitor["w"], monitor["h"]), True
+        return None, True
+
+    def _select_capture_region_dialog(self) -> None:
+        # 가상 데스크톱 전체를 덮는 반투명 창에서 마우스 드래그로 녹화 영역을 고른다.
+        monitors = self._monitors or enumerate_monitors()
+        if monitors:
+            vx = min(m["x"] for m in monitors)
+            vy = min(m["y"] for m in monitors)
+            vr = max(m["x"] + m["w"] for m in monitors)
+            vb = max(m["y"] + m["h"] for m in monitors)
+        else:
+            vx, vy = 0, 0
+            vr, vb = self.winfo_screenwidth(), self.winfo_screenheight()
+        vw, vh = vr - vx, vb - vy
+
+        overlay = tk.Toplevel(self)
+        overlay.overrideredirect(True)
+        overlay.attributes("-topmost", True)
+        try:
+            overlay.attributes("-alpha", 0.3)
+        except Exception:
+            pass
+        overlay.configure(bg="#1e293b")
+        overlay.geometry(f"{vw}x{vh}+{vx}+{vy}")
+
+        canvas = tk.Canvas(overlay, cursor="cross", bg="#1e293b", highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        canvas.create_text(
+            vw // 2, 30, text="드래그로 녹화할 영역을 지정하세요 (ESC: 취소)",
+            fill="#f8fafc", font=(self._ui_font_family, 16),
+        )
+
+        state: dict[str, object] = {"x0": 0, "y0": 0, "rect": None, "result": None}
+
+        def on_press(event: object) -> None:
+            state["x0"], state["y0"] = event.x_root, event.y_root
+            if state["rect"] is not None:
+                canvas.delete(state["rect"])
+            state["rect"] = canvas.create_rectangle(
+                event.x_root - vx, event.y_root - vy, event.x_root - vx, event.y_root - vy,
+                outline="#6366f1", width=2,
+            )
+
+        def on_drag(event: object) -> None:
+            if state["rect"] is not None:
+                canvas.coords(
+                    state["rect"], state["x0"] - vx, state["y0"] - vy, event.x_root - vx, event.y_root - vy
+                )
+
+        def on_release(event: object) -> None:
+            x0, y0 = int(state["x0"]), int(state["y0"])
+            x1, y1 = int(event.x_root), int(event.y_root)
+            left, top = min(x0, x1), min(y0, y1)
+            width, height = abs(x1 - x0), abs(y1 - y0)
+            if width >= 16 and height >= 16:
+                state["result"] = (left, top, width, height)
+            overlay.destroy()
+
+        def on_cancel(_event: object | None = None) -> None:
+            overlay.destroy()
+
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_release)
+        overlay.bind("<Escape>", on_cancel)
+        # 두 번째 이후 호출에서도 창이 확실히 앞에 뜨고 입력을 받도록 매핑 완료 후 grab한다.
+        overlay.update_idletasks()
+        overlay.lift()
+        overlay.focus_force()
+        try:
+            overlay.grab_set()
+        except Exception:
+            pass
+        self.wait_window(overlay)
+
+        result = state["result"]
+        if result is not None:
+            self.record_region = result  # type: ignore[assignment]
+            x, y, w, h = result
+            self.record_region_info_var.set(f"{w}×{h} @({x},{y})")
+        elif self.record_region is None:
+            # 취소했고 기존 영역도 없으면 전체 화면으로 되돌린다.
+            self.record_target_var.set(CAPTURE_FULL_LABEL)
+            self.select_region_btn.configure(state="disabled")
+            self.record_region_info_var.set("(영역 미지정)")
+
     def _select_media(self) -> None:
         patterns = [("영상/음성 파일", " ".join(MEDIA_EXTS)), ("모든 파일", "*.*")]
         path = filedialog.askopenfilename(filetypes=patterns)
@@ -3715,7 +4419,19 @@ class PapaStopApp(ctk.CTk):
         self._apply_resource_mode_from_selection()
         self._append_log(f"자원 사용 방식을 바꿨습니다: {self.asr.resource_summary()}")
 
+    @staticmethod
+    def _strip_status_prefix(label: str) -> str:
+        for prefix in ("✓ ", "↓ "):
+            if label.startswith(prefix):
+                return label[len(prefix):]
+        return label
+
+    @staticmethod
+    def _decorate_label(label: str, ready: bool) -> str:
+        return ("✓ " if ready else "↓ ") + label
+
     def _whisper_model_id_from_label(self, label: str) -> str:
+        label = self._strip_status_prefix(label)
         for key, value in WHISPER_MODEL_LABELS.items():
             if value == label:
                 return key
@@ -3731,6 +4447,7 @@ class PapaStopApp(ctk.CTk):
             return
         model_name = self._whisper_model_from_selection()
         self.asr.set_model(model_name)
+        self._refresh_model_status()
         self._append_log(f"음성 인식 모델을 바꿨습니다: {self.asr.model_label(model_name)}")
 
     def _live_whisper_model_from_selection(self) -> str:
@@ -3743,10 +4460,11 @@ class PapaStopApp(ctk.CTk):
             return
         model_name = self._live_whisper_model_from_selection()
         self.live_asr.set_model(model_name)
+        self._refresh_model_status()
         self._append_log(f"실시간 음성 인식 모델을 바꿨습니다: {self.live_asr.model_label(model_name)}")
 
     def _live_translation_profile_from_selection(self) -> str:
-        label = self.live_translation_var.get()
+        label = self._strip_status_prefix(self.live_translation_var.get())
         for key, value in LIVE_TRANSLATION_LABELS.items():
             if value == label:
                 return key
@@ -3761,7 +4479,93 @@ class PapaStopApp(ctk.CTk):
             return
         profile = self._live_translation_profile_from_selection()
         self.live_translator.set_profile(profile)
+        self._update_live_secondary_state()
+        self._refresh_model_status()
         self._append_log(f"실시간 번역 모델을 바꿨습니다: {self.live_translator.profile_label(profile)}")
+
+    def _update_live_secondary_state(self) -> None:
+        # OPUS-MT를 골랐을 때만 2차 번역 체크박스·드롭다운을 활성화한다.
+        is_opus = self.live_translator.preferred == "opus"
+        state = "normal" if is_opus else "disabled"
+        for widget in (getattr(self, "live_secondary_check", None), getattr(self, "live_secondary_combo", None)):
+            if widget is not None:
+                try:
+                    widget.configure(state=state)
+                except Exception:
+                    pass
+
+    def _refresh_model_status(self) -> None:
+        # 선택된 음성 인식·번역 모델이 이미 받아져 있는지 각 탭의 상태 줄에 표시한다.
+        def apply(label_widget, ready: bool) -> None:
+            if label_widget is None:
+                return
+            text = "✓ 사용 가능" if ready else "↓ 다운로드 필요"
+            color = "#16a34a" if ready else "#d97706"
+            try:
+                label_widget.configure(text=text, text_color=color)
+            except Exception:
+                pass
+
+        try:
+            apply(getattr(self, "file_asr_status_lbl", None), self.asr.is_model_ready(self._whisper_model_from_selection()))
+            apply(getattr(self, "file_trans_status_lbl", None), self.translator.is_profile_ready(self._translation_profile_from_selection()))
+            apply(getattr(self, "live_asr_status_lbl", None), self.live_asr.is_model_ready(self._live_whisper_model_from_selection()))
+            apply(getattr(self, "live_trans_status_lbl", None), self.live_translator.is_profile_ready(self._live_translation_profile_from_selection()))
+        except Exception:
+            pass
+        self._refresh_model_dropdowns()
+
+    def _refresh_model_dropdowns(self) -> None:
+        # 각 드롭다운 항목 앞에 ✓(사용 가능)/↓(다운로드 필요) 표시를 붙여 갱신한다.
+        def apply_combo(combo, var, order, labels, ready_fn, current_key) -> None:
+            if combo is None:
+                return
+            try:
+                combo.configure(values=[self._decorate_label(labels[k], ready_fn(k)) for k in order])
+                if current_key in labels:
+                    var.set(self._decorate_label(labels[current_key], ready_fn(current_key)))
+            except Exception:
+                pass
+
+        apply_combo(
+            getattr(self, "whisper_model_combo", None), self.whisper_model_var,
+            WHISPER_MODEL_ORDER, WHISPER_MODEL_LABELS, self.asr.is_model_ready,
+            self._whisper_model_from_selection(),
+        )
+        apply_combo(
+            getattr(self, "translation_profile_combo", None), self.translation_profile_var,
+            TRANSLATION_PROFILE_ORDER, TRANSLATION_PROFILE_LABELS, self.translator.is_profile_ready,
+            self._translation_profile_from_selection(),
+        )
+        apply_combo(
+            getattr(self, "live_whisper_model_combo", None), self.live_whisper_model_var,
+            WHISPER_MODEL_ORDER, WHISPER_MODEL_LABELS, self.live_asr.is_model_ready,
+            self._live_whisper_model_from_selection(),
+        )
+        apply_combo(
+            getattr(self, "live_translation_combo", None), self.live_translation_var,
+            LIVE_TRANSLATION_ORDER, LIVE_TRANSLATION_LABELS, self.live_translator.is_profile_ready,
+            self._live_translation_profile_from_selection(),
+        )
+
+    def _live_secondary_from_selection(self) -> str:
+        label = self.live_secondary_var.get()
+        for key, value in LIVE_SECONDARY_LABELS.items():
+            if value == label:
+                return key
+        return "nllb600"
+
+    def _on_live_secondary_selected(self, _event: object | None = None) -> None:
+        key = self._live_secondary_from_selection()
+        self.live_translator.set_opus_secondary(key)
+        self._append_log(f"OPUS 2차 번역기를 바꿨습니다: {LIVE_SECONDARY_LABELS.get(key, key)}")
+
+    def _on_live_secondary_toggled(self) -> None:
+        enabled = self.live_use_secondary_var.get()
+        self.live_translator.set_opus_use_secondary(enabled)
+        self._append_log(
+            "OPUS 2차 번역(영어→한국어)을 " + ("켰습니다." if enabled else "껐습니다. 영어 자막으로 표시됩니다.")
+        )
 
     def _source_lang_id_from_label(self, label: str) -> str:
         for key, value in SOURCE_LANG_LABELS.items():
@@ -3814,6 +4618,7 @@ class PapaStopApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _translation_profile_id_from_label(self, label: str) -> str:
+        label = self._strip_status_prefix(label)
         for key, value in TRANSLATION_PROFILE_LABELS.items():
             if value == label:
                 return key
@@ -3829,6 +4634,7 @@ class PapaStopApp(ctk.CTk):
             return
         profile = self._translation_profile_from_selection()
         self.translator.set_profile(profile)
+        self._refresh_model_status()
         self._append_log(f"번역 방식을 바꿨습니다: {self.translator.profile_label()}")
 
     def _prepare_translation_model(self) -> None:
@@ -4186,6 +4992,18 @@ class PapaStopApp(ctk.CTk):
         except ValueError:
             fps = DEFAULT_RECORD_FPS
 
+        region, region_ok = self._resolve_capture_region()
+        if not region_ok:
+            messagebox.showwarning(APP_NAME, "녹화할 영역을 먼저 지정해 주세요. ('영역 선택' 버튼)")
+            return
+
+        codec = DEFAULT_RECORD_CODEC
+        codec_label = self.record_codec_var.get()
+        for key, value in RECORD_CODEC_LABELS.items():
+            if value == codec_label:
+                codec = key
+                break
+
         self.record_cancel_event = threading.Event()
         self.record_cancel_event.clear()
         self.progress_started_at = None
@@ -4203,6 +5021,8 @@ class PapaStopApp(ctk.CTk):
                     capture_audio=bool(self.record_audio_var.get()),
                     emit=self._emit,
                     stop_event=self.record_cancel_event,
+                    region=region,
+                    codec=codec,
                 )
             except Exception as exc:
                 self._emit("error", str(exc))
