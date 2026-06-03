@@ -521,3 +521,15 @@ AI 작업 인수인계용 진행 기록 / To-Do Done
   검증: python -m py_compile .\papastop.py 통과.
    .\.venv\Scripts\python.exe -m unittest -q 통과(28개).
    .\.venv\Scripts\python.exe -c "from papastop import PapaStopApp; app=PapaStopApp(); app.update(); app._show_tab('help'); app.update(); print('help_log_mapped=', app._common_log_panel.winfo_ismapped(), 'content_h=', app._content_panel.winfo_height()); app._show_tab('file'); app.update(); print('file_log_mapped=', app._common_log_panel.winfo_ismapped(), 'list_wrap_w=', app.file_listbox_wrap.winfo_width()); app.destroy(); app.update_idletasks()" 결과 help_log_mapped=0, file_log_mapped=1, list_wrap_w=772.
+
+------------------------------------------------------------
+
+[완료] 도움말 제작자 박스 아래 소개 문구 제거  (2026-06-03 20:26:18)
+  어디: papastop.py (PapaStopApp._build_help_tab).
+  무엇/어떻게:
+   · 도움말 화면의 제작자 박스와 사이드 메뉴 박스 사이에 있던 "PapaStop 도움말" 제목을 삭제.
+   · 같은 위치의 안내 문구도 함께 삭제해 제작자 박스 다음에 바로 사이드 메뉴 박스가 오도록 정리.
+   · 해당 제목/안내 전용으로만 쓰이던 add_intro 내부 함수도 같이 제거.
+  검증: python -m py_compile .\papastop.py 통과.
+   .\.venv\Scripts\python.exe -c "from papastop import PapaStopApp; app=PapaStopApp(); app.update(); app._show_tab('help'); app.update(); print('intro_removed=', 'PapaStop 도움말' not in open('papastop.py', encoding='utf-8').read()); print('help_children=', len(app.help_tab.winfo_children())); app.destroy()" 결과 intro_removed=True, help_children=1.
+   rg -n "PapaStop 도움말|각 메뉴와 버튼의 역할|이 페이지는 내용이 길어질 수" papastop.py 결과 없음.

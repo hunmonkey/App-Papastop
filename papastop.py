@@ -3378,24 +3378,6 @@ class PapaStopApp(ctk.CTk):
         )
         help_scroll.pack(fill="both", expand=True)
 
-        def add_intro(title: str, text: str) -> None:
-            ctk.CTkLabel(
-                help_scroll,
-                text=title,
-                font=ctk.CTkFont(family=self._ui_font_family, size=18, weight="bold"),
-                text_color=UI_TEXT,
-                anchor="w",
-            ).pack(fill="x", padx=2, pady=(2, 6))
-            ctk.CTkLabel(
-                help_scroll,
-                text=text,
-                font=self.font_base,
-                text_color=UI_TEXT_MUTED,
-                justify="left",
-                anchor="w",
-                wraplength=820,
-            ).pack(fill="x", padx=2, pady=(0, 10))
-
         def add_section(title: str, lines: list[str]) -> None:
             card, body = self._make_card(help_scroll, title)
             card.pack(fill="x", padx=2, pady=(0, 10))
@@ -3418,11 +3400,6 @@ class PapaStopApp(ctk.CTk):
                 "허가받은 사용자 외의 사용을 금합니다.",
                 "외부 유출, 유포, 공유를 금지합니다.",
             ],
-        )
-        add_intro(
-            "PapaStop 도움말",
-            "각 메뉴와 버튼의 역할, 작업 순서, 주의사항을 한곳에 모았습니다. "
-            "이 페이지는 내용이 길어질 수 있어 세로로 스크롤됩니다.",
         )
         add_section(
             "사이드 메뉴",
