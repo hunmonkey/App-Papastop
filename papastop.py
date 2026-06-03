@@ -63,7 +63,7 @@ LIVE_SPEECH_PAD_MS = 200           # 발화 앞뒤 여유 패딩
 # 파일 자막은 정확도 우선이라 영향받지 않는다. 더 빠르게 하려면 1(greedy)로 낮출 수 있다.
 LIVE_BEAM_SIZE = 2
 
-WHISPER_MODEL_ORDER = ("tiny", "base", "small", "medium", "large-v3", "large-v3-turbo")
+WHISPER_MODEL_ORDER = ("tiny", "base", "small", "medium", "large-v3", "large-v3-turbo", "distil-large-v3")
 WHISPER_MODEL_LABELS = {
     "tiny": "매우 빠름 (tiny)",
     "base": "기본 (base)",
@@ -71,6 +71,7 @@ WHISPER_MODEL_LABELS = {
     "medium": "정확도 높음 (medium)",
     "large-v3": "최고 정확도 (large-v3)",
     "large-v3-turbo": "고정확도 빠름 (large-v3-turbo)",
+    "distil-large-v3": "영어 전용 고속 (distil-large-v3)",
 }
 
 SOURCE_LANG_AUTO = "auto"
@@ -191,12 +192,13 @@ LIVE_SECONDARY_STEPS = {
     "argos": ("argos", None),
 }
 
-TRANSLATION_PROFILE_ORDER = ("auto", "fast", "balanced", "accurate") + tuple(
+TRANSLATION_PROFILE_ORDER = ("auto", "fast", "nllb600", "balanced", "accurate") + tuple(
     f"llm-{key}" for key in LLM_MODEL_ORDER
 )
 TRANSLATION_PROFILE_LABELS = {
     "auto": "자동 (NLLB 우선, 실패 시 Argos)",
     "fast": "빠름 (Argos 번역)",
+    "nllb600": "경량 (NLLB 600M)",
     "balanced": "균형 (NLLB 1.3B)",
     "accurate": "정확도 우선 (NLLB 3.3B)",
     "live": "실시간 빠름 (NLLB 600M)",
@@ -204,6 +206,7 @@ TRANSLATION_PROFILE_LABELS = {
 TRANSLATION_PROFILE_ORDER_STEPS = {
     "auto": (("nllb", NLLB_FAST_MODEL), ("argos", None)),
     "fast": (("argos", None),),
+    "nllb600": (("nllb", NLLB_LIVE_MODEL), ("nllb", NLLB_FAST_MODEL)),
     "balanced": (("nllb", NLLB_FAST_MODEL),),
     "accurate": (("nllb", NLLB_ACCURATE_MODEL), ("nllb", NLLB_FAST_MODEL)),
     # 실시간 전용: 600M 우선, 없으면 1.3B로, 그래도 안 되면 Argos로 내려간다.

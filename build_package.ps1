@@ -67,6 +67,15 @@ if (Test-Path $WhisperSrc) {
     Copy-Item $WhisperSrc (Join-Path $DataDir "huggingface") -Recurse -Force
 }
 
+Write-Host "  - Copying NLLB CT2 translation models..."
+foreach ($ct2 in @("nllb-200-distilled-600M-ct2", "nllb-200-distilled-1.3B-ct2", "nllb-200-3.3B-ct2")) {
+    $src = Join-Path $AppDir ".papastop_data\$ct2"
+    if (Test-Path $src) {
+        Write-Host "      $ct2"
+        Copy-Item $src (Join-Path $DataDir $ct2) -Recurse -Force
+    }
+}
+
 Write-Host ""
 Write-Host "Package created:"
 Write-Host "  EXE   : dist\PapaStop\PapaStop.exe"
