@@ -2377,21 +2377,29 @@ class LiveCaptionService:
         self._srt_emitted = False
         self._dropped_chunks = 0
         self._lag_warned_at = 0.0
+        source_text = f"인터넷 URL: {self._source_url}" if self._source_url else "PC 스피커 소리"
+        emit("log", f"실시간 자막 작업을 준비합니다. 입력: {source_text}")
         if self._srt_path is not None:
             self._srt_path.parent.mkdir(parents=True, exist_ok=True)
+            emit("log", f"실시간 자막 SRT 저장을 준비했습니다: {self._srt_path}")
 
         # 첫 청크에서 모델을 로딩하면 10초 가까이 걸려 그 사이 들어온 앞 구간이 버려진다.
         # 캡처를 시작하기 전에 음성 인식·번역 모델을 미리 올려 두어 첫 구간부터 따라잡게 한다.
         emit("live_status", "음성 인식·번역 모델을 준비하는 중입니다 ...")
+        emit("log", "실시간 자막 모델을 준비합니다.")
         try:
             self.asr.prepare_model()
+            emit("log", f"음성 인식 모델 준비 완료: {self.asr.model_label()}")
             self.translator.prepare_profile()
+            emit("log", f"번역 모델 준비 완료: {self.translator.profile_label()}")
             self._warmup(emit)
         except Exception as exc:
             emit("log", f"실시간 모델 사전 준비 중 경고: {exc}")
         if stop_event.is_set():
+            emit("log", "실시간 자막 시작이 취소되었습니다.")
             return
         emit("live_status", "실시간 자막을 시작합니다 ...")
+        emit("log", "실시간 자막 캡처와 처리 스레드를 시작합니다.")
 
         # 캡처 두 경로(PC 소리/URL)가 같은 분할기를 공유한다. 확정된 발화를 워커 큐로 넘긴다.
         self._segmenter = _UtteranceSegmenter(
@@ -2415,6 +2423,7 @@ class LiveCaptionService:
 
         self._capture_thread.start()
         self._worker_thread.start()
+        emit("log", "실시간 자막 작업이 실행 중입니다.")
 
     def _warmup(self, emit: Callable[[str, object], None]) -> None:
         # 첫 추론은 CUDA 커널 준비로 유독 느리다. 시작할 때 짧은 더미 입력으로 인식·번역을 한 번씩
@@ -2429,12 +2438,18 @@ class LiveCaptionService:
         except Exception as exc:
             emit("log", f"실시간 자막 준비 중 경고: {exc}")
 
-    def stop(self, timeout: float = 2.0) -> None:
+    def stop(self, timeout: float = 2.0, emit: Callable[[str, object], None] | None = None) -> None:
+        def log(message: str) -> None:
+            if emit is not None:
+                emit("log", message)
+
+        log("실시간 자막 내부 작업에 중지 신호를 보냈습니다.")
         if self._stop_event is not None:
             self._stop_event.set()
         if self._ffmpeg_process is not None:
             process = self._ffmpeg_process
             self._ffmpeg_process = None
+            log("인터넷 실시간 캡처 프로세스를 종료하는 중입니다.")
             try:
                 process.terminate()
             except Exception:
@@ -2450,8 +2465,10 @@ class LiveCaptionService:
         loopback_recorder = self._loopback_recorder
         if loopback_recorder is not None:
             self._loopback_recorder = None
+            log("PC 스피커 캡처 장치를 닫는 중입니다.")
             try:
                 _close_windows_audio_recorder(loopback_recorder)
+                log("PC 스피커 캡처 장치를 닫았습니다.")
             except Exception:
                 pass
 
@@ -2466,9 +2483,19 @@ class LiveCaptionService:
                     pass
 
         if self._capture_thread is not None:
+            log("실시간 캡처 스레드 종료를 기다리는 중입니다.")
             self._capture_thread.join(timeout=timeout)
+            if self._capture_thread.is_alive():
+                log("실시간 캡처 스레드가 아직 정리 중입니다.")
+            else:
+                log("실시간 캡처 스레드가 종료되었습니다.")
         if self._worker_thread is not None:
+            log("실시간 자막 처리 스레드 종료를 기다리는 중입니다.")
             self._worker_thread.join(timeout=timeout)
+            if self._worker_thread.is_alive():
+                log("실시간 자막 처리 스레드가 아직 정리 중입니다.")
+            else:
+                log("실시간 자막 처리 스레드가 종료되었습니다.")
 
         self._capture_thread = None
         self._worker_thread = None
@@ -2484,6 +2511,7 @@ class LiveCaptionService:
             self._chunk_queue = None
 
         self._source_url = None
+        log("실시간 자막 내부 작업 정리가 완료되었습니다.")
 
     def _safe_put_chunk(self, item: tuple[float | None, object | None]) -> None:
         if self._chunk_queue is None:
@@ -2517,8 +2545,9 @@ class LiveCaptionService:
 
         release_audio_thread: Callable[[], None] = lambda: None
         try:
-            release_audio_thread = _initialize_windows_audio_thread()
+            emit("log", "PC 스피커 캡처를 준비합니다.")
             import soundcard as sc
+            release_audio_thread = _initialize_windows_audio_thread()
 
             speaker = sc.default_speaker()
             if speaker is None:
@@ -2528,6 +2557,7 @@ class LiveCaptionService:
             loopback = sc.get_microphone(id=str(speaker.name), include_loopback=True)
             with loopback.recorder(samplerate=self.sample_rate) as recorder:
                 self._loopback_recorder = recorder
+                emit("log", "PC 스피커 캡처를 시작했습니다.")
                 try:
                     while not stop_event.is_set():
                         with warnings.catch_warnings():
@@ -2547,6 +2577,7 @@ class LiveCaptionService:
                         self._segmenter.add_frame(audio)
                 finally:
                     self._loopback_recorder = None
+                    emit("log", "PC 스피커 캡처 장치를 정리했습니다.")
         except OperationCancelled:
             emit("log", "실시간 캡처가 취소되었습니다.")
         except Exception as exc:
@@ -2565,6 +2596,7 @@ class LiveCaptionService:
                 release_audio_thread()
             except Exception:
                 pass
+            emit("log", "PC 스피커 캡처 스레드가 종료되었습니다.")
 
     def _capture_from_url(
         self,
@@ -2656,6 +2688,7 @@ class LiveCaptionService:
             emit("error", f"실시간 캡처 오류: {url} - {exc}")
         finally:
             if process is not None:
+                emit("log", "인터넷 실시간 캡처 프로세스를 정리합니다.")
                 try:
                     if process.stdout is not None:
                         process.stdout.close()
@@ -2671,75 +2704,80 @@ class LiveCaptionService:
                 except Exception:
                     pass
             self._safe_put_chunk((None, None))
+            emit("log", "인터넷 실시간 캡처 스레드가 종료되었습니다.")
 
     def _worker_loop(self, emit: Callable[[str, object], None], stop_event: threading.Event) -> None:
-        while True:
-            if self._chunk_queue is None:
-                return
+        emit("log", "실시간 자막 처리 스레드가 시작되었습니다.")
+        try:
+            while True:
+                if self._chunk_queue is None:
+                    return
 
-            try:
-                chunk = self._chunk_queue.get(timeout=0.25)
-            except queue.Empty:
+                try:
+                    chunk = self._chunk_queue.get(timeout=0.25)
+                except queue.Empty:
+                    if stop_event.is_set():
+                        break
+                    continue
+
+                start_seconds, audio = chunk
+                if start_seconds is None:
+                    break
+                if audio is None:
+                    continue
                 if stop_event.is_set():
                     break
-                continue
 
-            start_seconds, audio = chunk
-            if start_seconds is None:
-                break
-            if audio is None:
-                continue
-            if stop_event.is_set():
-                break
-
-            work_started_at = time.monotonic()
-            try:
-                # 이미 발화 단위로 잘라 침묵이 제거됐으므로 위스퍼 쪽 VAD는 끄고(이중 처리 방지),
-                # 디코딩 폭(beam)도 좁혀 실시간 속도를 높인다.
-                asr_started_at = time.monotonic()
-                segments, source_language = self.asr.transcribe(
-                    audio,
-                    should_stop=stop_event.is_set,
-                    vad_filter=False,
-                    beam_size=LIVE_BEAM_SIZE,
-                )
-                asr_elapsed = time.monotonic() - asr_started_at
-                translate_elapsed = 0.0
-                if segments:
-                    translate_started_at = time.monotonic()
-                    translated = self.translator.translate_texts(
-                        [s.text for s in segments],
-                        source_language,
+                work_started_at = time.monotonic()
+                try:
+                    # 이미 발화 단위로 잘라 침묵이 제거됐으므로 위스퍼 쪽 VAD는 끄고(이중 처리 방지),
+                    # 디코딩 폭(beam)도 좁혀 실시간 속도를 높인다.
+                    asr_started_at = time.monotonic()
+                    segments, source_language = self.asr.transcribe(
+                        audio,
+                        should_stop=stop_event.is_set,
+                        vad_filter=False,
+                        beam_size=LIVE_BEAM_SIZE,
                     )
-                    translate_elapsed = time.monotonic() - translate_started_at
-                    # [임시 진단] 번역이 느린 경우 입력 텍스트의 길이·내용을 남긴다(원인 파악용).
-                    if translate_elapsed > 0.8:
-                        total_chars = sum(len(s.text) for s in segments)
-                        emit(
-                            "log",
-                            f"[진단] 번역 {translate_elapsed:.1f}초 | 언어={source_language} | "
-                            f"조각 {len(segments)}개·{total_chars}자 | 첫 텍스트: {segments[0].text[:60]!r}",
+                    asr_elapsed = time.monotonic() - asr_started_at
+                    translate_elapsed = 0.0
+                    if segments:
+                        translate_started_at = time.monotonic()
+                        translated = self.translator.translate_texts(
+                            [s.text for s in segments],
+                            source_language,
                         )
-                    if len(translated) != len(segments):
-                        translated = translated + ["" for _ in range(len(segments) - len(translated))]
-                    pairs = [(s, (t.strip() or s.text.strip())) for s, t in zip(segments, translated) if (t or s.text).strip()]
-                    lines = [text for _, text in pairs]
-                    if lines:
-                        emit("live_caption", "\n".join(lines[-2:]))
-                    if self._srt_path is not None and pairs:
-                        self._append_live_srt(start_seconds, pairs, emit)
-                utterance_seconds = len(audio) / self.sample_rate
-                self._report_processing_lag(
-                    time.monotonic() - work_started_at,
-                    utterance_seconds,
-                    asr_elapsed,
-                    translate_elapsed,
-                    emit,
-                )
-            except OperationCancelled:
-                emit("log", "실시간 번역이 취소되었습니다.")
-            except Exception as exc:
-                emit("error", f"실시간 번역 오류: {exc}")
+                        translate_elapsed = time.monotonic() - translate_started_at
+                        # [임시 진단] 번역이 느린 경우 입력 텍스트의 길이·내용을 남긴다(원인 파악용).
+                        if translate_elapsed > 0.8:
+                            total_chars = sum(len(s.text) for s in segments)
+                            emit(
+                                "log",
+                                f"[진단] 번역 {translate_elapsed:.1f}초 | 언어={source_language} | "
+                                f"조각 {len(segments)}개·{total_chars}자 | 첫 텍스트: {segments[0].text[:60]!r}",
+                            )
+                        if len(translated) != len(segments):
+                            translated = translated + ["" for _ in range(len(segments) - len(translated))]
+                        pairs = [(s, (t.strip() or s.text.strip())) for s, t in zip(segments, translated) if (t or s.text).strip()]
+                        lines = [text for _, text in pairs]
+                        if lines:
+                            emit("live_caption", "\n".join(lines[-2:]))
+                        if self._srt_path is not None and pairs:
+                            self._append_live_srt(start_seconds, pairs, emit)
+                    utterance_seconds = len(audio) / self.sample_rate
+                    self._report_processing_lag(
+                        time.monotonic() - work_started_at,
+                        utterance_seconds,
+                        asr_elapsed,
+                        translate_elapsed,
+                        emit,
+                    )
+                except OperationCancelled:
+                    emit("log", "실시간 번역이 취소되었습니다.")
+                except Exception as exc:
+                    emit("error", f"실시간 번역 오류: {exc}")
+        finally:
+            emit("log", "실시간 자막 처리 스레드가 종료되었습니다.")
 
     def _report_processing_lag(
         self,
@@ -2907,8 +2945,8 @@ class ScreenRecorderService:
         expected_channels: int | None = None
         release_audio_thread: Callable[[], None] = lambda: None
         try:
-            release_audio_thread = _initialize_windows_audio_thread()
             import soundcard as sc
+            release_audio_thread = _initialize_windows_audio_thread()
 
             speaker = sc.default_speaker()
             if speaker is None:
@@ -3331,6 +3369,163 @@ class PapaStopApp(ctk.CTk):
         menu.pack(fill="both", expand=True, padx=1, pady=1)
         return holder, menu
 
+    def _build_help_tab(self) -> None:
+        help_scroll = ctk.CTkScrollableFrame(
+            self.help_tab,
+            fg_color="transparent",
+            scrollbar_button_color=UI_BORDER_STRONG,
+            scrollbar_button_hover_color=UI_TEXT_MUTED,
+        )
+        help_scroll.pack(fill="both", expand=True)
+
+        def add_intro(title: str, text: str) -> None:
+            ctk.CTkLabel(
+                help_scroll,
+                text=title,
+                font=ctk.CTkFont(family=self._ui_font_family, size=18, weight="bold"),
+                text_color=UI_TEXT,
+                anchor="w",
+            ).pack(fill="x", padx=2, pady=(2, 6))
+            ctk.CTkLabel(
+                help_scroll,
+                text=text,
+                font=self.font_base,
+                text_color=UI_TEXT_MUTED,
+                justify="left",
+                anchor="w",
+                wraplength=820,
+            ).pack(fill="x", padx=2, pady=(0, 10))
+
+        def add_section(title: str, lines: list[str]) -> None:
+            card, body = self._make_card(help_scroll, title)
+            card.pack(fill="x", padx=2, pady=(0, 10))
+            for line in lines:
+                ctk.CTkLabel(
+                    body,
+                    text=line,
+                    font=self.font_base,
+                    text_color=UI_TEXT,
+                    justify="left",
+                    anchor="w",
+                    wraplength=820,
+                ).pack(fill="x", pady=2)
+
+        add_section(
+            "제작자",
+            [
+                "제작자 : 황재훈",
+                "연락처 : hunmonkey@hanmail.net",
+                "허가받은 사용자 외의 사용을 금합니다.",
+                "외부 유출, 유포, 공유를 금지합니다.",
+            ],
+        )
+        add_intro(
+            "PapaStop 도움말",
+            "각 메뉴와 버튼의 역할, 작업 순서, 주의사항을 한곳에 모았습니다. "
+            "이 페이지는 내용이 길어질 수 있어 세로로 스크롤됩니다.",
+        )
+        add_section(
+            "사이드 메뉴",
+            [
+                "파일 자막: 영상이나 음성 파일을 SRT 자막으로 만들고 필요하면 번역합니다.",
+                "실시간 자막: PC 스피커 소리나 인터넷 URL 스트림을 실시간으로 듣고 한국어 자막을 표시합니다.",
+                "화면 녹화: 전체 화면, 모니터, 선택 영역을 MKV 파일로 녹화합니다.",
+                "시스템 사양: 현재 PC의 CPU, RAM, 그래픽카드와 자원 사용 방식을 확인합니다.",
+                "도움말: 각 메뉴와 버튼 사용법, 주의사항을 확인합니다.",
+            ],
+        )
+        add_section(
+            "파일 자막 메뉴",
+            [
+                "원본 영상/음성: 자막으로 만들 파일 경로입니다. 직접 입력하거나 선택 버튼으로 고릅니다.",
+                "선택: 영상이나 음성 파일 하나를 고릅니다.",
+                "목록에 추가: 현재 원본 경로를 작업할 파일 목록에 넣습니다.",
+                "저장할 SRT / 폴더: 결과 자막 파일이나 저장 폴더를 지정합니다.",
+                "같은 이름으로: 원본 파일과 같은 위치에 같은 이름의 .srt 경로를 자동으로 넣습니다.",
+                "폴더 선택: 여러 파일을 처리할 때 결과를 저장할 폴더를 고릅니다.",
+                "자막 만들기 시작: 목록의 파일을 순서대로 처리합니다. 작업 중에는 설정을 바꾸지 않는 것이 안전합니다.",
+                "중지: 현재 파일 작업을 멈추도록 요청합니다. 처리 중인 단계에 따라 몇 초 걸릴 수 있습니다.",
+                "결과 열기: 마지막으로 만들어진 결과 파일이나 폴더를 엽니다.",
+                "음성 인식 모델: 빠를수록 처리 속도가 좋고, 큰 모델일수록 정확도가 좋아질 수 있습니다.",
+                "위스퍼 모델 다운로드: 선택한 음성 인식 모델을 미리 내려받습니다.",
+                "원본 언어: 자동 감지가 기본입니다. 언어를 알고 있으면 직접 고르면 오인식이 줄 수 있습니다.",
+                "번역 모델: 속도와 품질의 균형을 고릅니다. 큰 모델은 시간이 오래 걸리고 저장 공간을 많이 씁니다.",
+                "번역 모델 다운로드: 선택한 번역 모델을 미리 준비합니다.",
+                "파일 추가/폴더 추가: 작업 목록에 파일 또는 폴더 안의 미디어 파일을 넣습니다.",
+                "선택 삭제/전체 비우기: 작업 목록을 정리합니다. 원본 파일은 삭제하지 않습니다.",
+                "위로/아래로: 여러 파일 처리 순서를 바꿉니다.",
+                "주의: 처음 쓰는 모델은 자동 다운로드가 필요할 수 있어 시간이 오래 걸립니다.",
+            ],
+        )
+        add_section(
+            "실시간 자막 메뉴",
+            [
+                "PC 스피커 소리: 현재 PC에서 재생되는 소리를 듣고 자막을 만듭니다.",
+                "인터넷 URL 스트림: URL을 통해 들어오는 실시간 방송이나 오디오 스트림을 처리합니다.",
+                "URL: 인터넷 URL 스트림을 선택했을 때만 사용합니다. http, https, rtmp, rtmps, rtsp 주소를 입력합니다.",
+                "원본 언어: 자동 감지가 기본입니다. 자막이 엉뚱한 언어로 나오면 언어를 직접 고릅니다.",
+                "음성 인식 모델: 실시간은 tiny 또는 base처럼 빠른 모델을 권장합니다.",
+                "번역 모델: 정확 모델은 품질이 좋지만 느릴 수 있고, 빠른 모델은 반응이 빠르지만 표현이 단순할 수 있습니다.",
+                "OPUS 2차 번역: OPUS 선택 시 일본어/중국어를 영어로 거친 뒤 한국어로 다시 번역할 때 사용합니다.",
+                "시작: 실시간 자막을 시작합니다. 모델 준비, 캡처 시작, 처리 스레드 시작 과정은 아래 작업 기록에 남습니다.",
+                "중지: 실시간 캡처와 번역 처리를 멈추고 관련 장치를 정리합니다. 정리 과정도 작업 기록에 남습니다.",
+                "결과 열기: SRT 저장을 켠 경우 마지막 저장 파일을 엽니다.",
+                "자막 창을 항상 위에 표시: 별도 자막창을 화면 위에 띄웁니다.",
+                "자막 파일(.srt)로도 저장: 실시간 자막을 파일로 누적 저장합니다.",
+                "자막창 보이기/숨기기: 실시간 작업 중 별도 자막창 표시를 바꿉니다.",
+                "주의: PC 스피커 소리 캡처는 Windows 소리 장치 상태에 영향을 받습니다. 오류가 나면 사용 중인 재생 장치가 맞는지 확인합니다.",
+                "주의: 인터넷 URL 스트림에는 ffmpeg가 필요합니다. 주소가 잘못됐거나 방송이 끊기면 캡처가 중단될 수 있습니다.",
+            ],
+        )
+        add_section(
+            "화면 녹화 메뉴",
+            [
+                "저장할 MKV: 녹화 결과 파일 경로입니다.",
+                "찾아보기: 저장할 파일 위치를 직접 고릅니다.",
+                "캡처 대상: 전체 화면, 모니터, 영역 지정 중 하나를 고릅니다.",
+                "영역 선택: 영역 지정 모드에서 녹화할 사각형 영역을 마우스로 지정합니다.",
+                "녹화 형식: FFV1은 무손실이라 크고, H.264는 용량이 작지만 압축됩니다.",
+                "초당 화면 수: 24, 30, 60 중 선택합니다. 높을수록 부드럽지만 파일이 커질 수 있습니다.",
+                "PC 스피커 소리도 녹음: 화면과 함께 PC 소리를 WAV로 임시 녹음한 뒤 영상과 합칩니다.",
+                "녹화 시작: 화면 녹화를 시작합니다.",
+                "중지: 녹화를 멈추고 임시 영상과 소리를 정리한 뒤 최종 파일을 저장합니다.",
+                "결과 열기: 마지막 녹화 결과 파일을 엽니다.",
+                "주의: 소리 녹음을 켠 경우 스피커 소리가 비어 있으면 영상만 저장될 수 있습니다.",
+                "주의: 무손실 녹화는 파일 크기가 매우 커질 수 있으니 저장 공간을 먼저 확인합니다.",
+            ],
+        )
+        add_section(
+            "시스템 사양 메뉴",
+            [
+                "CPU/RAM/VGA: 현재 PC의 기본 사양을 보여줍니다.",
+                "자원 사용: 최대 성능 또는 균형 모드를 고릅니다.",
+                "최대 성능: CPU/GPU를 적극적으로 사용해 빠르게 처리합니다. 다른 작업이 느려질 수 있습니다.",
+                "균형: PC 여유를 남겨 두는 설정입니다. 처리 속도는 조금 느릴 수 있습니다.",
+                "사양 새로고침: PC 사양과 엔진 상태를 다시 확인합니다.",
+                "주의: 작업 중에는 자원 사용 방식을 바꾸지 않는 것이 안전합니다.",
+            ],
+        )
+        add_section(
+            "실시간 로그",
+            [
+                "제목줄: 현재 상태와 예상 시간을 한 줄로 보여줍니다.",
+                "진행률 바: 파일 자막처럼 진행률 계산이 가능한 작업에서 처리 정도를 보여줍니다.",
+                "로그 창: 시작 버튼 클릭, 모델 준비, 캡처 시작, 파일 저장, 중지 요청, 정리 완료 같은 세부 로그가 남습니다.",
+                "오류가 나오면 로그 창의 마지막 몇 줄을 먼저 확인합니다. 어떤 단계에서 멈췄는지 확인하는 단서입니다.",
+                "로그는 아래 영역 안에서 스크롤됩니다. 오래된 기록은 위쪽에 남고 새 기록은 아래에 추가됩니다.",
+            ],
+        )
+        add_section(
+            "모델과 저장 공간 주의사항",
+            [
+                "모델 파일은 보통 .papastop_data 폴더에 저장됩니다. 모델에 따라 수백 MB에서 수십 GB까지 커질 수 있습니다.",
+                "처음 실행하거나 새 모델을 고르면 다운로드 시간이 필요합니다.",
+                "GPU가 없거나 CUDA가 준비되지 않은 PC에서는 CPU로 처리되어 속도가 느릴 수 있습니다.",
+                "GitHub에는 모델, 로그, 테스트 산출물 같은 큰 파일을 올리지 않도록 .gitignore에 제외 규칙이 들어 있습니다.",
+                "문제가 반복되면 실시간 로그의 오류 문구와 사용한 입력 방식, 선택한 모델을 함께 확인합니다.",
+            ],
+        )
+
     def _build_ui(self) -> None:
         root = self
         # 왼쪽 세로 사이드바(고정폭) + 오른쪽 콘텐츠/로그 영역(가변폭)
@@ -3395,25 +3590,28 @@ class PapaStopApp(ctk.CTk):
         sidebar.grid_propagate(False)
         sidebar.pack_propagate(False)
 
-        # ── 오른쪽 영역: 위(탭 콘텐츠) + 아래(진행·작업 기록) ────────
+        # ── 오른쪽 영역: 위(탭 콘텐츠) + 아래(실시간 로그) ────────
         right = ctk.CTkFrame(root, fg_color="transparent")
         right.grid(row=0, column=1, sticky="nsew", padx=(7, 14), pady=14)
         right.grid_columnconfigure(0, weight=1)
-        # 진행·작업 기록 박스를 더 키운다(탭 콘텐츠 : 진행·기록 = 3 : 2).
-        right.grid_rowconfigure(0, weight=3)
-        right.grid_rowconfigure(1, weight=2)
+        # 실시간 로그가 한 줄 더 위로 올라오도록 아래 영역 비율을 조금 키운다.
+        right.grid_rowconfigure(0, weight=4)
+        right.grid_rowconfigure(1, weight=3)
+        self._right_panel = right
 
         content = ctk.CTkFrame(right, fg_color="transparent")
         content.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
         content.grid_columnconfigure(0, weight=1)
         content.grid_rowconfigure(0, weight=1)
+        self._content_panel = content
 
-        # 탭 4개를 같은 칸에 겹쳐 쌓고 tkraise로 전환한다.
+        # 탭을 같은 칸에 겹쳐 쌓고 tkraise로 전환한다.
         file_tab_host = ctk.CTkFrame(content, fg_color="transparent")
         live_tab_host = ctk.CTkFrame(content, fg_color="transparent")
         record_tab_host = ctk.CTkFrame(content, fg_color="transparent")
         system_tab_host = ctk.CTkFrame(content, fg_color="transparent")
-        for host in (file_tab_host, live_tab_host, record_tab_host, system_tab_host):
+        help_tab_host = ctk.CTkFrame(content, fg_color="transparent")
+        for host in (file_tab_host, live_tab_host, record_tab_host, system_tab_host, help_tab_host):
             host.grid(row=0, column=0, sticky="nsew")
 
         self.file_tab = ctk.CTkFrame(file_tab_host, fg_color="transparent")
@@ -3421,12 +3619,14 @@ class PapaStopApp(ctk.CTk):
         self.live_tab = live_tab_host
         self.record_tab = record_tab_host
         self.system_tab = system_tab_host
+        self.help_tab = help_tab_host
 
         self._tab_hosts = {
             "file": file_tab_host,
             "live": live_tab_host,
             "record": record_tab_host,
             "system": system_tab_host,
+            "help": help_tab_host,
         }
         self._nav_buttons: dict[str, ctk.CTkButton] = {}
         for key, label in (
@@ -3434,6 +3634,7 @@ class PapaStopApp(ctk.CTk):
             ("live", "실시간 자막"),
             ("record", "화면 녹화"),
             ("system", "시스템 사양"),
+            ("help", "도움말"),
         ):
             btn = ctk.CTkButton(
                 sidebar,
@@ -3450,8 +3651,7 @@ class PapaStopApp(ctk.CTk):
             btn.pack(fill="x", padx=10, pady=(16 if not self._nav_buttons else 2, 2))
             self._nav_buttons[key] = btn
 
-        # 공통 로그/진행 영역(아래)을 같은 오른쪽 그리드에 붙이기 위해 보관한다.
-        self._right_panel = right
+        # 공통 로그/진행 영역(아래)은 도움말 탭에서만 숨긴다.
 
         self.system_cpu_var = tk.StringVar(value="확인 중 ...")
         self.system_ram_var = tk.StringVar(value="확인 중 ...")
@@ -3670,7 +3870,8 @@ class PapaStopApp(ctk.CTk):
         list_area.pack(fill="both", expand=True)
 
         listbox_wrap = ctk.CTkFrame(list_area, fg_color="#ffffff", corner_radius=4, border_width=1, border_color=UI_BORDER_STRONG)
-        listbox_wrap.pack(side="left", fill="both", expand=True)
+        listbox_wrap.pack(side="left", fill="both", expand=True, padx=(0, 2))
+        self.file_listbox_wrap = listbox_wrap
         self.file_listbox = tk.Listbox(
             listbox_wrap,
             height=6,
@@ -3686,7 +3887,7 @@ class PapaStopApp(ctk.CTk):
             borderwidth=0,
             highlightthickness=0,
         )
-        self.file_listbox.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+        self.file_listbox.pack(side="left", fill="both", expand=True, padx=(8, 8), pady=8)
         self.file_list_scroll = ctk.CTkScrollbar(listbox_wrap, command=self.file_listbox.yview)
         self.file_listbox.configure(yscrollcommand=self.file_list_scroll.set)
 
@@ -3722,16 +3923,8 @@ class PapaStopApp(ctk.CTk):
             self.prepare_translation_btn,
         ]
 
-        ctk.CTkLabel(
-            self.file_tab,
-            text="영상이나 음성에서 한국어 SRT 자막을 만들어 저장합니다.",
-            font=self.font_base,
-            text_color=UI_TEXT_MUTED,
-            anchor="w",
-        ).pack(fill="x", pady=(8, 2))
-
         status_row = ctk.CTkFrame(self.file_tab, fg_color="transparent")
-        status_row.pack(fill="x", pady=(0, 4))
+        status_row.pack(fill="x", pady=(4, 4))
         ctk.CTkLabel(status_row, text="파일 상태", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left")
         self._live_label(status_row, self.file_status_var, font=self.font_base, text_color=UI_TEXT).pack(side="left", padx=(8, 0))
         ctk.CTkLabel(status_row, text="전체 진행", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left", padx=(20, 0))
@@ -4038,25 +4231,35 @@ class PapaStopApp(ctk.CTk):
             self.stop_record_btn,
         ]
 
-        # Bottom common: 오른쪽 영역 아래 칸에 진행·작업 기록을 둔다.
+        self._build_help_tab()
+
+        # Bottom common: 오른쪽 영역 아래 칸에 실시간 로그를 둔다.
         common = ctk.CTkFrame(
             self._right_panel, fg_color=UI_SURFACE, corner_radius=6, border_width=1, border_color=UI_CARD_BORDER
         )
         common.grid(row=1, column=0, sticky="nsew")
+        self._common_log_panel = common
 
         self.progress_var = tk.DoubleVar(value=0)
         self.status_var = tk.StringVar(value="대기 중")
         self.eta_var = tk.StringVar(value="예상 시간: 대기 중")
+        self.log_header_detail_var = tk.StringVar()
+        self.status_var.trace_add("write", lambda *_: self._sync_log_header())
+        self.eta_var.trace_add("write", lambda *_: self._sync_log_header())
+        self._sync_log_header()
 
-        ctk.CTkLabel(common, text="진행 상황과 작업 기록", font=self.font_section, text_color=UI_TEXT, anchor="w").pack(
-            fill="x", padx=14, pady=(10, 2)
+        log_header = ctk.CTkFrame(common, fg_color="transparent")
+        log_header.pack(fill="x", padx=14, pady=(10, 6))
+        ctk.CTkLabel(log_header, text="실시간 로그", font=self.font_section, text_color=UI_TEXT, anchor="w").pack(
+            side="left"
         )
-        self._live_label(common, self.status_var, font=self.font_base, text_color=UI_TEXT, anchor="w").pack(
-            fill="x", padx=14
-        )
-        self._live_label(common, self.eta_var, font=self.font_base, text_color=UI_TEXT_MUTED, anchor="w").pack(
-            fill="x", padx=14, pady=(0, 6)
-        )
+        self._live_label(
+            log_header,
+            self.log_header_detail_var,
+            font=self.font_base,
+            text_color=UI_TEXT_MUTED,
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True, padx=(6, 0))
         self.progress = ctk.CTkProgressBar(common, height=10, corner_radius=3, fg_color=UI_BORDER)
         self.progress.set(0)
         self.progress.pack(fill="x", padx=14, pady=(0, 8))
@@ -4084,12 +4287,24 @@ class PapaStopApp(ctk.CTk):
         host = self._tab_hosts.get(key)
         if host is None:
             return
+        if hasattr(self, "_common_log_panel"):
+            if key == "help":
+                self._common_log_panel.grid_remove()
+                self._content_panel.grid_configure(rowspan=2, pady=0)
+            else:
+                self._content_panel.grid_configure(rowspan=1, pady=(0, 8))
+                self._common_log_panel.grid(row=1, column=0, sticky="nsew")
         host.tkraise()
         for nav_key, btn in self._nav_buttons.items():
             if nav_key == key:
                 btn.configure(fg_color="#e0e7ff", text_color=UI_ACCENT)
             else:
                 btn.configure(fg_color="transparent", text_color=UI_TEXT)
+
+    def _sync_log_header(self) -> None:
+        status = str(self.status_var.get()).strip() or "대기 중"
+        eta = str(self.eta_var.get()).strip() or "예상 시간: 대기 중"
+        self.log_header_detail_var.set(f"({status}, {eta})")
 
     def _begin_timed_progress(self) -> None:
         self.progress_started_at = time.time()
@@ -5286,6 +5501,11 @@ class PapaStopApp(ctk.CTk):
         self.progress_started_at = None
         self._set_progress(0)
         self._set_eta_status("실시간 작업은 표시하지 않음")
+        source_text = f"인터넷 URL 스트림: {live_url}" if live_source == LIVE_SOURCE_URL else "PC 스피커 소리"
+        srt_text = "사용" if self.live_save_srt_var.get() else "사용 안 함"
+        overlay_text = "표시" if self.show_overlay_var.get() else "숨김"
+        self._emit("log", f"실시간 자막 시작 버튼을 눌렀습니다. 입력: {source_text}")
+        self._emit("log", f"실시간 설정: 음성 인식 {self.live_asr.model_label()} | 번역 {self.live_translator.profile_label()} | SRT 저장 {srt_text} | 자막창 {overlay_text}")
         self._emit("busy_live", True)
         self._emit("live_status", "연결 중 ...")
         self._emit("status", "실시간 자막")
@@ -5315,15 +5535,17 @@ class PapaStopApp(ctk.CTk):
         if not self._is_live_running:
             return
 
+        self._append_log("실시간 자막 중지 버튼을 눌렀습니다.")
         self._emit("live_status", "중지하는 중 ...")
         try:
-            self.live_service.stop()
+            self.live_service.stop(emit=self._emit)
         except Exception as exc:
             self._append_log(f"실시간 자막 중지 오류: {exc}")
         self._emit("busy_live", False)
         self._emit("live_status", "대기 중")
         self._emit("status", "대기 중")
         self._emit("eta_status", "대기 중")
+        self._append_log("실시간 자막 중지가 완료되었습니다.")
 
     def _open_output(self) -> None:
         if self.last_output is None or not self.last_output.exists():

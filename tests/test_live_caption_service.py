@@ -1,4 +1,5 @@
 import queue
+import builtins
 import sys
 import tempfile
 import threading
@@ -54,6 +55,13 @@ class LiveCaptionServiceTests(unittest.TestCase):
 
         previous_soundcard = sys.modules.get("soundcard")
         sys.modules["soundcard"] = soundcard
+        real_import = builtins.__import__
+
+        def recording_import(name, *args, **kwargs):
+            if name == "soundcard":
+                call_order.append("import")
+            return real_import(name, *args, **kwargs)
+
         try:
             service._chunk_queue = queue.Queue(maxsize=8)
             # 실제 silero VAD 로딩을 피하려고 발화가 없다고 답하는 가짜 분할기를 주입한다.
@@ -70,6 +78,7 @@ class LiveCaptionServiceTests(unittest.TestCase):
             with (
                 mock.patch("papastop.os.name", "nt"),
                 mock.patch("papastop.has_module", return_value=True),
+                mock.patch("builtins.__import__", side_effect=recording_import),
                 mock.patch("papastop._initialize_windows_audio_thread", side_effect=initialize_audio_thread),
             ):
                 service._capture_loop(lambda kind, payload: events.append((kind, payload)), stop_event)
@@ -85,10 +94,16 @@ class LiveCaptionServiceTests(unittest.TestCase):
 
         self.assertTrue(recorder.recorded_after_enter)
         self.assertTrue(recorder.exited)
-        self.assertEqual(call_order[0], "init")
+        self.assertEqual(call_order[0], "import")
+        self.assertLess(call_order.index("import"), call_order.index("init"))
         self.assertLess(call_order.index("init"), call_order.index("speaker"))
         self.assertEqual(call_order[-1], "cleanup")
         self.assertNotIn("error", [kind for kind, _ in events])
+        logs = [payload for kind, payload in events if kind == "log"]
+        self.assertIn("PC 스피커 캡처를 준비합니다.", logs)
+        self.assertIn("PC 스피커 캡처를 시작했습니다.", logs)
+        self.assertIn("PC 스피커 캡처 장치를 정리했습니다.", logs)
+        self.assertIn("PC 스피커 캡처 스레드가 종료되었습니다.", logs)
 
 
     def test_stop_prepares_windows_audio_thread_before_closing_recorder(self):
@@ -102,10 +117,16 @@ class LiveCaptionServiceTests(unittest.TestCase):
             return lambda: call_order.append("cleanup")
 
         with mock.patch("papastop._initialize_windows_audio_thread", side_effect=initialize_audio_thread):
-            service.stop(timeout=0)
+            events = []
+            service.stop(timeout=0, emit=lambda kind, payload: events.append((kind, payload)))
 
         self.assertEqual(call_order, ["init", "close", "cleanup"])
         self.assertIsNone(service._loopback_recorder)
+        logs = [payload for kind, payload in events if kind == "log"]
+        self.assertIn("실시간 자막 내부 작업에 중지 신호를 보냈습니다.", logs)
+        self.assertIn("PC 스피커 캡처 장치를 닫는 중입니다.", logs)
+        self.assertIn("PC 스피커 캡처 장치를 닫았습니다.", logs)
+        self.assertIn("실시간 자막 내부 작업 정리가 완료되었습니다.", logs)
 
 
     def test_safe_put_chunk_counts_dropped_chunks(self):
