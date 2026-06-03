@@ -38,6 +38,22 @@ release/
 htmlcov/
 .ipynb_checkpoints/
 
+# 테스트 실행 결과/임시 출력
+out/
+tmp_out/
+tmp/
+temp/
+test-output/
+test_outputs/
+test-results/
+test_results/
+reports/
+coverage.xml
+junit*.xml
+*.junit.xml
+*.tmp
+*.temp
+
 # 가상 환경
 venv/
 .venv/
@@ -47,9 +63,52 @@ env/
 ENV/
 .python-version
 
-# 로그
+# 로그/엔진/모델 실행 로그
 *.log
+*.log.*
+*.out
+*.err
+*.stderr
+*.stdout
+*.jsonl
+*.ndjson
+*.trace
+*.prof
+*.pid
+log/
 logs/
+tmp_logs/
+engine_logs/
+engine-logs/
+model_logs/
+model-logs/
+runs/
+wandb/
+mlruns/
+tensorboard/
+events.out.tfevents*
+ffmpeg*.log
+ctranslate2*.log
+whisper*.log
+faster-whisper*.log
+huggingface*.log
+transformers*.log
+llama*.log
+argostranslate*.log
+
+# 언어 모델/엔진 다운로드 산출물
+models/
+model/
+downloads/
+hf_cache/
+huggingface/
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.bin
 
 # IDE/에디터
 .vscode/

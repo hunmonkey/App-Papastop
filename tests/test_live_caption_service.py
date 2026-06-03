@@ -42,9 +42,10 @@ class LiveCaptionServiceTests(unittest.TestCase):
     def test_pc_speaker_recorder_is_opened_before_recording(self):
         stop_event = threading.Event()
         recorder = FakeRecorder(stop_event)
+        call_order = []
         microphone = types.SimpleNamespace(recorder=lambda samplerate: recorder)
         soundcard = types.SimpleNamespace(
-            default_speaker=lambda: types.SimpleNamespace(name="test speaker"),
+            default_speaker=lambda: call_order.append("speaker") or types.SimpleNamespace(name="test speaker"),
             get_microphone=lambda id, include_loopback: microphone,
         )
 
@@ -62,7 +63,15 @@ class LiveCaptionServiceTests(unittest.TestCase):
                 speech_timestamps_fn=lambda audio, sr: [],
             )
 
-            with mock.patch("papastop.os.name", "nt"), mock.patch("papastop.has_module", return_value=True):
+            def initialize_audio_thread():
+                call_order.append("init")
+                return lambda: call_order.append("cleanup")
+
+            with (
+                mock.patch("papastop.os.name", "nt"),
+                mock.patch("papastop.has_module", return_value=True),
+                mock.patch("papastop._initialize_windows_audio_thread", side_effect=initialize_audio_thread),
+            ):
                 service._capture_loop(lambda kind, payload: events.append((kind, payload)), stop_event)
 
             # 무음만 들어왔으므로 발화 청크는 없고 종료 신호만 큐에 남는다.
@@ -76,7 +85,27 @@ class LiveCaptionServiceTests(unittest.TestCase):
 
         self.assertTrue(recorder.recorded_after_enter)
         self.assertTrue(recorder.exited)
+        self.assertEqual(call_order[0], "init")
+        self.assertLess(call_order.index("init"), call_order.index("speaker"))
+        self.assertEqual(call_order[-1], "cleanup")
         self.assertNotIn("error", [kind for kind, _ in events])
+
+
+    def test_stop_prepares_windows_audio_thread_before_closing_recorder(self):
+        service = LiveCaptionService(asr=object(), translator=object(), sample_rate=10, chunk_seconds=0.1)
+        call_order = []
+        service._stop_event = threading.Event()
+        service._loopback_recorder = types.SimpleNamespace(close=lambda: call_order.append("close"))
+
+        def initialize_audio_thread():
+            call_order.append("init")
+            return lambda: call_order.append("cleanup")
+
+        with mock.patch("papastop._initialize_windows_audio_thread", side_effect=initialize_audio_thread):
+            service.stop(timeout=0)
+
+        self.assertEqual(call_order, ["init", "close", "cleanup"])
+        self.assertIsNone(service._loopback_recorder)
 
 
     def test_safe_put_chunk_counts_dropped_chunks(self):

@@ -201,7 +201,7 @@ TRANSLATION_PROFILE_LABELS = {
     "nllb600": "경량 (NLLB 600M)",
     "balanced": "균형 (NLLB 1.3B)",
     "accurate": "정확도 우선 (NLLB 3.3B)",
-    "live": "실시간 빠름 (NLLB 600M)",
+    "live": "빠름 (NLLB 600M)",
 }
 TRANSLATION_PROFILE_ORDER_STEPS = {
     "auto": (("nllb", NLLB_FAST_MODEL), ("argos", None)),
@@ -246,8 +246,8 @@ UI_BG = "#e6eaf2"            # 앱 전체 배경 (카드와 대비를 위해 약
 UI_SURFACE = "#ffffff"       # 입력/목록/로그 등 콘텐츠 표면
 UI_SURFACE_HOVER = "#eef2ff"  # 버튼 호버 등 옅은 강조 배경
 UI_BORDER = "#d6dbe6"        # 옅은 경계선
-UI_BORDER_STRONG = "#b9c1d1"  # 카드/입력 테두리 (또렷하게)
-UI_CARD_BORDER = "#c4ccda"   # 카드 구분용 테두리
+UI_BORDER_STRONG = "#9aa6ba"  # 카드/입력 테두리 (버튼 옆에서도 또렷하게)
+UI_CARD_BORDER = "#b0bac9"   # 카드 구분용 테두리
 UI_TEXT = "#0f172a"          # 본문 텍스트
 UI_TEXT_MUTED = "#64748b"    # 보조 텍스트
 UI_ACCENT = "#6366f1"        # 옅은 인디고 강조색 (자극적이지 않게)
@@ -318,6 +318,54 @@ def windows_creation_flags() -> int:
     if os.name != "nt":
         return 0
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _initialize_windows_audio_thread() -> Callable[[], None]:
+    """Windows audio APIs need COM prepared separately in each worker thread."""
+    if os.name != "nt":
+        return lambda: None
+
+    try:
+        import ctypes
+
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitializeEx.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
+        ole32.CoInitializeEx.restype = ctypes.c_long
+        ole32.CoUninitialize.argtypes = ()
+        ole32.CoUninitialize.restype = None
+
+        # COINIT_MULTITHREADED is appropriate for these background capture threads.
+        hr = int(ole32.CoInitializeEx(None, 0))
+    except AttributeError:
+        return lambda: None
+    except Exception as exc:
+        raise RuntimeError(f"윈도우 소리 장치 준비 실패: {exc}") from exc
+
+    normalized_hr = hr & 0xFFFFFFFF
+    if normalized_hr in (0x00000000, 0x00000001):  # S_OK, S_FALSE
+        return ole32.CoUninitialize
+    if normalized_hr == 0x80010106:  # RPC_E_CHANGED_MODE: already initialized differently.
+        return lambda: None
+    if normalized_hr & 0x80000000:
+        raise RuntimeError(f"윈도우 소리 장치 준비 실패: HRESULT 0x{normalized_hr:08x}")
+    return lambda: None
+
+
+def _close_windows_audio_recorder(recorder: object) -> None:
+    release_audio_thread: Callable[[], None] = lambda: None
+    try:
+        release_audio_thread = _initialize_windows_audio_thread()
+    except Exception:
+        pass
+    try:
+        close = getattr(recorder, "close", None)
+        if close is not None:
+            close()
+    finally:
+        try:
+            release_audio_thread()
+        except Exception:
+            pass
 
 
 def run_command(command: list[str], on_line: Callable[[str], None] | None = None, cwd: Path | None = None) -> None:
@@ -2377,9 +2425,9 @@ class LiveCaptionService:
             dummy = np.zeros(int(self.sample_rate * 1.0), dtype=np.float32)
             self.asr.transcribe(dummy, vad_filter=False, beam_size=LIVE_BEAM_SIZE)
             self.translator.translate_texts(["warm up"], "en")
-            emit("log", "실시간 엔진 준비 운동 완료.")
+            emit("log", "실시간 자막 준비가 완료되었습니다.")
         except Exception as exc:
-            emit("log", f"준비 운동 경고: {exc}")
+            emit("log", f"실시간 자막 준비 중 경고: {exc}")
 
     def stop(self, timeout: float = 2.0) -> None:
         if self._stop_event is not None:
@@ -2403,7 +2451,7 @@ class LiveCaptionService:
         if loopback_recorder is not None:
             self._loopback_recorder = None
             try:
-                loopback_recorder.close()
+                _close_windows_audio_recorder(loopback_recorder)
             except Exception:
                 pass
 
@@ -2467,9 +2515,11 @@ class LiveCaptionService:
 
         import warnings
 
-        import soundcard as sc
-
+        release_audio_thread: Callable[[], None] = lambda: None
         try:
+            release_audio_thread = _initialize_windows_audio_thread()
+            import soundcard as sc
+
             speaker = sc.default_speaker()
             if speaker is None:
                 raise RuntimeError("기본 스피커를 찾지 못했습니다.")
@@ -2511,6 +2561,10 @@ class LiveCaptionService:
                 except Exception:
                     pass
             self._safe_put_chunk((None, None))
+            try:
+                release_audio_thread()
+            except Exception:
+                pass
 
     def _capture_from_url(
         self,
@@ -2846,14 +2900,16 @@ class ScreenRecorderService:
     ) -> None:
         import warnings
 
-        import soundcard as sc
-
         if self._audio_path is None:
             return
 
         wav_file: wave.Wave_write | None = None
         expected_channels: int | None = None
+        release_audio_thread: Callable[[], None] = lambda: None
         try:
+            release_audio_thread = _initialize_windows_audio_thread()
+            import soundcard as sc
+
             speaker = sc.default_speaker()
             if speaker is None:
                 raise RuntimeError("기본 스피커를 찾지 못했습니다.")
@@ -2894,6 +2950,10 @@ class ScreenRecorderService:
         finally:
             if wav_file is not None:
                 wav_file.close()
+            try:
+                release_audio_thread()
+            except Exception:
+                pass
 
     def _monitor_recording(self, emit: Callable[[str, object], None]) -> None:
         try:
@@ -3144,8 +3204,8 @@ class LiveSubtitleOverlay(tk.Toplevel):
 class PapaStopApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        # 제목 표시줄(최상단)의 프로그램명은 비우고, 로고는 사이드바로 옮긴다.
-        self.title("")
+        # 제목 표시줄에 프로그램명을 표시하고, 사이드바에는 탭 메뉴만 둔다.
+        self.title(APP_NAME)
         self._configure_main_window()
         self._apply_theme()
         self.configure(fg_color=UI_BG)
@@ -3326,7 +3386,7 @@ class PapaStopApp(ctk.CTk):
         self._label_w = 130
         self._sec_btn_h = 34
 
-        # ── 왼쪽 세로 사이드바: 앱 이름 + 탭 버튼 4개 ───────────────
+        # ── 왼쪽 세로 사이드바: 탭 버튼 4개 ───────────────────────
         sidebar = ctk.CTkFrame(
             root, fg_color=UI_SURFACE, corner_radius=6, border_width=1,
             border_color=UI_CARD_BORDER, width=156,
@@ -3334,21 +3394,6 @@ class PapaStopApp(ctk.CTk):
         sidebar.grid(row=0, column=0, sticky="nsew", padx=(14, 7), pady=14)
         sidebar.grid_propagate(False)
         sidebar.pack_propagate(False)
-
-        # 사이드바 상단: 로고(둥근 사각형 + 'P') + 프로그램명. 별도 이미지 파일 없이 위젯으로 구성한다.
-        header = ctk.CTkFrame(sidebar, fg_color="transparent")
-        header.pack(fill="x", padx=14, pady=(16, 10))
-
-        logo = ctk.CTkFrame(header, width=28, height=28, corner_radius=7, fg_color=UI_ACCENT)
-        logo.pack(side="left")
-        logo.pack_propagate(False)
-        ctk.CTkLabel(
-            logo, text="P", font=ctk.CTkFont(size=16, weight="bold"), text_color="#ffffff"
-        ).pack(expand=True)
-
-        ctk.CTkLabel(
-            header, text=APP_NAME, font=self.font_section, text_color=UI_ACCENT, anchor="w"
-        ).pack(side="left", padx=(8, 0))
 
         # ── 오른쪽 영역: 위(탭 콘텐츠) + 아래(진행·작업 기록) ────────
         right = ctk.CTkFrame(root, fg_color="transparent")
@@ -3402,7 +3447,7 @@ class PapaStopApp(ctk.CTk):
                 text_color=UI_TEXT,
                 font=self.font_base,
             )
-            btn.pack(fill="x", padx=10, pady=2)
+            btn.pack(fill="x", padx=10, pady=(16 if not self._nav_buttons else 2, 2))
             self._nav_buttons[key] = btn
 
         # 공통 로그/진행 영역(아래)을 같은 오른쪽 그리드에 붙이기 위해 보관한다.
@@ -4581,7 +4626,7 @@ class PapaStopApp(ctk.CTk):
             return
 
         self._apply_resource_mode_from_selection()
-        self._append_log(f"자원 사용 방식을 바꿨습니다: {self.asr.resource_summary()}")
+        self._append_log(f"자원 사용 방식을 설정했습니다: {self.asr.resource_summary()}")
 
     @staticmethod
     def _strip_status_prefix(label: str) -> str:
@@ -4612,7 +4657,7 @@ class PapaStopApp(ctk.CTk):
         model_name = self._whisper_model_from_selection()
         self.asr.set_model(model_name)
         self._refresh_model_status()
-        self._append_log(f"음성 인식 모델을 바꿨습니다: {self.asr.model_label(model_name)}")
+        self._append_log(f"음성 인식 모델을 설정했습니다: {self.asr.model_label(model_name)}")
 
     def _live_whisper_model_from_selection(self) -> str:
         return self._whisper_model_id_from_label(self.live_whisper_model_var.get())
@@ -4625,7 +4670,7 @@ class PapaStopApp(ctk.CTk):
         model_name = self._live_whisper_model_from_selection()
         self.live_asr.set_model(model_name)
         self._refresh_model_status()
-        self._append_log(f"실시간 음성 인식 모델을 바꿨습니다: {self.live_asr.model_label(model_name)}")
+        self._append_log(f"실시간 음성 인식 모델을 설정했습니다: {self.live_asr.model_label(model_name)}")
 
     def _live_translation_profile_from_selection(self) -> str:
         label = self._strip_status_prefix(self.live_translation_var.get())
@@ -4645,7 +4690,8 @@ class PapaStopApp(ctk.CTk):
         self.live_translator.set_profile(profile)
         self._update_live_secondary_state()
         self._refresh_model_status()
-        self._append_log(f"실시간 번역 모델을 바꿨습니다: {self.live_translator.profile_label(profile)}")
+        label = LIVE_TRANSLATION_LABELS.get(profile, self.live_translator.profile_label(profile))
+        self._append_log(f"실시간 번역 모델을 설정했습니다: {label}")
 
     def _update_live_secondary_state(self) -> None:
         # OPUS-MT를 골랐을 때만 2차 번역 체크박스·드롭다운을 활성화한다.
@@ -4722,7 +4768,7 @@ class PapaStopApp(ctk.CTk):
     def _on_live_secondary_selected(self, _event: object | None = None) -> None:
         key = self._live_secondary_from_selection()
         self.live_translator.set_opus_secondary(key)
-        self._append_log(f"OPUS 2차 번역기를 바꿨습니다: {LIVE_SECONDARY_LABELS.get(key, key)}")
+        self._append_log(f"OPUS 2차 번역기를 설정했습니다: {LIVE_SECONDARY_LABELS.get(key, key)}")
 
     def _on_live_secondary_toggled(self) -> None:
         enabled = self.live_use_secondary_var.get()
@@ -4799,7 +4845,7 @@ class PapaStopApp(ctk.CTk):
         profile = self._translation_profile_from_selection()
         self.translator.set_profile(profile)
         self._refresh_model_status()
-        self._append_log(f"번역 방식을 바꿨습니다: {self.translator.profile_label()}")
+        self._append_log(f"번역 방식을 설정했습니다: {self.translator.profile_label()}")
 
     def _prepare_translation_model(self) -> None:
         if self._is_file_running or self._is_live_running or self._is_record_running:

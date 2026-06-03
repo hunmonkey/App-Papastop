@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 
 from papastop import (
-    build_lossless_screen_capture_command,
+    build_screen_capture_command,
     default_recording_path,
     float_audio_to_pcm16_bytes,
 )
@@ -13,7 +13,7 @@ from papastop import (
 class ScreenRecordingTests(unittest.TestCase):
     def test_lossless_screen_capture_command_uses_gdigrab_and_ffv1(self):
         output = Path("capture.mkv")
-        command = build_lossless_screen_capture_command("ffmpeg", output, 30)
+        command = build_screen_capture_command("ffmpeg", output, 30)
 
         self.assertIn("gdigrab", command)
         self.assertIn("desktop", command)
