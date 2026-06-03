@@ -18,7 +18,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 build/
+build_min/
 dist/
+dist_min/
 release/
 *.spec
 .pytest_cache/

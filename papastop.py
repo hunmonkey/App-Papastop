@@ -1052,6 +1052,107 @@ def hf_file_cached(repo_id: str, filename: str) -> bool:
         return False
 
 
+# 모델 다운로드 진행률을 GUI로 흘려보내기 위한 전역 후크.
+# faster-whisper·transformers·llama_cpp는 모두 huggingface_hub로 모델을 내려받고,
+# huggingface_hub는 내부에서 tqdm 진행바를 쓴다. 그 tqdm을 가로채 진행/속도/남은시간을 전달한다.
+_download_progress_callback: "Callable[[dict], None] | None" = None
+_hf_tqdm_hooked = False
+_last_download_emit = 0.0
+
+
+def set_download_progress_callback(callback: "Callable[[dict], None] | None") -> None:
+    global _download_progress_callback
+    _download_progress_callback = callback
+
+
+def _report_tqdm_progress(bar: object, closing: bool = False) -> None:
+    global _last_download_emit
+    callback = _download_progress_callback
+    if callback is None:
+        return
+    fmt = getattr(bar, "format_dict", None) or {}
+    total = fmt.get("total")
+    unit = getattr(bar, "unit", "") or ""
+    # 바이트 단위 다운로드만 진행률로 표시한다("Fetching N files" 같은 개수 카운터는 무시).
+    if not total or "B" not in unit:
+        return
+    now = time.monotonic()
+    # 이벤트 큐 폭주를 막기 위해 0.15초 간격으로만 보낸다(완료 시점은 항상 전달).
+    if not closing and (now - _last_download_emit) < 0.15:
+        return
+    _last_download_emit = now
+    n = fmt.get("n", 0)
+    rate = fmt.get("rate")
+    percent = min(100.0, n / total * 100.0) if total else 0.0
+    eta_seconds = ((total - n) / rate) if (rate and rate > 0) else None
+    try:
+        callback(
+            {
+                "desc": getattr(bar, "desc", "") or "",
+                "percent": percent,
+                "n": n,
+                "total": total,
+                "eta_seconds": eta_seconds,
+                "closing": closing,
+            }
+        )
+    except Exception:
+        pass
+
+
+def _has_real_std_stream() -> bool:
+    for stream in (sys.stderr, sys.stdout):
+        if stream is not None and hasattr(stream, "write"):
+            return True
+    return False
+
+
+def install_hf_download_hook() -> None:
+    """huggingface_hub가 쓰는 tqdm의 init/update/close를 한 번만 감싸 진행 콜백을 붙인다."""
+    global _hf_tqdm_hooked
+    if _hf_tqdm_hooked:
+        return
+    try:
+        from huggingface_hub.utils import tqdm as HfTqdm
+    except Exception:
+        return
+
+    # 진행바가 꺼져 있으면 tqdm이 n을 갱신하지 않아 진행률을 받을 수 없으므로 켠다(표시는 GUI로 한다).
+    try:
+        from huggingface_hub.utils import enable_progress_bars
+
+        enable_progress_bars()
+    except Exception:
+        pass
+
+    orig_init = HfTqdm.__init__
+    orig_update = HfTqdm.update
+    orig_close = HfTqdm.close
+
+    def init(self, *args, **kwargs):
+        # windowed(EXE)에서는 표준 출력 스트림이 없어 tqdm 출력이 예외를 던질 수 있다.
+        # 진행은 GUI로 보여주므로, 스트림이 없을 때만 안전한 더미 버퍼로 출력을 돌린다.
+        if kwargs.get("file") is None and not _has_real_std_stream():
+            import io
+
+            kwargs["file"] = io.StringIO()
+        orig_init(self, *args, **kwargs)
+
+    def update(self, n=1):
+        result = orig_update(self, n)
+        _report_tqdm_progress(self)
+        return result
+
+    def close(self):
+        _report_tqdm_progress(self, closing=True)
+        return orig_close(self)
+
+    HfTqdm.__init__ = init
+    HfTqdm.update = update
+    HfTqdm.close = close
+    _hf_tqdm_hooked = True
+
+
 def format_hms(seconds: float) -> str:
     total = int(max(0, seconds))
     hours, remainder = divmod(total, 3600)
@@ -3043,12 +3144,17 @@ class LiveSubtitleOverlay(tk.Toplevel):
 class PapaStopApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title(APP_NAME)
+        # 제목 표시줄(최상단)의 프로그램명은 비우고, 로고는 사이드바로 옮긴다.
+        self.title("")
         self._configure_main_window()
         self._apply_theme()
         self.configure(fg_color=UI_BG)
 
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+
+        # 모델 다운로드(huggingface_hub) 진행률을 GUI 공통 진행 영역에 실시간 표시한다.
+        install_hf_download_hook()
+        set_download_progress_callback(lambda data: self._emit("download_progress", data))
 
         self.asr = ASREngine()
         # 실시간은 속도(tiny), 파일은 정확도(base 이상)로 모델을 따로 쓰도록 엔진을 분리한다.
@@ -3229,9 +3335,20 @@ class PapaStopApp(ctk.CTk):
         sidebar.grid_propagate(False)
         sidebar.pack_propagate(False)
 
+        # 사이드바 상단: 로고(둥근 사각형 + 'P') + 프로그램명. 별도 이미지 파일 없이 위젯으로 구성한다.
+        header = ctk.CTkFrame(sidebar, fg_color="transparent")
+        header.pack(fill="x", padx=14, pady=(16, 10))
+
+        logo = ctk.CTkFrame(header, width=28, height=28, corner_radius=7, fg_color=UI_ACCENT)
+        logo.pack(side="left")
+        logo.pack_propagate(False)
         ctk.CTkLabel(
-            sidebar, text=APP_NAME, font=self.font_section, text_color=UI_ACCENT, anchor="w"
-        ).pack(fill="x", padx=14, pady=(16, 10))
+            logo, text="P", font=ctk.CTkFont(size=16, weight="bold"), text_color="#ffffff"
+        ).pack(expand=True)
+
+        ctk.CTkLabel(
+            header, text=APP_NAME, font=self.font_section, text_color=UI_ACCENT, anchor="w"
+        ).pack(side="left", padx=(8, 0))
 
         # ── 오른쪽 영역: 위(탭 콘텐츠) + 아래(진행·작업 기록) ────────
         right = ctk.CTkFrame(root, fg_color="transparent")
@@ -3911,6 +4028,7 @@ class PapaStopApp(ctk.CTk):
             font=self.font_base,
         )
         self.log_text.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+        self._configure_log_indent()
         self.log_text.configure(state="disabled")
 
         self._append_log("앱을 시작했습니다.")
@@ -3944,14 +4062,54 @@ class PapaStopApp(ctk.CTk):
     def _set_eta_status(self, text: str) -> None:
         self.eta_var.set(f"예상 시간: {text}")
 
+    def _handle_download_progress(self, data: object) -> None:
+        if not isinstance(data, dict):
+            return
+        percent = float(data.get("percent") or 0.0)
+        desc = str(data.get("desc") or "").strip()
+        total = data.get("total")
+        n = data.get("n") or 0
+        eta_seconds = data.get("eta_seconds")
+
+        label = desc if desc else "모델 파일"
+        if len(label) > 40:
+            label = "…" + label[-39:]
+
+        size_text = ""
+        if total:
+            size_text = f" ({format_file_size(int(n))}/{format_file_size(int(total))})"
+        self.status_var.set(f"모델 다운로드 중: {label} {percent:.0f}%{size_text}")
+        self._set_progress(percent)
+
+        if percent < 3:
+            self.eta_var.set("예상 시간: 계산 중")
+        elif eta_seconds is not None:
+            finish = time.strftime("%H:%M", time.localtime(time.time() + eta_seconds))
+            self.eta_var.set(
+                f"예상 시간: 약 {format_duration_short(eta_seconds)} 남음 · 완료 예상 {finish}"
+            )
+
     def _refresh_resource_plan_label(self) -> None:
         self.resource_plan_var.set(build_resource_settings(self._resource_mode_from_selection()).summary)
+
+    def _configure_log_indent(self) -> None:
+        # 로그가 길어 자동 줄바꿈될 때, 둘째 줄부터 시각("HH:MM:SS - ") 폭만큼 들여써
+        # 시각 컬럼을 침범하지 않게 한다(hanging indent).
+        try:
+            import tkinter.font as tkfont
+
+            textbox = self.log_text._textbox
+            font = tkfont.Font(font=textbox.cget("font"))
+            self._log_indent_px = font.measure("00:00:00 - ")
+            textbox.tag_configure("logline", lmargin2=self._log_indent_px)
+        except Exception:
+            pass
 
     def _append_log(self, msg: object) -> None:
         if self.log_text is None:
             return
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", f"{time.strftime('%H:%M:%S')} {msg}\n")
+        self.log_text.insert("end", f"{time.strftime('%H:%M:%S')} - {msg}\n", "logline")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
@@ -4016,6 +4174,8 @@ class PapaStopApp(ctk.CTk):
                 progress = float(payload)
                 self._set_progress(progress)
                 self._update_eta(progress)
+            elif kind == "download_progress":
+                self._handle_download_progress(payload)
             elif kind == "eta_status":
                 self.progress_started_at = None
                 self._set_eta_status(str(payload))
@@ -4388,7 +4548,8 @@ class PapaStopApp(ctk.CTk):
             "번역 방식: 파일 " + self.translator.profile_label() + " / 실시간 " + self.live_translator.profile_label()
         )
         tools.append("자원 사용: " + build_resource_settings(self._resource_mode_from_selection()).summary)
-        self._append_log(" | ".join(tools))
+        for line in tools:
+            self._append_log(line)
 
     def _resource_mode_id_from_label(self, label: str) -> str:
         for key, value in RESOURCE_MODE_LABELS.items():

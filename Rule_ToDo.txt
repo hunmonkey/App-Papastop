@@ -47,3 +47,58 @@ PapaStop: 영상·음성을 자막(SRT)으로 만들고 번역하는 Windows 데
 ------------------------------------------------------------
 ■ 작업 진행 계획
 ------------------------------------------------------------
+
+[완료] 1. 용량 최소화(minimum) 배포 빌드 추가  (2026-06-03 18:10:00)
+  어디: build_package_min.ps1(신규), build_package_min.bat(신규), .gitignore
+  무엇/어떻게:
+   · 기존 build_package.ps1을 기반으로 "모델 미동봉" 빌드 스크립트 신설.
+   · EXE와 엔진(라이브러리)은 그대로 포함하되, 모델(Whisper huggingface 약 37GB,
+     NLLB CT2 600M/1.3B/3.3B 약 8GB) 복사 단계를 제거 → 첫 사용 시 사용 PC가 자동 다운로드.
+   · CUDA 라이브러리(nvidia, 약 1.9GB)는 모델이 아니고 GPU 가속에 필요하므로 그대로 동봉.
+   · 일반 빌드(dist\PapaStop)와 섞이지 않게 --distpath dist_min, --workpath build_min 사용.
+   · dist_min\PapaStop\README_MINIMUM.txt 안내 파일 자동 생성(첫 실행 시 모델 자동 다운로드 안내).
+   · .gitignore에 build_min/, dist_min/ 추가.
+   · papastop.py는 변경 없음: 모델 부재 시 자동 다운로드가 이미 구현됨
+     (Whisper download_root, NLLB는 CT2 없으면 transformers pipeline 폴백).
+  검증: build_package_min.ps1 PowerShell 파서 통과 확인. 실제 EXE 빌드는 미실행(수십 분 소요, 황재훈 님이 직접 실행).
+  효과(추정): 동봉 용량 약 49GB → 약 4GB.
+
+[완료] 2. 모델 다운로드 진행률·예상시간 GUI 실시간 표시  (2026-06-03 18:40:00)
+  어디: papastop.py
+  무엇/어떻게:
+   · faster-whisper·transformers·llama_cpp는 모두 huggingface_hub로 모델을 내려받으므로,
+     huggingface_hub의 tqdm(클래스: huggingface_hub.utils.tqdm)의 __init__/update/close를 한 번만 감싸는 후크 추가.
+   · 신규 모듈 함수: set_download_progress_callback, _report_tqdm_progress, _has_real_std_stream,
+     install_hf_download_hook (hf_file_cached 아래에 배치). 바이트 단위(unit='B') 다운로드만 진행률로 처리.
+   · App.__init__: event_queue 생성 직후 install_hf_download_hook() 호출 +
+     set_download_progress_callback(lambda d: self._emit("download_progress", d)) 연결.
+   · _process_events: "download_progress" 분기 추가 → _handle_download_progress(payload).
+   · _handle_download_progress(신규): 공통 진행 영역(status_var/progress/eta_var)에
+     "모델 다운로드 중: {파일} {%} (받은용량/전체용량)" + "예상 시간: 약 N 남음 · 완료 예상 HH:MM" 표시.
+   · 0.15초 throttle로 이벤트 큐 폭주 방지. enable_progress_bars()로 진행바 강제 활성화(꺼져 있으면 n 미갱신).
+   · windowed(EXE) 환경에서 표준 스트림(sys.stderr/stdout)이 없을 때 tqdm 출력을 io.StringIO 더미로 돌려 예외 방지.
+  검증: py_compile 통과. 후크 단위 테스트로 바이트 tqdm은 50/100% 이벤트 발생, 개수(unit='it') tqdm은 무시 확인.
+        sys.stderr/stdout=None(windowed 흉내)에서도 예외 없이 진행률 수신 확인.
+
+[완료] 3. 작업 기록(로그) 가독성 개선: "시각 - 내용" + 줄바꿈 시 시각 컬럼 보존  (2026-06-03 19:05:00)
+  어디: papastop.py
+  무엇/어떻게:
+   · _append_log: 출력 형식을 "HH:MM:SS {내용}" → "HH:MM:SS - {내용}"으로 변경하고 "logline" 태그로 삽입.
+   · _configure_log_indent(신규): CTkTextbox 내부 tkinter.Text(_textbox)에 lmargin2=시각폭(약 58px) 태그 설정.
+     → 한 줄이 길어 자동 줄바꿈되면 둘째 줄부터 시각("HH:MM:SS - ") 폭만큼 들여써 시각 컬럼을 침범하지 않음(hanging indent).
+   · _build_ui: log_text 생성 직후 _configure_log_indent() 호출.
+   · _refresh_status: 8개 항목을 " | "로 한 줄에 합치던 것을 항목별로 개별 _append_log 호출(각 줄마다 시각 표시).
+  검증: py_compile 통과. customtkinter CTkTextbox 스모크 테스트로 insert(tags=) 지원, _textbox=tkinter.Text,
+        font.measure("00:00:00 - ")=58px, tag lmargin2=58 적용 확인.
+
+[완료] 4. 제목표시줄 프로그램명 제거 + 사이드바 로고 추가  (2026-06-03 19:30:00)
+  어디: papastop.py
+  무엇/어떻게:
+   · PapaStopApp.__init__: self.title(APP_NAME) → self.title("") 로 창 제목표시줄의 'PapaStop' 글자 제거.
+   · _build_ui 사이드바: 기존 단일 CTkLabel(APP_NAME)을 header 프레임으로 교체.
+     - 로고: CTkFrame(28x28, corner_radius=7, fg_color=UI_ACCENT) 안에 흰색 'P' 라벨(CTkFont size16 bold).
+     - 그 오른쪽에 기존 'PapaStop' 텍스트 라벨(UI_ACCENT, font_section) 배치(side="left", padx=(8,0)).
+   · Pillow(PIL) 미설치 확인 → 이미지 파일/새 의존성 없이 customtkinter 위젯만으로 로고 구성(배포 영향 없음).
+  검증: py_compile 통과. CTk 스모크 테스트로 title('')='' 확인, 사이드바 header에 로고(28x28)+텍스트 정상 렌더 확인.
+  미해결(보고): 제목표시줄 '왼쪽 기본 아이콘'은 OS/Tk가 그리는 것이라 self.title("")만으로는 남을 수 있음.
+              완전 제거를 원하면 빈/투명 .ico를 iconbitmap으로 적용하는 후속 작업 필요(현재는 미적용).
