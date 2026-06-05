@@ -3675,6 +3675,55 @@ class PapaStopApp(ctk.CTk):
         menu.pack(fill="both", expand=True, padx=1, pady=1)
         return holder, menu
 
+    def _make_form_frame(self, parent):
+        """탭마다 입력 줄의 시작 위치가 같도록 쓰는 공통 폼 프레임."""
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        frame.grid_columnconfigure(0, minsize=self._label_w)
+        frame.grid_columnconfigure(1, weight=1)
+        return frame
+
+    def _form_label(self, parent, text: str, *, width: int | None = None, **kwargs):
+        label_width = self._label_w if width is None else width
+        return ctk.CTkLabel(
+            parent,
+            text=text,
+            width=label_width,
+            font=self.font_base,
+            text_color=UI_TEXT_MUTED,
+            anchor="w",
+            **kwargs,
+        )
+
+    def _hint_label(self, parent, text: str, *, wraplength: int = 360, **kwargs):
+        return ctk.CTkLabel(
+            parent,
+            text=text,
+            font=self.font_base,
+            text_color=UI_TEXT_MUTED,
+            justify="left",
+            anchor="w",
+            wraplength=wraplength,
+            **kwargs,
+        )
+
+    def _make_status_row(self, parent, items: list[tuple[str, tk.StringVar]]):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        for index, (label, variable) in enumerate(items):
+            ctk.CTkLabel(
+                row,
+                text=label,
+                font=self.font_base,
+                text_color=UI_TEXT_MUTED,
+            ).pack(side="left", padx=((20, 0) if index else (0, 0)))
+            self._live_label(
+                row,
+                variable,
+                font=self.font_base,
+                text_color=UI_TEXT,
+                anchor="w",
+            ).pack(side="left", padx=(8, 0))
+        return row
+
     def _build_help_tab(self) -> None:
         help_scroll = ctk.CTkScrollableFrame(
             self.help_tab,
@@ -3876,9 +3925,18 @@ class PapaStopApp(ctk.CTk):
         sidebar.pack_propagate(False)
 
         # 사이드바 상단 브랜드 줄 + 얇은 구분선 (탭 목록과 시각적으로 분리)
+        sidebar_header = ctk.CTkFrame(sidebar, fg_color="transparent")
+        sidebar_header.pack(fill="x", padx=14, pady=(14, 8))
+        logo = ctk.CTkFrame(sidebar_header, width=28, height=28, corner_radius=7, fg_color=UI_ACCENT)
+        logo.pack(side="left")
+        logo.pack_propagate(False)
         ctk.CTkLabel(
-            sidebar, text=APP_NAME, font=self.font_section, text_color=UI_ACCENT, anchor="w"
-        ).pack(fill="x", padx=14, pady=(16, 8))
+            logo, text="P", font=ctk.CTkFont(family=fam, size=16, weight="bold"),
+            text_color=UI_SURFACE,
+        ).pack(fill="both", expand=True)
+        ctk.CTkLabel(
+            sidebar_header, text=APP_NAME, font=self.font_section, text_color=UI_ACCENT, anchor="w"
+        ).pack(side="left", fill="x", expand=True, padx=(8, 0))
         ctk.CTkFrame(sidebar, height=1, fg_color=UI_BORDER).pack(fill="x", padx=12, pady=(0, 8))
 
         # ── 오른쪽 영역: 위(탭 콘텐츠) + 아래(실시간 로그) ────────
@@ -3952,58 +4010,55 @@ class PapaStopApp(ctk.CTk):
 
         system_card, system_body = self._make_card(self.system_tab, "현재 PC 사양")
         system_card.pack(fill="x", pady=(2, 10))
+        system_form = self._make_form_frame(system_body)
+        system_form.pack(fill="x")
+        system_form.grid_columnconfigure(2, weight=1)
 
-        def add_system_row(label: str, variable: tk.StringVar) -> None:
-            row = ctk.CTkFrame(system_body, fg_color="transparent")
-            row.pack(fill="x", pady=4)
-            ctk.CTkLabel(
-                row, text=label, width=80, anchor="w", text_color=UI_TEXT_MUTED, font=self.font_base
-            ).pack(side="left", anchor="n")
+        def add_system_row(row_index: int, label: str, variable: tk.StringVar) -> None:
+            self._form_label(system_form, label).grid(row=row_index, column=0, sticky="nw", pady=4)
             self._live_label(
-                row,
+                system_form,
                 variable,
                 font=self.font_base,
                 justify="left",
                 anchor="w",
                 wraplength=620,
                 text_color=UI_TEXT,
-            ).pack(side="left", fill="x", expand=True)
+            ).grid(row=row_index, column=1, columnspan=2, sticky="ew", padx=10, pady=4)
 
-        add_system_row("CPU", self.system_cpu_var)
-        add_system_row("RAM", self.system_ram_var)
-        add_system_row("VGA", self.system_vga_var)
+        add_system_row(0, "CPU", self.system_cpu_var)
+        add_system_row(1, "RAM", self.system_ram_var)
+        add_system_row(2, "VGA", self.system_vga_var)
 
-        resource_row = ctk.CTkFrame(system_body, fg_color="transparent")
-        resource_row.pack(fill="x", pady=4)
-        ctk.CTkLabel(
-            resource_row, text="자원 사용", width=80, anchor="w", text_color=UI_TEXT_MUTED, font=self.font_base
-        ).pack(side="left", anchor="n")
+        self._form_label(system_form, "자원 사용").grid(row=3, column=0, sticky="nw", pady=4)
         resource_mode_holder, self.resource_mode_combo = self._make_option_menu(
-            resource_row,
+            system_form,
             variable=self.resource_mode_var,
             values=[RESOURCE_MODE_LABELS[key] for key in RESOURCE_MODE_ORDER],
             command=self._on_resource_mode_selected,
             width=280,
         )
-        resource_mode_holder.pack(side="left", padx=(0, 10))
+        resource_mode_holder.grid(row=3, column=1, sticky="w", padx=10, pady=4)
         self._live_label(
-            resource_row,
+            system_form,
             self.resource_plan_var,
             font=self.font_base,
             justify="left",
             anchor="w",
             wraplength=520,
             text_color=UI_TEXT_MUTED,
-        ).pack(side="left", fill="x", expand=True)
+        ).grid(row=3, column=2, sticky="ew", padx=(0, 10), pady=4)
 
+        system_action_row = ctk.CTkFrame(self.system_tab, fg_color="transparent")
+        system_action_row.pack(fill="x", pady=6)
         ctk.CTkButton(
-            self.system_tab,
+            system_action_row,
             text="사양 새로고침",
             command=self._refresh_system_specs,
             width=120,
             height=34,
             **self._ghost_btn,
-        ).pack(anchor="w", pady=6)
+        ).pack(side="left")
 
         # File tab
         self.file_path_var = tk.StringVar()
@@ -4026,7 +4081,7 @@ class PapaStopApp(ctk.CTk):
         self.record_region_info_var = tk.StringVar(value="(영역 미지정)")
 
         def row_label(parent, text, **kw):
-            return ctk.CTkLabel(parent, text=text, font=self.font_base, text_color=UI_TEXT, **kw)
+            return self._form_label(parent, text, **kw)
 
         # 음성 인식 / 번역 콤보를 같은 폭으로 두어야 뒤따르는 다운로드 버튼 열이 맞는다.
         MODEL_COMBO_W = 250
@@ -4134,11 +4189,10 @@ class PapaStopApp(ctk.CTk):
             **self._ghost_btn,
         )
         self.prepare_translation_btn.grid(row=1, column=2, sticky="w", pady=6)
-        ctk.CTkLabel(
+        self._hint_label(
             model_form,
             text="고품질 LLM은 GPU·VRAM 사용 / 첫 선택 시 수 GB 다운로드",
-            font=self.font_base,
-            text_color=UI_TEXT_MUTED,
+            wraplength=460,
         ).grid(row=2, column=1, columnspan=4, sticky="w", padx=(10, 0), pady=(0, 6))
 
         file_status_row, self.file_asr_status_lbl, self.file_trans_status_lbl = self._make_model_status_row(self.file_tab)
@@ -4204,12 +4258,11 @@ class PapaStopApp(ctk.CTk):
             self.prepare_translation_btn,
         ]
 
-        status_row = ctk.CTkFrame(self.file_tab, fg_color="transparent")
+        status_row = self._make_status_row(
+            self.file_tab,
+            [("파일 상태", self.file_status_var), ("전체 진행", self.batch_status_var)],
+        )
         status_row.pack(fill="x", pady=(4, 4))
-        ctk.CTkLabel(status_row, text="파일 상태", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left")
-        self._live_label(status_row, self.file_status_var, font=self.font_base, text_color=UI_TEXT).pack(side="left", padx=(8, 0))
-        ctk.CTkLabel(status_row, text="전체 진행", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left", padx=(20, 0))
-        self._live_label(status_row, self.batch_status_var, font=self.font_base, text_color=UI_TEXT).pack(side="left", padx=(8, 0))
 
         self._refresh_file_queue()
 
@@ -4226,86 +4279,73 @@ class PapaStopApp(ctk.CTk):
         source_card, source_body = self._make_card(self.live_tab, "실시간 소리 입력")
         source_card.pack(fill="x", pady=(2, 10))
 
-        live_row0 = ctk.CTkFrame(source_body, fg_color="transparent")
-        live_row0.pack(fill="x", pady=4)
-        ctk.CTkLabel(
-            live_row0, text="입력", font=self.font_base, text_color=UI_TEXT_MUTED, width=self._label_w, anchor="w"
-        ).pack(side="left")
+        live_form = self._make_form_frame(source_body)
+        live_form.pack(fill="x")
+        live_form.grid_columnconfigure(1, weight=0)
+        live_form.grid_columnconfigure(4, weight=1)
+
+        self._form_label(live_form, "입력").grid(row=0, column=0, sticky="w", pady=4)
+        live_source_group = ctk.CTkFrame(live_form, fg_color="transparent")
+        live_source_group.grid(row=0, column=1, sticky="w", padx=10, pady=4)
         ctk.CTkRadioButton(
-            live_row0,
+            live_source_group,
             text="PC 스피커 소리",
             variable=self.live_source_var,
             value=LIVE_SOURCE_SPEAKER,
             font=self.font_base,
-        ).pack(side="left", padx=(12, 14))
+        ).pack(side="left", padx=(0, 14))
         ctk.CTkRadioButton(
-            live_row0,
+            live_source_group,
             text="인터넷 URL 스트림",
             variable=self.live_source_var,
             value=LIVE_SOURCE_URL,
             font=self.font_base,
         ).pack(side="left")
-        ctk.CTkLabel(live_row0, text="원본 언어", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left", padx=(18, 0))
+        self._form_label(live_form, "원본 언어", width=76).grid(row=0, column=2, sticky="w", padx=(12, 0), pady=4)
         live_lang_holder, self.live_source_lang_combo = self._make_option_menu(
-            live_row0,
+            live_form,
             variable=self.source_lang_var,
             values=[SOURCE_LANG_LABELS[key] for key in SOURCE_LANG_ORDER],
             command=self._on_source_lang_selected,
             width=120,
         )
-        live_lang_holder.pack(side="left", padx=10)
+        live_lang_holder.grid(row=0, column=3, sticky="w", padx=10, pady=4)
 
-        live_row_url = ctk.CTkFrame(source_body, fg_color="transparent")
-        live_row_url.pack(fill="x", pady=4)
-        ctk.CTkLabel(
-            live_row_url, text="URL", font=self.font_base, text_color=UI_TEXT_MUTED, width=self._label_w, anchor="w"
-        ).pack(side="left")
-        ctk.CTkEntry(live_row_url, textvariable=self.live_url_var, **self._entry_kw).pack(
-            side="left", fill="x", expand=True, padx=10
+        self._form_label(live_form, "URL").grid(row=1, column=0, sticky="w", pady=4)
+        ctk.CTkEntry(live_form, textvariable=self.live_url_var, **self._entry_kw).grid(
+            row=1, column=1, columnspan=4, sticky="ew", padx=10, pady=4
         )
 
-        live_row_model = ctk.CTkFrame(source_body, fg_color="transparent")
-        live_row_model.pack(fill="x", pady=4)
-        ctk.CTkLabel(
-            live_row_model, text="음성 인식 모델", font=self.font_base, text_color=UI_TEXT_MUTED, width=self._label_w, anchor="w"
-        ).pack(side="left")
+        self._form_label(live_form, "음성 인식 모델").grid(row=2, column=0, sticky="w", pady=4)
         live_model_holder, self.live_whisper_model_combo = self._make_option_menu(
-            live_row_model,
+            live_form,
             variable=self.live_whisper_model_var,
             values=[WHISPER_MODEL_LABELS[key] for key in WHISPER_MODEL_ORDER],
             command=self._on_live_whisper_model_selected,
             width=MODEL_COMBO_W,
         )
-        live_model_holder.pack(side="left", padx=10)
-        ctk.CTkLabel(
-            live_row_model, text="실시간은 빠른 tiny/base 권장", font=self.font_base, text_color=UI_TEXT_MUTED
-        ).pack(side="left", padx=(6, 0))
+        live_model_holder.grid(row=2, column=1, sticky="w", padx=10, pady=4)
+        self._hint_label(live_form, "실시간은 빠른 tiny/base 권장", wraplength=360).grid(
+            row=2, column=2, columnspan=3, sticky="ew", padx=(6, 10), pady=4
+        )
 
-        live_row_trans = ctk.CTkFrame(source_body, fg_color="transparent")
-        live_row_trans.pack(fill="x", pady=4)
-        ctk.CTkLabel(
-            live_row_trans, text="번역 모델", font=self.font_base, text_color=UI_TEXT_MUTED, width=self._label_w, anchor="w"
-        ).pack(side="left")
+        self._form_label(live_form, "번역 모델").grid(row=3, column=0, sticky="w", pady=4)
         live_trans_holder, self.live_translation_combo = self._make_option_menu(
-            live_row_trans,
+            live_form,
             variable=self.live_translation_var,
             values=[TRANSLATION_PROFILE_LABELS[key] for key in TRANSLATION_PROFILE_ORDER],
             command=self._on_live_translation_profile_selected,
             width=MODEL_COMBO_W,
         )
-        live_trans_holder.pack(side="left", padx=10)
-        ctk.CTkLabel(
-            live_row_trans, text="파일 탭과 동일 · LLM은 실시간이 느려질 수 있음", font=self.font_base, text_color=UI_TEXT_MUTED
-        ).pack(side="left", padx=(6, 0))
+        live_trans_holder.grid(row=3, column=1, sticky="w", padx=10, pady=4)
+        self._hint_label(live_form, "파일 탭과 동일 · LLM은 실시간이 느려질 수 있음", wraplength=360).grid(
+            row=3, column=2, columnspan=3, sticky="ew", padx=(6, 10), pady=4
+        )
 
         # OPUS-MT(영어 1차) 선택 시 영어→한국어 2차 번역 설정
-        live_row_opus = ctk.CTkFrame(source_body, fg_color="transparent")
-        live_row_opus.pack(fill="x", pady=4)
-        ctk.CTkLabel(
-            live_row_opus, text="OPUS 2차 번역", font=self.font_base, text_color=UI_TEXT_MUTED, width=self._label_w, anchor="w"
-        ).pack(side="left")
+        self._form_label(live_form, "OPUS 2차 번역").grid(row=4, column=0, sticky="w", pady=4)
         self.live_secondary_check = ctk.CTkCheckBox(
-            live_row_opus,
+            live_form,
             text="영어→한국어 2차 번역",
             variable=self.live_use_secondary_var,
             onvalue=True,
@@ -4313,18 +4353,18 @@ class PapaStopApp(ctk.CTk):
             command=self._on_live_secondary_toggled,
             font=self.font_base,
         )
-        self.live_secondary_check.pack(side="left", padx=(0, 12))
+        self.live_secondary_check.grid(row=4, column=1, sticky="w", padx=10, pady=4)
         live_secondary_holder, self.live_secondary_combo = self._make_option_menu(
-            live_row_opus,
+            live_form,
             variable=self.live_secondary_var,
             values=[LIVE_SECONDARY_LABELS[key] for key in LIVE_SECONDARY_ORDER],
             command=self._on_live_secondary_selected,
             width=MODEL_COMBO_W,
         )
-        live_secondary_holder.pack(side="left", padx=2)
-        ctk.CTkLabel(
-            live_row_opus, text="OPUS 선택 시에만 적용(일·중→영→한)", font=self.font_base, text_color=UI_TEXT_MUTED
-        ).pack(side="left", padx=(6, 0))
+        live_secondary_holder.grid(row=4, column=2, sticky="w", padx=(0, 10), pady=4)
+        self._hint_label(live_form, "OPUS 선택 시에만 적용(일·중→영→한)", wraplength=300).grid(
+            row=4, column=3, columnspan=2, sticky="ew", padx=(0, 10), pady=4
+        )
         self._update_live_secondary_state()
 
         live_status_row, self.live_asr_status_lbl, self.live_trans_status_lbl = self._make_model_status_row(source_body)
@@ -4368,7 +4408,7 @@ class PapaStopApp(ctk.CTk):
             text="자막창 보이기",
             command=self._toggle_live_overlay,
             width=120,
-            height=32,
+            height=self._sec_btn_h,
             state="disabled",
             **self._ghost_btn,
         )
@@ -4391,87 +4431,76 @@ class PapaStopApp(ctk.CTk):
             text_color=UI_TEXT,
         )
         self.live_preview.pack(fill="x", padx=16, pady=16)
-        self._live_label(
-            self.live_tab, self.live_status_var, font=self.font_base, text_color=UI_TEXT_MUTED, anchor="w"
-        ).pack(fill="x", pady=6)
+        live_status_line = self._make_status_row(self.live_tab, [("실시간 상태", self.live_status_var)])
+        live_status_line.pack(fill="x", pady=6)
 
         # Screen record tab
         record_card, record_body = self._make_card(self.record_tab, "녹화 설정")
         record_card.pack(fill="x", pady=(2, 10))
 
-        record_row0 = ctk.CTkFrame(record_body, fg_color="transparent")
-        record_row0.pack(fill="x", pady=4)
-        ctk.CTkLabel(
-            record_row0, text="저장할 MKV", font=self.font_base, text_color=UI_TEXT_MUTED, width=self._label_w, anchor="w"
-        ).pack(side="left")
-        self.record_output_entry = ctk.CTkEntry(record_row0, textvariable=self.record_output_var, **self._entry_kw)
-        self.record_output_entry.pack(side="left", fill="x", expand=True, padx=10)
+        record_form = self._make_form_frame(record_body)
+        record_form.pack(fill="x")
+        record_form.grid_columnconfigure(1, weight=0)
+        record_form.grid_columnconfigure(3, weight=1)
+
+        self._form_label(record_form, "저장할 MKV").grid(row=0, column=0, sticky="w", pady=4)
+        self.record_output_entry = ctk.CTkEntry(record_form, textvariable=self.record_output_var, **self._entry_kw)
+        self.record_output_entry.grid(row=0, column=1, columnspan=3, sticky="ew", padx=10, pady=4)
         self.browse_record_btn = ctk.CTkButton(
-            record_row0, text="찾아보기", command=self._select_record_output, width=90, height=34, **self._ghost_btn
+            record_form, text="찾아보기", command=self._select_record_output,
+            width=110, height=self._sec_btn_h, **self._ghost_btn
         )
-        self.browse_record_btn.pack(side="left")
+        self.browse_record_btn.grid(row=0, column=4, sticky="ew", pady=4)
 
         # 캡처 대상: 전체 화면 / 모니터별 / 영역 지정
-        record_row_target = ctk.CTkFrame(record_body, fg_color="transparent")
-        record_row_target.pack(fill="x", pady=4)
-        ctk.CTkLabel(
-            record_row_target, text="캡처 대상", font=self.font_base, text_color=UI_TEXT_MUTED, width=self._label_w, anchor="w"
-        ).pack(side="left")
+        self._form_label(record_form, "캡처 대상").grid(row=1, column=0, sticky="w", pady=4)
         target_holder, self.record_target_combo = self._make_option_menu(
-            record_row_target,
+            record_form,
             variable=self.record_target_var,
             values=self._capture_target_labels(),
             command=self._on_capture_target_selected,
             width=MODEL_COMBO_W,
         )
-        target_holder.pack(side="left", padx=10)
+        target_holder.grid(row=1, column=1, sticky="w", padx=10, pady=4)
         self.select_region_btn = ctk.CTkButton(
-            record_row_target, text="영역 선택", command=self._select_capture_region_dialog,
-            width=90, height=34, state="disabled", **self._ghost_btn,
+            record_form, text="영역 선택", command=self._select_capture_region_dialog,
+            width=110, height=self._sec_btn_h, state="disabled", **self._ghost_btn,
         )
-        self.select_region_btn.pack(side="left")
-        ctk.CTkLabel(
-            record_row_target, textvariable=self.record_region_info_var, font=self.font_base, text_color=UI_TEXT_MUTED
-        ).pack(side="left", padx=(8, 0))
+        self.select_region_btn.grid(row=1, column=2, sticky="w", pady=4)
+        self._live_label(
+            record_form, self.record_region_info_var, font=self.font_base, text_color=UI_TEXT_MUTED, anchor="w"
+        ).grid(row=1, column=3, columnspan=2, sticky="ew", padx=(8, 10), pady=4)
 
         # 녹화 형식: 무손실(FFV1) / 고화질 압축(H.264)
-        record_row_codec = ctk.CTkFrame(record_body, fg_color="transparent")
-        record_row_codec.pack(fill="x", pady=4)
-        ctk.CTkLabel(
-            record_row_codec, text="녹화 형식", font=self.font_base, text_color=UI_TEXT_MUTED, width=self._label_w, anchor="w"
-        ).pack(side="left")
+        self._form_label(record_form, "녹화 형식").grid(row=2, column=0, sticky="w", pady=4)
         codec_holder, self.record_codec_combo = self._make_option_menu(
-            record_row_codec,
+            record_form,
             variable=self.record_codec_var,
             values=[RECORD_CODEC_LABELS[key] for key in RECORD_CODEC_ORDER],
             width=MODEL_COMBO_W,
         )
-        codec_holder.pack(side="left", padx=10)
-        ctk.CTkLabel(
-            record_row_codec, text="무손실=원본화질·대용량, H.264=용량 1/10~", font=self.font_base, text_color=UI_TEXT_MUTED
-        ).pack(side="left", padx=(6, 0))
+        codec_holder.grid(row=2, column=1, sticky="w", padx=10, pady=4)
+        self._hint_label(record_form, "무손실=원본화질·대용량, H.264=용량 1/10~", wraplength=360).grid(
+            row=2, column=2, columnspan=3, sticky="ew", padx=(6, 10), pady=4
+        )
 
-        record_row1 = ctk.CTkFrame(record_body, fg_color="transparent")
-        record_row1.pack(fill="x", pady=4)
-        ctk.CTkLabel(
-            record_row1, text="초당 화면 수", font=self.font_base, text_color=UI_TEXT_MUTED, width=self._label_w, anchor="w"
-        ).pack(side="left")
+        self._form_label(record_form, "초당 화면 수").grid(row=3, column=0, sticky="w", pady=4)
         record_fps_holder, self.record_fps_combo = self._make_option_menu(
-            record_row1,
+            record_form,
             variable=self.record_fps_var,
             values=["24", "30", "60"],
             width=90,
         )
-        record_fps_holder.pack(side="left", padx=(10, 20))
+        record_fps_holder.grid(row=3, column=1, sticky="w", padx=10, pady=4)
         self.record_audio_check = ctk.CTkCheckBox(
-            record_row1,
+            record_form,
             text="PC 스피커 소리도 녹음",
             variable=self.record_audio_var,
             onvalue=True,
             offvalue=False,
             font=self.font_base,
         )
-        self.record_audio_check.pack(side="left")
+        self.record_audio_check.grid(row=3, column=2, columnspan=3, sticky="w", padx=(6, 10), pady=4)
 
         record_row2 = ctk.CTkFrame(self.record_tab, fg_color="transparent")
         record_row2.pack(fill="x", pady=6)
@@ -4487,9 +4516,8 @@ class PapaStopApp(ctk.CTk):
             record_row2, text="결과 열기", command=self._open_output, **self._open_btn_kw
         ).pack(side="right")
 
-        self._live_label(
-            self.record_tab, self.record_status_var, font=self.font_base, text_color=UI_TEXT_MUTED, anchor="w"
-        ).pack(fill="x", pady=6)
+        record_status_line = self._make_status_row(self.record_tab, [("녹화 상태", self.record_status_var)])
+        record_status_line.pack(fill="x", pady=6)
         self._record_controls = [
             self.record_output_entry,
             self.browse_record_btn,
@@ -4980,14 +5008,14 @@ class PapaStopApp(ctk.CTk):
             overlay.attributes("-alpha", 0.3)
         except Exception:
             pass
-        overlay.configure(bg="#1e293b")
+        overlay.configure(bg=OVERLAY_BG)
         overlay.geometry(f"{vw}x{vh}+{vx}+{vy}")
 
-        canvas = tk.Canvas(overlay, cursor="cross", bg="#1e293b", highlightthickness=0)
+        canvas = tk.Canvas(overlay, cursor="cross", bg=OVERLAY_BG, highlightthickness=0)
         canvas.pack(fill="both", expand=True)
         canvas.create_text(
             vw // 2, 30, text="드래그로 녹화할 영역을 지정하세요 (ESC: 취소)",
-            fill="#f8fafc", font=(self._ui_font_family, 16),
+            fill=OVERLAY_FG, font=(self._ui_font_family, 16),
         )
 
         state: dict[str, object] = {"x0": 0, "y0": 0, "rect": None, "result": None}
@@ -4998,7 +5026,7 @@ class PapaStopApp(ctk.CTk):
                 canvas.delete(state["rect"])
             state["rect"] = canvas.create_rectangle(
                 event.x_root - vx, event.y_root - vy, event.x_root - vx, event.y_root - vy,
-                outline="#6366f1", width=2,
+                outline=UI_ACCENT, width=2,
             )
 
         def on_drag(event: object) -> None:
