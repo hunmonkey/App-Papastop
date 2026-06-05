@@ -3,11 +3,11 @@ param(
 )
 
 # PapaStop 최소(minimum) 배포 빌드
-# - EXE와 실행 엔진(라이브러리)은 그대로 포함한다.
-# - 음성인식/번역 "모델"은 동봉하지 않는다. 사용할 PC가 첫 실행 때 자동으로 내려받는다.
-#   (Whisper 약 37GB, NLLB CT2 약 8GB → 미동봉으로 약 45GB 절감)
-# - CUDA 라이브러리(nvidia)는 모델이 아니고 GPU 가속에 필요하므로 유지한다.
-# 결과물은 일반 빌드(dist\PapaStop)와 섞이지 않도록 별도 폴더(dist_min)에 만든다.
+# - 실행 엔진(라이브러리)은 포함합니다.
+# - 음성인식/번역 모델은 포함하지 않습니다.
+# - 모델은 사용자가 처음 기능을 실행할 때 자동으로 내려받습니다.
+# - CUDA 라이브러리는 GPU 가속에 필요하므로 포함합니다.
+# - 일반 빌드(dist\PapaStop)와 섞이지 않도록 dist_min/build_min을 사용합니다.
 
 $ErrorActionPreference = "Stop"
 
@@ -72,24 +72,22 @@ New-Item -ItemType Directory -Force $DataDir | Out-Null
 Write-Host "  - Copying CUDA libraries (nvidia)..."
 Copy-Item $NvidiaSrc (Join-Path $DataDir "nvidia") -Recurse -Force
 
-# 모델(Whisper / NLLB CT2)은 의도적으로 복사하지 않는다.
-# papastop.py가 모델이 없으면 첫 사용 시 자동으로 내려받도록 이미 구현되어 있다.
+# 모델(Whisper / NLLB CT2)은 일부러 복사하지 않습니다.
+# papastop.py가 모델이 없으면 첫 사용 때 자동으로 내려받도록 이미 구현되어 있습니다.
 
 $Guide = @'
 PapaStop 최소(minimum) 배포본 안내
 ============================================================
 
-이 배포본은 용량을 줄이기 위해 음성인식/번역 "모델"을 포함하지 않았습니다.
+이 배포본은 용량을 줄이기 위해 음성인식/번역 "모델"을 포함하지 않습니다.
 
-- 첫 실행 후 음성인식 또는 번역을 처음 사용할 때, 필요한 모델을
-  자동으로 인터넷에서 내려받습니다. (한 번 받으면 다음부터는 다시 받지 않습니다.)
-- 따라서 처음 사용할 때는 인터넷 연결이 필요하며, 모델 크기에 따라
-  첫 사용이 다소 느릴 수 있습니다.
-- 받은 모델은 EXE 옆 .papastop_data 폴더 안에 저장됩니다.
-  이 폴더를 지우지 마세요. (지우면 다시 내려받습니다.)
+- 처음 실행한 뒤 음성인식이나 번역을 처음 사용할 때 필요한 모델을 인터넷에서 자동으로 내려받습니다.
+- 한 번 내려받은 모델은 PapaStop.exe 옆의 .papastop_data 폴더 안에 저장됩니다.
+- .papastop_data 폴더를 지우면 모델을 다시 내려받아야 합니다.
+- 처음 사용하는 PC에서는 인터넷 연결이 필요하고, 모델 크기에 따라 첫 사용 시간이 오래 걸릴 수 있습니다.
 
-CUDA(그래픽카드 가속) 라이브러리는 포함되어 있습니다.
-NVIDIA 그래픽카드가 있으면 자동으로 GPU 가속을 사용합니다.
+CUDA(NVIDIA 그래픽카드 가속용 라이브러리)는 포함되어 있습니다.
+NVIDIA 그래픽카드가 있으면 자동으로 GPU 가속을 사용할 수 있습니다.
 '@
 Set-Content -Path (Join-Path $DistDir "PapaStop\README_MINIMUM.txt") -Value $Guide -Encoding UTF8
 
