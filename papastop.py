@@ -36,7 +36,7 @@ else:
 PAPASTOP_DATA = APP_ROOT / ".papastop_data"
 HF_HOME = PAPASTOP_DATA / "huggingface"
 
-DEFAULT_WHISPER_MODEL = "base"
+DEFAULT_WHISPER_MODEL = "large-v3-turbo"
 DEFAULT_SAMPLE_RATE = 16_000
 DEFAULT_CHUNK_SECONDS = 5.0
 DEFAULT_RECORD_SAMPLE_RATE = 48_000
@@ -129,10 +129,23 @@ NLLB_CT2_MODEL_DIRS = {
 }
 
 # llama.cpp(GGUF) 기반 LLM 번역 모델 — 파일 자막 품질 우선용.
-# 16GB VRAM에 Q4_K_M 양자화로 전 레이어 GPU 적재 기준(모두 단일 파일 GGUF).
+# 모두 단일 파일 GGUF. 기본은 전 레이어 GPU 적재(n_gpu_layers=-1)이며,
+# 16GB VRAM을 넘는 대형 모델만 아래 옵션으로 조정한다.
+#   - n_gpu_layers : GPU에 올릴 레이어 수(나머지는 CPU+RAM, 일부 CPU 분담 = 느려짐)
+#   - exclusive_vram : 번역 직전 음성 인식 모델을 내려 VRAM을 비운다(대형 모델 OOM 방지)
+#   - no_think : Qwen3 등 추론(thinking) 모델의 사고 과정을 끄는 지시를 덧붙인다
 LLM_GGUF_DIR = PAPASTOP_DATA / "gguf"
 LLM_TRANSLATION_CHUNK_SIZE = 8
-LLM_MODEL_ORDER = ("exaone-7.8b", "qwen2.5-7b", "gemma2-9b", "qwen2.5-14b")
+LLM_MODEL_ORDER = (
+    "exaone-7.8b",
+    "qwen3-14b",
+    "gemma3-12b",
+    "aya-expanse-8b",
+    "mistral-small-24b",
+    "qwen3-30b-a3b",
+    "gemma3-27b",
+    "exaone4-32b",
+)
 LLM_MODELS = {
     "exaone-7.8b": {
         "repo": "LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct-GGUF",
@@ -140,23 +153,58 @@ LLM_MODELS = {
         "label": "EXAONE 3.5 7.8B (한국어 특화)",
         "vram_gb": 5,
     },
-    "qwen2.5-7b": {
-        "repo": "bartowski/Qwen2.5-7B-Instruct-GGUF",
-        "file": "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
-        "label": "Qwen2.5 7B (다국어·가벼움)",
-        "vram_gb": 5,
+    # ── 2025년 세대 모델(전 레이어 GPU 적재) ──────────────────────
+    "qwen3-14b": {
+        "repo": "bartowski/Qwen_Qwen3-14B-GGUF",
+        "file": "Qwen_Qwen3-14B-Q4_K_M.gguf",
+        "label": "Qwen3 14B (다국어 최신·고품질)",
+        "vram_gb": 9,
+        "no_think": True,
     },
-    "gemma2-9b": {
-        "repo": "bartowski/gemma-2-9b-it-GGUF",
-        "file": "gemma-2-9b-it-Q4_K_M.gguf",
-        "label": "Gemma 2 9B (범용 고품질)",
+    "gemma3-12b": {
+        "repo": "bartowski/google_gemma-3-12b-it-GGUF",
+        "file": "google_gemma-3-12b-it-Q4_K_M.gguf",
+        "label": "Gemma 3 12B (다국어·한국어 강함)",
+        "vram_gb": 8,
+    },
+    "aya-expanse-8b": {
+        "repo": "bartowski/aya-expanse-8b-GGUF",
+        "file": "aya-expanse-8b-Q4_K_M.gguf",
+        "label": "Aya Expanse 8B (번역 특화 다국어)",
         "vram_gb": 6,
     },
-    "qwen2.5-14b": {
-        "repo": "bartowski/Qwen2.5-14B-Instruct-GGUF",
-        "file": "Qwen2.5-14B-Instruct-Q4_K_M.gguf",
-        "label": "Qwen2.5 14B (최고 품질)",
-        "vram_gb": 9,
+    # ── 대형 최고 품질 모델(번역 직전 위스퍼 해제로 VRAM 확보) ────
+    "mistral-small-24b": {
+        "repo": "bartowski/mistralai_Mistral-Small-3.2-24B-Instruct-2506-GGUF",
+        "file": "mistralai_Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf",
+        "label": "Mistral Small 24B (효율 고품질)",
+        "vram_gb": 14,
+        "exclusive_vram": True,
+    },
+    # MoE: 30B지만 토큰당 3B만 계산 → 일부 CPU 분담이어도 대형치고 빠르다.
+    "qwen3-30b-a3b": {
+        "repo": "bartowski/Qwen_Qwen3-30B-A3B-GGUF",
+        "file": "Qwen_Qwen3-30B-A3B-Q4_K_M.gguf",
+        "label": "Qwen3 30B-A3B (MoE·빠른 대형)",
+        "vram_gb": 17,
+        "n_gpu_layers": 36,
+        "exclusive_vram": True,
+        "no_think": True,
+    },
+    "gemma3-27b": {
+        "repo": "bartowski/google_gemma-3-27b-it-GGUF",
+        "file": "google_gemma-3-27b-it-Q3_K_M.gguf",
+        "label": "Gemma 3 27B (최고 품질)",
+        "vram_gb": 13,
+        "exclusive_vram": True,
+    },
+    "exaone4-32b": {
+        "repo": "LGAI-EXAONE/EXAONE-4.0-32B-GGUF",
+        "file": "EXAONE-4.0-32B-IQ4_XS.gguf",
+        "label": "EXAONE 4.0 32B (한국어 특화·일부 CPU)",
+        "vram_gb": 16,
+        "n_gpu_layers": 48,
+        "exclusive_vram": True,
     },
 }
 
@@ -193,7 +241,7 @@ LIVE_SECONDARY_STEPS = {
     "argos": ("argos", None),
 }
 
-TRANSLATION_PROFILE_ORDER = ("auto", "fast", "nllb600", "balanced", "accurate") + tuple(
+TRANSLATION_PROFILE_ORDER = ("auto", "fast", "nllb600", "balanced", "accurate", "opus") + tuple(
     f"llm-{key}" for key in LLM_MODEL_ORDER
 )
 TRANSLATION_PROFILE_LABELS = {
@@ -224,13 +272,7 @@ for _llm_key in LLM_MODEL_ORDER:
 TRANSLATION_PROFILE_ORDER_STEPS["opus"] = (("opus", None),)
 TRANSLATION_PROFILE_LABELS["opus"] = "OPUS-MT (영어 1차→2차)"
 
-# 실시간 탭 번역 모델 선택: 품질(1.3B)·속도(600M)·OPUS 2단계(영어 경유) 중 선택.
-LIVE_TRANSLATION_ORDER = ("balanced", "live", "opus")
-LIVE_TRANSLATION_LABELS = {
-    "balanced": "정확 (NLLB 1.3B)",
-    "live": "빠름 (NLLB 600M)",
-    "opus": "OPUS-MT (영어 1차→2차)",
-}
+# 실시간 탭 번역 모델은 파일 탭과 동일한 TRANSLATION_PROFILE_ORDER/LABELS를 그대로 사용한다.
 
 DEFAULT_RESOURCE_MODE = "max"
 RESOURCE_MODE_ORDER = ("max", "balanced")
@@ -1596,6 +1638,16 @@ class ASREngine:
             self.set_model(model_name)
         self._load_model()
 
+    def unload(self) -> None:
+        """모델을 메모리에서 내려 VRAM을 비운다(대형 LLM 번역 직전에 호출).
+        다음 사용 시 _load_model()이 자동으로 다시 올린다."""
+        with self._load_lock:
+            self._model = None
+            self._batched_model = None
+        import gc
+
+        gc.collect()
+
     def model_label(self, model_name: str | None = None) -> str:
         target = model_name or self.model_name
         return WHISPER_MODEL_LABELS.get(target, target)
@@ -1699,6 +1751,7 @@ class ASREngine:
         on_segment: Callable[[SubtitleSegment], None] | None = None,
         vad_filter: bool = True,
         beam_size: int | None = None,
+        word_timestamps: bool = False,
     ) -> tuple[list[SubtitleSegment], str]:
         self._load_model(on_line=on_line)
         assert self._model is not None
@@ -1715,6 +1768,7 @@ class ASREngine:
             "beam_size": beam_size if beam_size is not None else settings.asr_beam_size,
             "vad_filter": vad_filter,
             "condition_on_previous_text": False,
+            "word_timestamps": word_timestamps,
         }
         if self._batched_model is not None:
             transcribe_kwargs["batch_size"] = settings.asr_batch_size
@@ -1732,9 +1786,17 @@ class ASREngine:
             text = (segment.text or "").strip()
             if not text:
                 continue
+            # 단어 타임스탬프가 있으면 실제 첫/마지막 단어 시각으로 자막 구간을 좁혀 싱크를 맞춘다.
+            words = getattr(segment, "words", None) if word_timestamps else None
+            if words and words[0].start is not None and words[-1].end is not None:
+                start = float(words[0].start)
+                end = float(words[-1].end)
+            else:
+                start = float(segment.start)
+                end = float(segment.end)
             subtitle_segment = SubtitleSegment(
-                start=float(segment.start),
-                end=float(segment.end),
+                start=start,
+                end=end,
                 text=text,
             )
             rows.append(subtitle_segment)
@@ -1756,6 +1818,7 @@ class TranslationEngine:
         self._nllb_ct2_translators: dict[str, object] = {}
         self._nllb_tokenizer = None
         self._llama_models: dict[str, object] = {}
+        self._active_llm_no_think = False
         self._opus_pipelines: dict[str, object] = {}
         # OPUS 2단계(영어 경유) 설정: 2차 번역기와 사용 여부.
         self.opus_secondary = "nllb600"
@@ -1792,6 +1855,17 @@ class TranslationEngine:
     def _profile_steps(self, profile: str | None = None) -> tuple[tuple[str, str | None], ...]:
         selected = profile or self.preferred
         return TRANSLATION_PROFILE_ORDER_STEPS.get(selected, TRANSLATION_PROFILE_ORDER_STEPS["auto"])
+
+    def needs_exclusive_vram(self, profile: str | None = None) -> bool:
+        """현재 프로필의 주 모델이 VRAM을 독점해야 하는 대형 LLM이면 True.
+        파일 자막에서 번역 직전에 음성 인식 모델을 내려 OOM을 막는 데 쓴다."""
+        steps = self._profile_steps(profile)
+        if not steps:
+            return False
+        engine, model = steps[0]
+        if engine != "llama" or model is None:
+            return False
+        return bool((LLM_MODELS.get(model) or {}).get("exclusive_vram"))
 
     def prepare_profile(self, profile: str | None = None) -> None:
         chosen = profile or self.preferred
@@ -1996,6 +2070,9 @@ class TranslationEngine:
         return hf_hub_download(**kwargs)
 
     def _load_llama(self, key: str):
+        spec = LLM_MODELS.get(key) or {}
+        # 추론(thinking) 모델이면 채팅 시 사고 과정을 끄는 지시를 덧붙인다.
+        self._active_llm_no_think = bool(spec.get("no_think"))
         cached = self._llama_models.get(key)
         if cached is not None:
             return cached
@@ -2023,7 +2100,12 @@ class TranslationEngine:
             from llama_cpp import Llama
 
             settings = build_resource_settings(self.resource_mode)
-            n_gpu = -1 if get_ctranslate2_cuda_available() else 0
+            # 기본은 전 레이어 GPU(-1). 16GB에 다 안 올라가는 대형 모델은
+            # spec의 n_gpu_layers만큼만 GPU에 올리고 나머지는 CPU+RAM이 맡는다.
+            if get_ctranslate2_cuda_available():
+                n_gpu = int(spec.get("n_gpu_layers", -1))
+            else:
+                n_gpu = 0
             llm = Llama(
                 model_path=model_path,
                 n_gpu_layers=n_gpu,
@@ -2050,6 +2132,13 @@ class TranslationEngine:
         return min(2048, max(256, budget))
 
     def _llama_chat(self, llm, messages: list[dict[str, str]], max_tokens: int) -> str:
+        if self._active_llm_no_think and messages:
+            # Qwen3 등은 마지막 사용자 메시지에 "/no_think"를 붙이면 사고 과정을 건너뛴다.
+            messages = [dict(message) for message in messages]
+            for message in reversed(messages):
+                if message.get("role") == "user":
+                    message["content"] = f"{message['content']} /no_think"
+                    break
         out = llm.create_chat_completion(
             messages=messages,
             max_tokens=max_tokens,
@@ -2057,9 +2146,14 @@ class TranslationEngine:
             top_p=0.9,
         )
         try:
-            return str(out["choices"][0]["message"]["content"]).strip()
+            content = str(out["choices"][0]["message"]["content"])
         except Exception as exc:
             raise RuntimeError("LLM 번역 결과를 읽지 못했습니다.") from exc
+        # 추론(thinking) 모델이 남기는 <think>...</think> 사고 과정은 자막에서 제거한다.
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+        if "</think>" in content:
+            content = content.split("</think>")[-1]
+        return content.strip()
 
     def _parse_llm_numbered_translations(self, raw: str, originals: list[str]) -> list[str] | None:
         expected = len(originals)
@@ -2366,10 +2460,16 @@ class FileSubtitleWorkflow:
                 on_line=on_line,
                 should_stop=should_stop,
                 on_segment=on_segment,
+                word_timestamps=True,  # 자막 시각을 실제 단어 경계로 정밀하게 맞춘다.
             )
 
             if not segments:
                 raise RuntimeError("인식할 수 있는 음성을 찾지 못했습니다.")
+
+            # 대형 LLM 번역은 16GB VRAM을 거의 다 쓰므로, 번역 전에 위스퍼를 내려 자리를 비운다.
+            if self.translator.needs_exclusive_vram():
+                on_line("대형 번역 모델을 위해 음성 인식 모델을 메모리에서 내립니다 ...")
+                self.asr.unload()
 
             on_progress(55)
             on_line("한국어로 번역하는 중 ...")
@@ -3446,8 +3546,9 @@ class PapaStopApp(ctk.CTk):
         set_download_progress_callback(lambda data: self._emit("download_progress", data))
 
         self.asr = ASREngine()
-        # 실시간은 속도(tiny), 파일은 정확도(base 이상)로 모델을 따로 쓰도록 엔진을 분리한다.
-        self.live_asr = ASREngine(model_name="tiny")
+        # 실시간은 속도(small), 파일은 정확도(large-v3-turbo)로 모델을 따로 쓰도록 엔진을 분리한다.
+        # RTX 5070 Ti(16GB)에서는 small도 GPU로 실시간을 충분히 따라간다.
+        self.live_asr = ASREngine(model_name="small")
         self.translator = TranslationEngine(preferred="auto")
         # 실시간 번역도 파일과 따로 둔다. 기본은 품질 우선(1.3B), 실시간 탭 콤보에서 600M(빠름)로 바꿀 수 있다.
         self.live_translator = TranslationEngine(preferred="balanced")
@@ -4118,7 +4219,7 @@ class PapaStopApp(ctk.CTk):
         self.show_overlay_var = tk.BooleanVar(value=True)
         self.live_save_srt_var = tk.BooleanVar(value=False)
         self.live_whisper_model_var = tk.StringVar(value=WHISPER_MODEL_LABELS[self.live_asr.model_name])
-        self.live_translation_var = tk.StringVar(value=LIVE_TRANSLATION_LABELS[self.live_translator.preferred])
+        self.live_translation_var = tk.StringVar(value=TRANSLATION_PROFILE_LABELS[self.live_translator.preferred])
         self.live_use_secondary_var = tk.BooleanVar(value=self.live_translator.opus_use_secondary)
         self.live_secondary_var = tk.StringVar(value=LIVE_SECONDARY_LABELS[self.live_translator.opus_secondary])
 
@@ -4188,13 +4289,13 @@ class PapaStopApp(ctk.CTk):
         live_trans_holder, self.live_translation_combo = self._make_option_menu(
             live_row_trans,
             variable=self.live_translation_var,
-            values=[LIVE_TRANSLATION_LABELS[key] for key in LIVE_TRANSLATION_ORDER],
+            values=[TRANSLATION_PROFILE_LABELS[key] for key in TRANSLATION_PROFILE_ORDER],
             command=self._on_live_translation_profile_selected,
             width=MODEL_COMBO_W,
         )
         live_trans_holder.pack(side="left", padx=10)
         ctk.CTkLabel(
-            live_row_trans, text="정확=1.3B, 빠름=600M, OPUS=영어 경유", font=self.font_base, text_color=UI_TEXT_MUTED
+            live_row_trans, text="파일 탭과 동일 · LLM은 실시간이 느려질 수 있음", font=self.font_base, text_color=UI_TEXT_MUTED
         ).pack(side="left", padx=(6, 0))
 
         # OPUS-MT(영어 1차) 선택 시 영어→한국어 2차 번역 설정
@@ -5059,7 +5160,7 @@ class PapaStopApp(ctk.CTk):
 
     def _live_translation_profile_from_selection(self) -> str:
         label = self._strip_status_prefix(self.live_translation_var.get())
-        for key, value in LIVE_TRANSLATION_LABELS.items():
+        for key, value in TRANSLATION_PROFILE_LABELS.items():
             if value == label:
                 return key
         return "balanced"
@@ -5067,7 +5168,7 @@ class PapaStopApp(ctk.CTk):
     def _on_live_translation_profile_selected(self, _event: object | None = None) -> None:
         if self._is_live_running or self._is_translation_preparing:
             self.live_translation_var.set(
-                LIVE_TRANSLATION_LABELS.get(self.live_translator.preferred, LIVE_TRANSLATION_LABELS["balanced"])
+                TRANSLATION_PROFILE_LABELS.get(self.live_translator.preferred, TRANSLATION_PROFILE_LABELS["balanced"])
             )
             messagebox.showwarning(APP_NAME, "현재 작업이 끝난 뒤 번역 모델을 바꿔 주세요.")
             return
@@ -5075,7 +5176,7 @@ class PapaStopApp(ctk.CTk):
         self.live_translator.set_profile(profile)
         self._update_live_secondary_state()
         self._refresh_model_status()
-        label = LIVE_TRANSLATION_LABELS.get(profile, self.live_translator.profile_label(profile))
+        label = TRANSLATION_PROFILE_LABELS.get(profile, self.live_translator.profile_label(profile))
         self._append_log(f"실시간 번역 모델을 설정했습니다: {label}")
 
     def _update_live_secondary_state(self) -> None:
@@ -5139,7 +5240,7 @@ class PapaStopApp(ctk.CTk):
         )
         apply_combo(
             getattr(self, "live_translation_combo", None), self.live_translation_var,
-            LIVE_TRANSLATION_ORDER, LIVE_TRANSLATION_LABELS, self.live_translator.is_profile_ready,
+            TRANSLATION_PROFILE_ORDER, TRANSLATION_PROFILE_LABELS, self.live_translator.is_profile_ready,
             self._live_translation_profile_from_selection(),
         )
 
