@@ -131,6 +131,7 @@ NLLB_CT2_MODEL_DIRS = {
 # llama.cpp(GGUF) 기반 LLM 번역 모델 — 파일 자막 품질 우선용.
 # 16GB VRAM에 Q4_K_M 양자화로 전 레이어 GPU 적재 기준(모두 단일 파일 GGUF).
 LLM_GGUF_DIR = PAPASTOP_DATA / "gguf"
+LLM_TRANSLATION_CHUNK_SIZE = 8
 LLM_MODEL_ORDER = ("exaone-7.8b", "qwen2.5-7b", "gemma2-9b", "qwen2.5-14b")
 LLM_MODELS = {
     "exaone-7.8b": {
@@ -253,6 +254,12 @@ UI_TEXT_MUTED = "#64748b"    # 보조 텍스트
 UI_ACCENT = "#6366f1"        # 옅은 인디고 강조색 (자극적이지 않게)
 UI_ACCENT_HOVER = "#5457e6"
 UI_ACCENT_ACTIVE = "#4548c9"
+UI_ACCENT_SOFT = "#e0e7ff"   # 선택된 탭/세그먼트 배경 (옅은 인디고 틴트)
+UI_ACCENT_SOFT_HOVER = "#c7d2fe"
+UI_DANGER = "#dc2626"        # 중지/삭제/실패
+UI_DANGER_HOVER = "#b91c1c"
+UI_OK = "#16a34a"            # 모델 준비 완료 표시 (완료 상태에만 제한적 사용)
+UI_WARN = "#d97706"          # 모델 다운로드 필요 표시
 OVERLAY_BG = "#0f172a"       # 자막 오버레이 배경 (어두운 톤 유지)
 OVERLAY_FG = "#f8fafc"
 
@@ -1230,6 +1237,63 @@ def clean_text_for_srt(text: str) -> str:
     return fixed
 
 
+_HANGUL_RE = re.compile(r"[가-힣]")
+_SOURCE_SCRIPT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]")
+_NUMBER_PREFIX_RE = re.compile(r"^\s*\d{1,3}\s*[\.\)\]:：、-]\s*")
+_TRANSLATION_LABEL_RE = re.compile(r"^(?:번역문?|한국어|korean|translation|target)\s*[:：]\s*", re.IGNORECASE)
+_TRANSLATION_LABEL_ANY_RE = re.compile(r"(?:번역문?|한국어|korean|translation|target)\s*[:：]\s*", re.IGNORECASE)
+_SOURCE_LABEL_RE = re.compile(
+    r"^(?:원문|일본어|중국어|영어|source|original|japanese|chinese|english|日本語|中文)\s*[:：]\s*",
+    re.IGNORECASE,
+)
+
+
+def clean_translation_for_subtitle(translated: str, original: str) -> str:
+    """번역 모델 답변에서 원문·라벨을 걷어내고 SRT에 넣을 한국어 자막만 남긴다."""
+    raw = str(translated or "").replace("\r\n", "\n").replace("\r", "\n").replace("```", "")
+    original_clean = clean_text_for_srt(str(original or ""))
+    pieces: list[str] = []
+
+    for raw_line in raw.split("\n"):
+        line = raw_line.strip().strip("\"'“”‘’")
+        if not line:
+            continue
+        line = _NUMBER_PREFIX_RE.sub("", line).strip()
+        if not line:
+            continue
+        if _SOURCE_LABEL_RE.match(line):
+            parts = _TRANSLATION_LABEL_ANY_RE.split(_SOURCE_LABEL_RE.sub("", line, count=1), maxsplit=1)
+            if len(parts) != 2:
+                continue
+            line = parts[1].strip()
+        line = _TRANSLATION_LABEL_RE.sub("", line, count=1).strip()
+        if not line:
+            continue
+
+        if re.search(r"\s(?:=>|->|→|=)\s", line):
+            arrow_parts = [part.strip() for part in re.split(r"\s*(?:=>|->|→|=)\s*", line) if part.strip()]
+            korean_parts = [part for part in arrow_parts if _HANGUL_RE.search(part)]
+            if korean_parts:
+                line = korean_parts[-1]
+
+        line_clean = clean_text_for_srt(line)
+        if original_clean and line_clean == original_clean and _SOURCE_SCRIPT_RE.search(original_clean):
+            continue
+        if original_clean and original_clean in line and _HANGUL_RE.search(line):
+            line = line.replace(original_clean, " ").strip()
+        if line:
+            pieces.append(line)
+
+    if not pieces:
+        return ""
+    if any(_HANGUL_RE.search(piece) for piece in pieces):
+        pieces = [piece for piece in pieces if _HANGUL_RE.search(piece)]
+    cleaned = clean_text_for_srt(" ".join(pieces))
+    if _SOURCE_SCRIPT_RE.search(cleaned) and not _HANGUL_RE.search(cleaned):
+        return ""
+    return cleaned
+
+
 def default_recording_path(output_dir: Path | None = None) -> Path:
     folder = output_dir if output_dir is not None else PAPASTOP_DATA / "recordings"
     return folder / f"screen-{time.strftime('%Y%m%d-%H%M%S')}.mkv"
@@ -1971,32 +2035,149 @@ class TranslationEngine:
             self._resource_summary = settings.summary
             return llm
 
+    def _llm_system_message(self, source_code: str) -> str:
+        src = (source_code or "").split("-")[0].lower()
+        lang = LLM_LANG_NAMES.get(src, "the source")
+        return (
+            f"You are a professional {lang}-to-Korean subtitle translator. "
+            "Translate meaning and tone naturally for Korean viewers. "
+            "Use concise Korean subtitle style. "
+            "Never include the source text, labels, romanization, explanations, markdown, or notes."
+        )
+
+    def _llm_max_tokens(self, texts: list[str]) -> int:
+        budget = sum(max(24, len(text) * 3) for text in texts) + 160
+        return min(2048, max(256, budget))
+
+    def _llama_chat(self, llm, messages: list[dict[str, str]], max_tokens: int) -> str:
+        out = llm.create_chat_completion(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.1,
+            top_p=0.9,
+        )
+        try:
+            return str(out["choices"][0]["message"]["content"]).strip()
+        except Exception as exc:
+            raise RuntimeError("LLM 번역 결과를 읽지 못했습니다.") from exc
+
+    def _parse_llm_numbered_translations(self, raw: str, originals: list[str]) -> list[str] | None:
+        expected = len(originals)
+        if expected <= 0:
+            return []
+
+        slots: dict[int, str] = {}
+        current_index: int | None = None
+        current_lines: list[str] = []
+
+        def flush_current() -> None:
+            nonlocal current_index, current_lines
+            if current_index is not None:
+                slots[current_index] = "\n".join(current_lines).strip()
+            current_index = None
+            current_lines = []
+
+        for raw_line in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = re.match(r"^(\d{1,3})\s*[\.\)\]:：、-]\s*(.*)$", line)
+            if match:
+                number = int(match.group(1))
+                if 1 <= number <= expected:
+                    flush_current()
+                    current_index = number
+                    current_lines = [match.group(2).strip()]
+                    continue
+            if current_index is not None:
+                current_lines.append(line)
+        flush_current()
+
+        if all(index in slots for index in range(1, expected + 1)):
+            return [
+                clean_translation_for_subtitle(slots[index], originals[index - 1])
+                for index in range(1, expected + 1)
+            ]
+
+        plain_lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        if len(plain_lines) == expected:
+            return [
+                clean_translation_for_subtitle(line, original)
+                for line, original in zip(plain_lines, originals)
+            ]
+        return None
+
+    def _translate_llama_one(self, llm, text: str, source_code: str) -> str:
+        stripped = text.strip()
+        if not stripped:
+            return ""
+        messages = [
+            {"role": "system", "content": self._llm_system_message(source_code)},
+            {
+                "role": "user",
+                "content": (
+                    "Translate this subtitle line into Korean.\n"
+                    "Return only the Korean subtitle text. Do not copy the source text.\n\n"
+                    f"Source:\n{stripped}"
+                ),
+            },
+        ]
+        raw = self._llama_chat(llm, messages, self._llm_max_tokens([stripped]))
+        return clean_translation_for_subtitle(raw, stripped)
+
+    def _translate_llama_batch(self, llm, texts: list[str], source_code: str) -> list[str]:
+        if not texts:
+            return []
+        src = (source_code or "").split("-")[0].lower()
+        lang = LLM_LANG_NAMES.get(src, "the source")
+        numbered_lines = "\n".join(f"{index}. {text.strip()}" for index, text in enumerate(texts, start=1))
+        messages = [
+            {"role": "system", "content": self._llm_system_message(source_code)},
+            {
+                "role": "user",
+                "content": (
+                    f"Translate these {lang} subtitle lines into Korean.\n"
+                    "Use surrounding lines as context, but keep one Korean output line for each input line.\n"
+                    f"Return exactly {len(texts)} lines. Each line must start with the same number and a period.\n"
+                    "Do not copy any source-language text.\n\n"
+                    f"{numbered_lines}"
+                ),
+            },
+        ]
+        raw = self._llama_chat(llm, messages, self._llm_max_tokens(texts))
+        parsed = self._parse_llm_numbered_translations(raw, texts)
+        if parsed is None:
+            return [self._translate_llama_one(llm, text, source_code) for text in texts]
+        return [
+            parsed_text or self._translate_llama_one(llm, original, source_code)
+            for parsed_text, original in zip(parsed, texts)
+        ]
+
     def _translate_llama(self, texts: list[str], source_code: str, key: str) -> list[str]:
         if not texts:
             return []
         llm = self._load_llama(key)
-        src = (source_code or "").split("-")[0].lower()
-        lang = LLM_LANG_NAMES.get(src, "the source")
+        settings = build_resource_settings(self.resource_mode)
+        batch_size = max(1, min(LLM_TRANSLATION_CHUNK_SIZE, settings.translation_batch_size))
 
         results: list[str] = []
-        for text in texts:
-            stripped = text.strip()
-            if not stripped:
-                results.append("")
+        for start in range(0, len(texts), batch_size):
+            chunk = texts[start : start + batch_size]
+            chunk_results = ["" for _ in chunk]
+            nonempty_positions: list[int] = []
+            nonempty_texts: list[str] = []
+            for index, text in enumerate(chunk):
+                stripped = text.strip()
+                if stripped:
+                    nonempty_positions.append(index)
+                    nonempty_texts.append(stripped)
+            if not nonempty_texts:
+                results.extend(chunk_results)
                 continue
-            prompt = (
-                "You are a professional subtitle translator. "
-                f"Translate the following {lang} text into natural, fluent Korean. "
-                "Output ONLY the Korean translation, with no explanations, notes, or romanization.\n\n"
-                f"{stripped}"
-            )
-            out = llm.create_chat_completion(
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=512,
-                temperature=0.2,
-                top_p=0.9,
-            )
-            results.append(out["choices"][0]["message"]["content"].strip())
+            translated = self._translate_llama_batch(llm, nonempty_texts, source_code)
+            for position, translated_text in zip(nonempty_positions, translated):
+                chunk_results[position] = translated_text
+            results.extend(chunk_results)
         return results
 
     # ── OPUS-MT 2단계(원본→영어→한국어) ─────────────────────────
@@ -2198,10 +2379,11 @@ class FileSubtitleWorkflow:
                 translated = translated + ["" for _ in range(len(segments) - len(translated))]
 
             translated_segments: list[SubtitleSegment] = []
+            skipped_translations = 0
             for original, text in zip(segments, translated):
                 if should_stop is not None and should_stop():
                     raise OperationCancelled("취소되었습니다.")
-                subtitle_text = (text or original.text).strip()
+                subtitle_text = clean_translation_for_subtitle(text, original.text)
                 if subtitle_text:
                     translated_segments.append(
                         SubtitleSegment(
@@ -2210,6 +2392,11 @@ class FileSubtitleWorkflow:
                             text=subtitle_text,
                         )
                     )
+                else:
+                    skipped_translations += 1
+
+            if skipped_translations:
+                on_line(f"번역 결과가 비어 있거나 원문만 나온 {skipped_translations}줄은 저장하지 않았습니다.")
 
             on_progress(85)
             on_line(f"SRT 저장: {output_srt}")
@@ -2758,7 +2945,11 @@ class LiveCaptionService:
                             )
                         if len(translated) != len(segments):
                             translated = translated + ["" for _ in range(len(segments) - len(translated))]
-                        pairs = [(s, (t.strip() or s.text.strip())) for s, t in zip(segments, translated) if (t or s.text).strip()]
+                        pairs = []
+                        for segment, text in zip(segments, translated):
+                            subtitle_text = clean_translation_for_subtitle(text, segment.text)
+                            if subtitle_text:
+                                pairs.append((segment, subtitle_text))
                         lines = [text for _, text in pairs]
                         if lines:
                             emit("live_caption", "\n".join(lines[-2:]))
@@ -3316,8 +3507,8 @@ class PapaStopApp(ctk.CTk):
         assign("CTkCheckBox", "hover_color", indigo_hover)
         assign("CTkRadioButton", "fg_color", indigo)
         assign("CTkRadioButton", "hover_color", indigo_hover)
-        assign("CTkSegmentedButton", "selected_color", ["#e0e7ff", "#e0e7ff"])
-        assign("CTkSegmentedButton", "selected_hover_color", ["#c7d2fe", "#c7d2fe"])
+        assign("CTkSegmentedButton", "selected_color", [UI_ACCENT_SOFT, UI_ACCENT_SOFT])
+        assign("CTkSegmentedButton", "selected_hover_color", [UI_ACCENT_SOFT_HOVER, UI_ACCENT_SOFT_HOVER])
         assign("CTkScrollbar", "button_color", scroll_color)
         assign("CTkScrollbar", "button_hover_color", scroll_hover)
 
@@ -3350,6 +3541,20 @@ class PapaStopApp(ctk.CTk):
         body = ctk.CTkFrame(card, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=14, pady=(0, 12))
         return card, body
+
+    def _make_model_status_row(self, parent):
+        """음성 인식·번역 모델 준비 상태를 한 줄로 보여주는 행을 만든다.
+        공백 정렬 대신 고정 라벨로 맞춰 탭마다 위치가 어긋나지 않게 한다.
+        (행 프레임, 음성 인식 상태 라벨, 번역 상태 라벨)을 돌려준다."""
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        ctk.CTkLabel(row, text="모델 상태", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left")
+        ctk.CTkLabel(row, text="음성 인식", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left", padx=(14, 4))
+        asr_lbl = ctk.CTkLabel(row, text="확인 중", font=self.font_base, text_color=UI_TEXT_MUTED)
+        asr_lbl.pack(side="left")
+        ctk.CTkLabel(row, text="번역", font=self.font_base, text_color=UI_TEXT_MUTED).pack(side="left", padx=(18, 4))
+        trans_lbl = ctk.CTkLabel(row, text="확인 중", font=self.font_base, text_color=UI_TEXT_MUTED)
+        trans_lbl.pack(side="left")
+        return row, asr_lbl, trans_lbl
 
     def _live_label(self, parent, variable: tk.StringVar, **kwargs):
         """StringVar 값이 바뀌면 자동으로 글자를 갱신하는 CTkLabel을 만듭니다."""
@@ -3514,6 +3719,8 @@ class PapaStopApp(ctk.CTk):
         self.font_base = ctk.CTkFont(family=fam, size=13)
         self.font_section = ctk.CTkFont(family=fam, size=14, weight="bold")
         self.font_caption = ctk.CTkFont(family=fam, size=15)
+        # 선택된 사이드바 탭만 굵게 — 지금 어느 화면인지 한눈에 보이게 한다.
+        self.font_nav_bold = ctk.CTkFont(family=fam, size=13, weight="bold")
 
         self._ghost_btn = dict(
             fg_color="transparent",
@@ -3523,13 +3730,13 @@ class PapaStopApp(ctk.CTk):
             border_color=UI_BORDER_STRONG,
             corner_radius=4,
         )
-        self._danger_btn = dict(fg_color="#dc2626", hover_color="#b91c1c", text_color="#ffffff")
+        self._danger_btn = dict(fg_color=UI_DANGER, hover_color=UI_DANGER_HOVER, text_color=UI_SURFACE)
         self._entry_kw = dict(
             height=34,
             corner_radius=4,
             border_width=1,
             border_color=UI_BORDER_STRONG,
-            fg_color="#ffffff",
+            fg_color=UI_SURFACE,
             text_color=UI_TEXT,
             font=self.font_base,
         )
@@ -3566,6 +3773,12 @@ class PapaStopApp(ctk.CTk):
         sidebar.grid(row=0, column=0, sticky="nsew", padx=(14, 7), pady=14)
         sidebar.grid_propagate(False)
         sidebar.pack_propagate(False)
+
+        # 사이드바 상단 브랜드 줄 + 얇은 구분선 (탭 목록과 시각적으로 분리)
+        ctk.CTkLabel(
+            sidebar, text=APP_NAME, font=self.font_section, text_color=UI_ACCENT, anchor="w"
+        ).pack(fill="x", padx=14, pady=(16, 8))
+        ctk.CTkFrame(sidebar, height=1, fg_color=UI_BORDER).pack(fill="x", padx=12, pady=(0, 8))
 
         # ── 오른쪽 영역: 위(탭 콘텐츠) + 아래(실시간 로그) ────────
         right = ctk.CTkFrame(root, fg_color="transparent")
@@ -3625,7 +3838,7 @@ class PapaStopApp(ctk.CTk):
                 text_color=UI_TEXT,
                 font=self.font_base,
             )
-            btn.pack(fill="x", padx=10, pady=(16 if not self._nav_buttons else 2, 2))
+            btn.pack(fill="x", padx=10, pady=2)
             self._nav_buttons[key] = btn
 
         # 공통 로그/진행 영역(아래)은 도움말 탭에서만 숨긴다.
@@ -3825,20 +4038,10 @@ class PapaStopApp(ctk.CTk):
             text="고품질 LLM은 GPU·VRAM 사용 / 첫 선택 시 수 GB 다운로드",
             font=self.font_base,
             text_color=UI_TEXT_MUTED,
-        ).grid(row=1, column=3, sticky="w", padx=(12, 0), pady=6)
+        ).grid(row=2, column=1, columnspan=4, sticky="w", padx=(10, 0), pady=(0, 6))
 
-        file_status_row = ctk.CTkFrame(self.file_tab, fg_color="transparent")
+        file_status_row, self.file_asr_status_lbl, self.file_trans_status_lbl = self._make_model_status_row(self.file_tab)
         file_status_row.pack(fill="x", pady=(0, 4))
-        ctk.CTkLabel(
-            file_status_row, text="모델 상태 —  음성 인식:", font=self.font_base, text_color=UI_TEXT_MUTED
-        ).pack(side="left")
-        self.file_asr_status_lbl = ctk.CTkLabel(file_status_row, text="확인 중", font=self.font_base, text_color=UI_TEXT_MUTED)
-        self.file_asr_status_lbl.pack(side="left", padx=(4, 0))
-        ctk.CTkLabel(
-            file_status_row, text="     번역:", font=self.font_base, text_color=UI_TEXT_MUTED
-        ).pack(side="left")
-        self.file_trans_status_lbl = ctk.CTkLabel(file_status_row, text="확인 중", font=self.font_base, text_color=UI_TEXT_MUTED)
-        self.file_trans_status_lbl.pack(side="left", padx=(4, 0))
 
         queue_card, queue_body = self._make_card(self.file_tab, "작업할 파일 목록")
         queue_card.pack(fill="both", expand=True, pady=(4, 6))
@@ -3846,7 +4049,7 @@ class PapaStopApp(ctk.CTk):
         list_area = ctk.CTkFrame(queue_body, fg_color="transparent")
         list_area.pack(fill="both", expand=True)
 
-        listbox_wrap = ctk.CTkFrame(list_area, fg_color="#ffffff", corner_radius=4, border_width=1, border_color=UI_BORDER_STRONG)
+        listbox_wrap = ctk.CTkFrame(list_area, fg_color=UI_SURFACE, corner_radius=4, border_width=1, border_color=UI_BORDER_STRONG)
         listbox_wrap.pack(side="left", fill="both", expand=True, padx=(0, 2))
         self.file_listbox_wrap = listbox_wrap
         self.file_listbox = tk.Listbox(
@@ -3854,11 +4057,11 @@ class PapaStopApp(ctk.CTk):
             height=6,
             selectmode="extended",
             exportselection=False,
-            bg="#ffffff",
+            bg=UI_SURFACE,
             fg=UI_TEXT,
-            font=(self._ui_font_family, 10),
+            font=(self._ui_font_family, 11),
             selectbackground=UI_ACCENT,
-            selectforeground="#ffffff",
+            selectforeground=UI_SURFACE,
             activestyle="none",
             relief="flat",
             borderwidth=0,
@@ -4023,18 +4226,8 @@ class PapaStopApp(ctk.CTk):
         ).pack(side="left", padx=(6, 0))
         self._update_live_secondary_state()
 
-        live_status_row = ctk.CTkFrame(source_body, fg_color="transparent")
+        live_status_row, self.live_asr_status_lbl, self.live_trans_status_lbl = self._make_model_status_row(source_body)
         live_status_row.pack(fill="x", pady=(2, 0))
-        ctk.CTkLabel(
-            live_status_row, text="모델 상태 —  음성 인식:", font=self.font_base, text_color=UI_TEXT_MUTED
-        ).pack(side="left")
-        self.live_asr_status_lbl = ctk.CTkLabel(live_status_row, text="확인 중", font=self.font_base, text_color=UI_TEXT_MUTED)
-        self.live_asr_status_lbl.pack(side="left", padx=(4, 0))
-        ctk.CTkLabel(
-            live_status_row, text="     번역:", font=self.font_base, text_color=UI_TEXT_MUTED
-        ).pack(side="left")
-        self.live_trans_status_lbl = ctk.CTkLabel(live_status_row, text="확인 중", font=self.font_base, text_color=UI_TEXT_MUTED)
-        self.live_trans_status_lbl.pack(side="left", padx=(4, 0))
 
         live_row1 = ctk.CTkFrame(self.live_tab, fg_color="transparent")
         live_row1.pack(fill="x", pady=6)
@@ -4245,7 +4438,7 @@ class PapaStopApp(ctk.CTk):
             common,
             height=170,
             wrap="word",
-            fg_color="#ffffff",
+            fg_color=UI_SURFACE,
             text_color=UI_TEXT,
             border_color=UI_BORDER_STRONG,
             border_width=1,
@@ -4274,9 +4467,9 @@ class PapaStopApp(ctk.CTk):
         host.tkraise()
         for nav_key, btn in self._nav_buttons.items():
             if nav_key == key:
-                btn.configure(fg_color="#e0e7ff", text_color=UI_ACCENT)
+                btn.configure(fg_color=UI_ACCENT_SOFT, text_color=UI_ACCENT, font=self.font_nav_bold)
             else:
-                btn.configure(fg_color="transparent", text_color=UI_TEXT)
+                btn.configure(fg_color="transparent", text_color=UI_TEXT, font=self.font_base)
 
     def _sync_log_header(self) -> None:
         status = str(self.status_var.get()).strip() or "대기 중"
@@ -4902,7 +5095,7 @@ class PapaStopApp(ctk.CTk):
             if label_widget is None:
                 return
             text = "✓ 사용 가능" if ready else "↓ 다운로드 필요"
-            color = "#16a34a" if ready else "#d97706"
+            color = UI_OK if ready else UI_WARN
             try:
                 label_widget.configure(text=text, text_color=color)
             except Exception:

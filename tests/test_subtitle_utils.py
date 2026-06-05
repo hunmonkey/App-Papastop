@@ -10,9 +10,11 @@ from papastop import (
     ASREngine,
     OperationCancelled,
     SubtitleSegment,
+    TranslationEngine,
     build_eta_text,
     build_resource_settings,
     build_subtitle_overwrite_prompt,
+    clean_translation_for_subtitle,
     clean_text_for_srt,
     default_srt_path,
     format_bytes_as_gib,
@@ -44,6 +46,16 @@ class FakeASREngine(ASREngine):
         )
 
 
+class FakeLlama:
+    def __init__(self, content: str):
+        self.content = content
+        self.messages = []
+
+    def create_chat_completion(self, *, messages, **_kwargs):
+        self.messages.append(messages)
+        return {"choices": [{"message": {"content": self.content}}]}
+
+
 class SubtitleUtilityTests(unittest.TestCase):
     def test_format_srt_time(self):
         self.assertEqual(format_srt_time(0.0), "00:00:00,000")
@@ -51,6 +63,48 @@ class SubtitleUtilityTests(unittest.TestCase):
 
     def test_clean_text_for_srt(self):
         self.assertEqual(clean_text_for_srt("  Hello     world  "), "Hello world")
+
+    def test_clean_translation_for_subtitle_removes_source_lines(self):
+        text = "日本語: 今日はいい天気ですね\n한국어: 오늘은 날씨가 좋네요."
+
+        self.assertEqual(
+            clean_translation_for_subtitle(text, "今日はいい天気ですね"),
+            "오늘은 날씨가 좋네요.",
+        )
+
+        self.assertEqual(
+            clean_translation_for_subtitle(
+                "Japanese: 今日はいい天気ですね Korean: 오늘은 날씨가 좋네요.",
+                "今日はいい天気ですね",
+            ),
+            "오늘은 날씨가 좋네요.",
+        )
+
+    def test_clean_translation_for_subtitle_rejects_source_only_japanese(self):
+        self.assertEqual(clean_translation_for_subtitle("今日はいい天気ですね", "今日はいい天気ですね"), "")
+
+    def test_llm_numbered_translation_parser_keeps_korean_only(self):
+        engine = TranslationEngine()
+
+        parsed = engine._parse_llm_numbered_translations(
+            "1. Japanese: 今日はいい天気ですね\n한국어: 오늘은 날씨가 좋네요.\n2. 번역: 같이 가요.",
+            ["今日はいい天気ですね", "行きましょう"],
+        )
+
+        self.assertEqual(parsed, ["오늘은 날씨가 좋네요.", "같이 가요."])
+
+    def test_llm_translation_batches_lines_for_context(self):
+        engine = TranslationEngine()
+        fake = FakeLlama("1. 오늘은 날씨가 좋네요.\n2. 같이 가요.")
+        engine._load_llama = lambda _key: fake
+
+        translated = engine._translate_llama(["今日はいい天気ですね", "行きましょう"], "ja", "qwen2.5-14b")
+
+        self.assertEqual(translated, ["오늘은 날씨가 좋네요.", "같이 가요."])
+        user_prompt = fake.messages[0][1]["content"]
+        self.assertIn("1. 今日はいい天気ですね", user_prompt)
+        self.assertIn("2. 行きましょう", user_prompt)
+        self.assertIn("Return exactly 2 lines", user_prompt)
 
     def test_write_srt_filters_empty_lines_and_indexes(self):
         output = Path(tempfile.gettempdir()) / "papastop_test.srt"

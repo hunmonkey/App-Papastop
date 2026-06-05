@@ -134,8 +134,12 @@ PapaStop은 밝은 라이트 테마를 기본으로 한다.
 핵심 액션(옅은 인디고)  #6366f1     UI_ACCENT           시작 버튼, 진행률, 선택 강조, 드롭다운 화살표 칸
 핵심 액션 hover        #5457e6     UI_ACCENT_HOVER     핵심 버튼 hover
 핵심 액션 active       #4548c9     UI_ACCENT_ACTIVE    핵심 버튼 눌림
-중지/위험              #dc2626     -                   중지, 삭제, 실패
-중지/위험 hover        #b91c1c     -                   위험 버튼 hover
+강조 소프트 배경        #e0e7ff     UI_ACCENT_SOFT      선택된 탭, 세그먼트 선택 배경
+강조 소프트 hover       #c7d2fe     UI_ACCENT_SOFT_HOVER 세그먼트 선택 hover
+중지/위험              #dc2626     UI_DANGER           중지, 삭제, 실패
+중지/위험 hover        #b91c1c     UI_DANGER_HOVER     위험 버튼 hover
+준비 완료(초록)         #16a34a     UI_OK               모델 준비 완료 표시(제한적)
+준비 필요(주황)         #d97706     UI_WARN             모델 다운로드 필요 표시
 
 핵심 액션은 "눈에 자극적이지 않은 옅은 인디고"로 한다. 진한 인디고(#4f46e5)나 형광 파랑은 쓰지 않는다.
 색은 소금처럼 조금만 쓴다. 많이 넣을수록 화면이 맛을 잃는다.
