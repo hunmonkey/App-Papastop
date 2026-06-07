@@ -2,6 +2,14 @@ param(
     [switch]$SkipInstall
 )
 
+# 배포 빌드 전 확인할 것
+# - 권장 실행 명령:
+#   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build_package.ps1 -SkipInstall
+# - 소스 코드를 고친 뒤라면 먼저 `python -m py_compile papastop.py`로 기본 문법을 확인합니다.
+# - 일반 배포본은 `.papastop_data\huggingface` 모델 캐시를 함께 복사하므로 여유 디스크 공간을 확인합니다.
+# - PyInstaller가 onnxruntime, torch tensorboard, llama_cpp, CUDA DLL 경고를 보여도 항상 실패는 아닙니다.
+#   마지막 `Package created:` 문구와 `dist\PapaStop\PapaStop.exe`, `.papastop_data` 내용을 함께 확인합니다.
+
 $ErrorActionPreference = "Stop"
 
 $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path

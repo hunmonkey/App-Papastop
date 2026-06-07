@@ -70,8 +70,20 @@ python papastop.py
 
 ## 패키징
 
-`build_package.bat` 또는 `build_package.ps1` 실행 시 단일 EXE를 생성합니다.
-`dist\PapaStop.exe`가 만들어지며, CUDA/모델 캐시 일부는 필요 시 `dist\.papastop_data`에 함께 생성됩니다.
+Windows PowerShell에서 실행 정책 때문에 스크립트가 막힐 수 있으므로 아래처럼 실행합니다.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build_package.ps1 -SkipInstall
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build_package_min.ps1 -SkipInstall
+```
+
+- 일반 배포본: `dist\PapaStop\PapaStop.exe`
+  - `dist\PapaStop\.papastop_data`에 CUDA 라이브러리, Hugging Face 모델 캐시, NLLB CT2 모델을 함께 복사합니다.
+  - 새 모델을 받은 뒤 배포할 때는 빌드 전에 앱 기준으로 모델 준비 상태를 확인합니다.
+- 최소 배포본: `dist_min\PapaStop\PapaStop.exe`
+  - 모델 캐시는 넣지 않고 CUDA 라이브러리와 `README_MINIMUM.txt`만 넣습니다.
+  - `README_MINIMUM.txt`는 Windows PowerShell 한글 깨짐을 피하려고 `build_package_min.ps1`에서 UTF-8 base64로 생성합니다.
+- PyInstaller가 `onnxruntime`, `torch.utils.tensorboard`, `llama_cpp`, CUDA DLL 경고를 출력해도 바로 실패로 보지 말고, 마지막 `Package created:` 문구와 실제 EXE/데이터 폴더를 확인합니다.
 
 ---
 

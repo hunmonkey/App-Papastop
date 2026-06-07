@@ -140,6 +140,7 @@ LLM_MODEL_ORDER = (
     "exaone-7.8b",
     "qwen3-14b",
     "gemma3-12b",
+    "gemma4-12b",
     "aya-expanse-8b",
     "mistral-small-24b",
     "qwen3-30b-a3b",
@@ -165,6 +166,12 @@ LLM_MODELS = {
         "repo": "bartowski/google_gemma-3-12b-it-GGUF",
         "file": "google_gemma-3-12b-it-Q4_K_M.gguf",
         "label": "Gemma 3 12B (다국어·한국어 강함)",
+        "vram_gb": 8,
+    },
+    "gemma4-12b": {
+        "repo": "ggml-org/gemma-4-12B-it-GGUF",
+        "file": "gemma-4-12B-it-Q4_K_M.gguf",
+        "label": "Gemma 4 12B (최신·고효율)",
         "vram_gb": 8,
     },
     "aya-expanse-8b": {
@@ -1149,6 +1156,147 @@ def hf_file_cached(repo_id: str, filename: str) -> bool:
         return False
 
 
+def hf_repo_cache_key(repo_id: str) -> str:
+    return "models--" + repo_id.replace("/", "--")
+
+
+def whisper_model_repo(model_name: str) -> str:
+    try:
+        from faster_whisper.utils import _MODELS
+
+        return _MODELS.get(model_name, f"Systran/faster-whisper-{model_name}")
+    except Exception:
+        return f"Systran/faster-whisper-{model_name}"
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _path_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            try:
+                total += child.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _remove_path(path: Path) -> int:
+    removed_bytes = _path_size(path)
+    if not path.exists():
+        return 0
+
+    def clear_readonly(func, target, _exc_info):
+        try:
+            os.chmod(target, 0o700)
+        except OSError:
+            pass
+        func(target)
+
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, onerror=clear_readonly)
+    else:
+        path.unlink()
+    return removed_bytes
+
+
+def delete_hf_repo_files(repo_id: str) -> tuple[int, list[Path]]:
+    ensure_cache_dirs()
+    hub_root = HF_HOME / "hub"
+    cache_key = hf_repo_cache_key(repo_id)
+    candidates = (
+        hub_root / cache_key,
+        hub_root / ".locks" / cache_key,
+    )
+    removed_bytes = 0
+    removed_paths: list[Path] = []
+    for path in candidates:
+        if path.exists() and _path_within(path, hub_root):
+            removed_bytes += _remove_path(path)
+            removed_paths.append(path)
+    return removed_bytes, removed_paths
+
+
+def delete_whisper_model_files(model_name: str) -> tuple[int, list[Path]]:
+    return delete_hf_repo_files(whisper_model_repo(model_name))
+
+
+def delete_llm_model_files(key: str) -> tuple[int, list[Path]]:
+    spec = LLM_MODELS.get(key)
+    if spec is None:
+        return 0, []
+    return delete_hf_repo_files(spec["repo"])
+
+
+def delete_nllb_model_files(model_name: str) -> tuple[int, list[Path]]:
+    removed_bytes = 0
+    removed_paths: list[Path] = []
+    ct2_path = NLLB_CT2_MODEL_DIRS.get(model_name)
+    if ct2_path is not None and ct2_path.exists() and _path_within(ct2_path, PAPASTOP_DATA):
+        removed_bytes += _remove_path(ct2_path)
+        removed_paths.append(ct2_path)
+    hf_bytes, hf_paths = delete_hf_repo_files(model_name)
+    removed_bytes += hf_bytes
+    removed_paths.extend(hf_paths)
+    return removed_bytes, removed_paths
+
+
+def delete_opus_model_files() -> tuple[int, list[Path]]:
+    removed_bytes = 0
+    removed_paths: list[Path] = []
+    for repo_id in OPUS_MT_MODELS.values():
+        hf_bytes, hf_paths = delete_hf_repo_files(repo_id)
+        removed_bytes += hf_bytes
+        removed_paths.extend(hf_paths)
+    return removed_bytes, removed_paths
+
+
+def _is_argos_package_path(path: Path) -> bool:
+    parts = {part.lower() for part in path.parts}
+    return "argos-translate" in parts and "packages" in parts
+
+
+def delete_argos_package_files() -> tuple[int, list[Path]]:
+    if not has_module("argostranslate"):
+        return 0, []
+    removed_bytes = 0
+    removed_paths: list[Path] = []
+    try:
+        import argostranslate.package as argostranslate_package
+
+        packages = argostranslate_package.get_installed_packages()
+    except Exception:
+        return 0, []
+
+    for package in packages:
+        package_path = Path(getattr(package, "package_path", ""))
+        if package_path.exists() and _is_argos_package_path(package_path):
+            removed_bytes += _remove_path(package_path)
+            removed_paths.append(package_path)
+
+    try:
+        import argostranslate.translate as argostranslate_translate
+
+        argostranslate_translate.load_installed_languages()
+    except Exception:
+        pass
+    return removed_bytes, removed_paths
+
+
 # 모델 다운로드 진행률을 GUI로 흘려보내기 위한 전역 후크.
 # faster-whisper·transformers·llama_cpp는 모두 huggingface_hub로 모델을 내려받고,
 # huggingface_hub는 내부에서 tqdm 진행바를 쓴다. 그 tqdm을 가로채 진행/속도/남은시간을 전달한다.
@@ -1655,13 +1803,7 @@ class ASREngine:
     def is_model_ready(self, model_name: str | None = None) -> bool:
         """선택한 음성 인식 모델이 이미 내려받아져 바로 쓸 수 있으면 True."""
         size = model_name or self.model_name
-        try:
-            from faster_whisper.utils import _MODELS
-
-            repo = _MODELS.get(size, f"Systran/faster-whisper-{size}")
-        except Exception:
-            repo = f"Systran/faster-whisper-{size}"
-        return hf_file_cached(repo, "model.bin")
+        return hf_file_cached(whisper_model_repo(size), "model.bin")
 
     def resource_summary(self) -> str:
         return self._resource_summary
@@ -2421,6 +2563,24 @@ class TranslationEngine:
     def _opus_ready(self) -> bool:
         # ja/zh OPUS 1차 모델이 모두 받아져 있어야 사용 가능.
         return all(hf_file_cached(repo, "pytorch_model.bin") for repo in OPUS_MT_MODELS.values())
+
+    def release_runtime_cache(self, engine: str, model: str | None) -> None:
+        """삭제 직전 메모리에 올려둔 번역 모델을 내려 파일 잠금을 피한다."""
+        with self._pipeline_lock:
+            if engine == "llama" and model is not None:
+                loaded = self._llama_models.pop(model, None)
+                close = getattr(loaded, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+            elif engine == "nllb" and model is not None:
+                self._nllb_ct2_translators.pop(model, None)
+                self._nllb_pipelines.pop(model, None)
+                self._nllb_tokenizer = None
+            elif engine == "opus":
+                self._opus_pipelines.clear()
 
 
 class FileSubtitleWorkflow:
@@ -4085,7 +4245,8 @@ class PapaStopApp(ctk.CTk):
 
         # 음성 인식 / 번역 콤보를 같은 폭으로 두어야 뒤따르는 다운로드 버튼 열이 맞는다.
         MODEL_COMBO_W = 250
-        MODEL_BTN_W = 175
+        MODEL_BTN_W = 160
+        MODEL_DELETE_BTN_W = 74
         PATH_BTN1_W = 120   # 선택 / 같은 이름으로 (왼쪽 버튼 열)
         PATH_BTN2_W = 110   # 목록에 추가 / 폴더 선택 (오른쪽 버튼 열)
 
@@ -4152,15 +4313,26 @@ class PapaStopApp(ctk.CTk):
             width=MODEL_COMBO_W,
         )
         whisper_holder.grid(row=0, column=1, sticky="w", padx=10, pady=6)
+        asr_action_frame = ctk.CTkFrame(model_form, fg_color="transparent")
+        asr_action_frame.grid(row=0, column=2, sticky="w", pady=6)
         self.prepare_asr_btn = ctk.CTkButton(
-            model_form,
+            asr_action_frame,
             text="위스퍼 모델 다운로드",
             command=self._prepare_asr_model,
             width=MODEL_BTN_W,
             height=self._sec_btn_h,
             **self._ghost_btn,
         )
-        self.prepare_asr_btn.grid(row=0, column=2, sticky="w", pady=6)
+        self.prepare_asr_btn.pack(side="left")
+        self.delete_asr_btn = ctk.CTkButton(
+            asr_action_frame,
+            text="삭제",
+            command=self._delete_file_asr_model,
+            width=MODEL_DELETE_BTN_W,
+            height=self._sec_btn_h,
+            **self._danger_btn,
+        )
+        self.delete_asr_btn.pack(side="left", padx=(8, 0))
         row_label(model_form, "원본 언어").grid(row=0, column=3, sticky="w", padx=(18, 0), pady=6)
         file_lang_holder, self.file_source_lang_combo = self._make_option_menu(
             model_form,
@@ -4180,15 +4352,26 @@ class PapaStopApp(ctk.CTk):
             width=MODEL_COMBO_W,
         )
         translation_holder.grid(row=1, column=1, sticky="w", padx=10, pady=6)
+        translation_action_frame = ctk.CTkFrame(model_form, fg_color="transparent")
+        translation_action_frame.grid(row=1, column=2, sticky="w", pady=6)
         self.prepare_translation_btn = ctk.CTkButton(
-            model_form,
+            translation_action_frame,
             text="번역 모델 다운로드",
             command=self._prepare_translation_model,
             width=MODEL_BTN_W,
             height=self._sec_btn_h,
             **self._ghost_btn,
         )
-        self.prepare_translation_btn.grid(row=1, column=2, sticky="w", pady=6)
+        self.prepare_translation_btn.pack(side="left")
+        self.delete_translation_btn = ctk.CTkButton(
+            translation_action_frame,
+            text="삭제",
+            command=self._delete_file_translation_model,
+            width=MODEL_DELETE_BTN_W,
+            height=self._sec_btn_h,
+            **self._danger_btn,
+        )
+        self.delete_translation_btn.pack(side="left", padx=(8, 0))
         self._hint_label(
             model_form,
             text="고품질 LLM은 GPU·VRAM 사용 / 첫 선택 시 수 GB 다운로드",
@@ -4254,8 +4437,10 @@ class PapaStopApp(ctk.CTk):
             self.cancel_file_btn,
             self.whisper_model_combo,
             self.prepare_asr_btn,
+            self.delete_asr_btn,
             self.translation_profile_combo,
             self.prepare_translation_btn,
+            self.delete_translation_btn,
         ]
 
         status_row = self._make_status_row(
@@ -4325,8 +4510,17 @@ class PapaStopApp(ctk.CTk):
             width=MODEL_COMBO_W,
         )
         live_model_holder.grid(row=2, column=1, sticky="w", padx=10, pady=4)
+        self.delete_live_asr_btn = ctk.CTkButton(
+            live_form,
+            text="삭제",
+            command=self._delete_live_asr_model,
+            width=MODEL_DELETE_BTN_W,
+            height=self._sec_btn_h,
+            **self._danger_btn,
+        )
+        self.delete_live_asr_btn.grid(row=2, column=2, sticky="w", pady=4)
         self._hint_label(live_form, "실시간은 빠른 tiny/base 권장", wraplength=360).grid(
-            row=2, column=2, columnspan=3, sticky="ew", padx=(6, 10), pady=4
+            row=2, column=3, columnspan=2, sticky="ew", padx=(10, 10), pady=4
         )
 
         self._form_label(live_form, "번역 모델").grid(row=3, column=0, sticky="w", pady=4)
@@ -4338,8 +4532,17 @@ class PapaStopApp(ctk.CTk):
             width=MODEL_COMBO_W,
         )
         live_trans_holder.grid(row=3, column=1, sticky="w", padx=10, pady=4)
+        self.delete_live_translation_btn = ctk.CTkButton(
+            live_form,
+            text="삭제",
+            command=self._delete_live_translation_model,
+            width=MODEL_DELETE_BTN_W,
+            height=self._sec_btn_h,
+            **self._danger_btn,
+        )
+        self.delete_live_translation_btn.grid(row=3, column=2, sticky="w", pady=4)
         self._hint_label(live_form, "파일 탭과 동일 · LLM은 실시간이 느려질 수 있음", wraplength=360).grid(
-            row=3, column=2, columnspan=3, sticky="ew", padx=(6, 10), pady=4
+            row=3, column=3, columnspan=2, sticky="ew", padx=(10, 10), pady=4
         )
 
         # OPUS-MT(영어 1차) 선택 시 영어→한국어 2차 번역 설정
@@ -4816,6 +5019,7 @@ class PapaStopApp(ctk.CTk):
             self.prepare_translation_btn.configure(state="disabled")
             self.start_file_btn.configure(state="disabled")
         self._refresh_resource_mode_control_state()
+        self._refresh_model_action_states()
 
     def _refresh_resource_mode_control_state(self) -> None:
         if not hasattr(self, "resource_mode_combo"):
@@ -4847,6 +5051,7 @@ class PapaStopApp(ctk.CTk):
             self.start_live_btn.configure(state="disabled")
             self.start_record_btn.configure(state="disabled")
         self._refresh_resource_mode_control_state()
+        self._refresh_model_action_states()
 
     def _set_translation_preparing(self, preparing: bool) -> None:
         self._is_translation_preparing = preparing
@@ -4865,6 +5070,7 @@ class PapaStopApp(ctk.CTk):
             self.start_live_btn.configure(state="disabled")
             self.start_record_btn.configure(state="disabled")
         self._refresh_resource_mode_control_state()
+        self._refresh_model_action_states()
 
     def _set_live_busy(self, busy: bool) -> None:
         self._is_live_running = busy
@@ -4875,6 +5081,7 @@ class PapaStopApp(ctk.CTk):
             self.overlay = None
         self._sync_live_overlay_button()
         self._refresh_resource_mode_control_state()
+        self._refresh_model_action_states()
 
     def _live_overlay_is_visible(self) -> bool:
         if self.overlay is None:
@@ -4945,6 +5152,7 @@ class PapaStopApp(ctk.CTk):
         if self._is_asr_preparing or self._is_translation_preparing:
             self.start_record_btn.configure(state="disabled")
         self._refresh_resource_mode_control_state()
+        self._refresh_model_action_states()
 
     def _select_record_output(self) -> None:
         initial_path = Path(self.record_output_var.get().strip() or str(default_recording_path()))
@@ -5238,6 +5446,7 @@ class PapaStopApp(ctk.CTk):
         except Exception:
             pass
         self._refresh_model_dropdowns()
+        self._refresh_model_action_states()
 
     def _refresh_model_dropdowns(self) -> None:
         # 각 드롭다운 항목 앞에 ✓(사용 가능)/↓(다운로드 필요) 표시를 붙여 갱신한다.
@@ -5271,6 +5480,120 @@ class PapaStopApp(ctk.CTk):
             TRANSLATION_PROFILE_ORDER, TRANSLATION_PROFILE_LABELS, self.live_translator.is_profile_ready,
             self._live_translation_profile_from_selection(),
         )
+
+    def _refresh_model_action_states(self) -> None:
+        busy = (
+            self._is_file_running
+            or self._is_live_running
+            or self._is_record_running
+            or self._is_asr_preparing
+            or self._is_translation_preparing
+        )
+        state = "disabled" if busy else "normal"
+        for name in (
+            "prepare_asr_btn",
+            "delete_asr_btn",
+            "delete_live_asr_btn",
+            "prepare_translation_btn",
+            "delete_translation_btn",
+            "delete_live_translation_btn",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                try:
+                    widget.configure(state=state)
+                except Exception:
+                    pass
+
+    def _model_change_busy(self) -> bool:
+        return (
+            self._is_file_running
+            or self._is_live_running
+            or self._is_record_running
+            or self._is_asr_preparing
+            or self._is_translation_preparing
+        )
+
+    def _confirm_model_delete(self, label: str) -> bool:
+        return messagebox.askyesno(
+            APP_NAME,
+            (
+                f"{label}\n\n"
+                "내려받은 파일만 삭제합니다.\n"
+                "목록의 모델 이름은 그대로 남고, 삭제 후에는 다시 다운로드할 수 있게 표시됩니다.\n\n"
+                "삭제할까요?"
+            ),
+        )
+
+    def _after_model_deleted(self, label: str, removed_bytes: int, removed_paths: list[Path]) -> None:
+        self._refresh_model_status()
+        if removed_paths:
+            message = f"{label} 파일 삭제 완료: {format_file_size(removed_bytes)}"
+        else:
+            message = f"{label}은 이미 삭제된 상태입니다."
+        self._append_log(message)
+        messagebox.showinfo(APP_NAME, message)
+
+    def _delete_file_asr_model(self) -> None:
+        self._delete_asr_model(self._whisper_model_from_selection())
+
+    def _delete_live_asr_model(self) -> None:
+        self._delete_asr_model(self._live_whisper_model_from_selection())
+
+    def _delete_asr_model(self, model_name: str) -> None:
+        if self._model_change_busy():
+            messagebox.showwarning(APP_NAME, "현재 작업이 끝난 뒤 모델을 삭제해 주세요.")
+            return
+        label = self.asr.model_label(model_name)
+        if not self._confirm_model_delete(f"음성 인식 모델: {label}"):
+            return
+
+        if self.asr.model_name == model_name:
+            self.asr.unload()
+        if self.live_asr.model_name == model_name:
+            self.live_asr.unload()
+        try:
+            removed_bytes, removed_paths = delete_whisper_model_files(model_name)
+            self._after_model_deleted(f"음성 인식 모델 {label}", removed_bytes, removed_paths)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"음성 인식 모델 삭제 실패: {exc}")
+            self._append_log(f"음성 인식 모델 삭제 실패: {exc}")
+
+    def _delete_file_translation_model(self) -> None:
+        self._delete_translation_profile(self._translation_profile_from_selection())
+
+    def _delete_live_translation_model(self) -> None:
+        self._delete_translation_profile(self._live_translation_profile_from_selection())
+
+    def _delete_translation_profile(self, profile: str) -> None:
+        if self._model_change_busy():
+            messagebox.showwarning(APP_NAME, "현재 작업이 끝난 뒤 번역 모델을 삭제해 주세요.")
+            return
+        steps = TRANSLATION_PROFILE_ORDER_STEPS.get(profile, ())
+        if not steps:
+            return
+        engine, model = steps[0]
+        label = TRANSLATION_PROFILE_LABELS.get(profile, profile)
+        if not self._confirm_model_delete(f"번역 모델: {label}"):
+            return
+
+        try:
+            self.translator.release_runtime_cache(engine, model)
+            self.live_translator.release_runtime_cache(engine, model)
+            if engine == "llama" and model is not None:
+                removed_bytes, removed_paths = delete_llm_model_files(model)
+            elif engine == "nllb" and model is not None:
+                removed_bytes, removed_paths = delete_nllb_model_files(model)
+            elif engine == "opus":
+                removed_bytes, removed_paths = delete_opus_model_files()
+            elif engine == "argos":
+                removed_bytes, removed_paths = delete_argos_package_files()
+            else:
+                removed_bytes, removed_paths = 0, []
+            self._after_model_deleted(f"번역 모델 {label}", removed_bytes, removed_paths)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"번역 모델 삭제 실패: {exc}")
+            self._append_log(f"번역 모델 삭제 실패: {exc}")
 
     def _live_secondary_from_selection(self) -> str:
         label = self.live_secondary_var.get()

@@ -8,6 +8,11 @@ param(
 # - 모델은 사용자가 처음 기능을 실행할 때 자동으로 내려받습니다.
 # - CUDA 라이브러리는 GPU 가속에 필요하므로 포함합니다.
 # - 일반 빌드(dist\PapaStop)와 섞이지 않도록 dist_min/build_min을 사용합니다.
+# - 권장 실행 명령:
+#   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build_package_min.ps1 -SkipInstall
+# - 빌드 뒤 `dist_min\PapaStop\.papastop_data`에 Hugging Face 모델 캐시가 있으면 최소 배포본이 아닙니다.
+# - PyInstaller가 onnxruntime, torch tensorboard, llama_cpp, CUDA DLL 경고를 보여도 항상 실패는 아닙니다.
+#   마지막 `Package created:` 문구와 `dist_min\PapaStop\PapaStop.exe`를 함께 확인합니다.
 
 $ErrorActionPreference = "Stop"
 
@@ -75,20 +80,12 @@ Copy-Item $NvidiaSrc (Join-Path $DataDir "nvidia") -Recurse -Force
 # 모델(Whisper / NLLB CT2)은 일부러 복사하지 않습니다.
 # papastop.py가 모델이 없으면 첫 사용 때 자동으로 내려받도록 이미 구현되어 있습니다.
 
-$Guide = @'
-PapaStop 최소(minimum) 배포본 안내
-============================================================
-
-이 배포본은 용량을 줄이기 위해 음성인식/번역 "모델"을 포함하지 않습니다.
-
-- 처음 실행한 뒤 음성인식이나 번역을 처음 사용할 때 필요한 모델을 인터넷에서 자동으로 내려받습니다.
-- 한 번 내려받은 모델은 PapaStop.exe 옆의 .papastop_data 폴더 안에 저장됩니다.
-- .papastop_data 폴더를 지우면 모델을 다시 내려받아야 합니다.
-- 처음 사용하는 PC에서는 인터넷 연결이 필요하고, 모델 크기에 따라 첫 사용 시간이 오래 걸릴 수 있습니다.
-
-CUDA(NVIDIA 그래픽카드 가속용 라이브러리)는 포함되어 있습니다.
-NVIDIA 그래픽카드가 있으면 자동으로 GPU 가속을 사용할 수 있습니다.
-'@
+# README_MINIMUM 안내문은 UTF-8 base64로 보관합니다.
+# Windows PowerShell 5에서 한글 here-string이 깨져 저장되는 실수를 막기 위한 장치입니다.
+$GuideBase64 = (
+    "UGFwYVN0b3Ag7LWc7IaMKG1pbmltdW0pIOuwsO2PrOuzuCDslYjrgrQKPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CgrsnbQg67Cw7Y+s67O47J2AIOyaqeufieydhCDspITsnbTquLAg7JyE7ZW0IOydjOyEseyduOyLnS/rsojsl60gIuuqqOuNuCLsnYQg7Y+s7ZWo7ZWY7KeAIOyViuyKteuLiOuLpC4KCi0g7LKY7J2MIOyLpO2Wie2VnCDrkqQg7J2M7ISx7J247Iud7J2064KYIOuyiOyXreydhCDsspjsnYwg7IKs7Jqp7ZWgIOuVjCDtlYTsmpTtlZwg66qo64247J2EIOyduO2EsOuEt+yXkOyEnCDsnpDrj5nsnLzroZwg64K066Ck67Cb7Iq164uI64ukLgotIO2VnCDrsogg64K066Ck67Cb7J2AIOuqqOuNuOydgCBQYXBhU3RvcC5leGUg7JiG7J2YIC5wYXBhc3RvcF9kYXRhIO2PtOuNlCDslYjsl5Ag7KCA7J6l65Cp64uI64ukLgotIC5wYXBhc3RvcF9kYXRhIO2PtOuNlOulvCDsp4DsmrDrqbQg66qo64247J2EIOuLpOyLnCDrgrTroKTrsJvslYTslbwg7ZWp64uI64ukLgotIOyymOydjCDsgqzsmqntlZjripQgUEPsl5DshJzripQg7J247YSw64S3IOyXsOqysOydtCDtlYTsmpTtlZjqs6AsIOuqqOuNuCDtgazquLDsl5Ag65Sw6528IOyyqyDsgqzsmqkg7Iuc6rCE7J20IOyYpOuemCDqsbjrprQg7IiYIOyeiOyKteuLiOuLpC4KCkNVREEoTlZJRElBIOq3uOuemO2Uvey5tOuTnCDqsIDsho3smqkg65287J2067iM65+s66asKeuKlCDtj6ztlajrkJjslrQg7J6I7Iq164uI64ukLgpOVklESUEg6re4656Y7ZS97Lm065Oc6rCAIOyeiOycvOuptCDsnpDrj5nsnLzroZwgR1BVIOqwgOyGjeydhCDsgqzsmqntlaAg7IiYIOyeiOyKteuLiOuLpC4="
+)
+$Guide = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($GuideBase64))
 Set-Content -Path (Join-Path $DistDir "PapaStop\README_MINIMUM.txt") -Value $Guide -Encoding UTF8
 
 Write-Host ""

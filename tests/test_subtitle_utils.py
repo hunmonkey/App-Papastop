@@ -8,8 +8,12 @@ import numpy as np
 
 from papastop import (
     ASREngine,
+    LLM_MODEL_ORDER,
+    LLM_MODELS,
     OperationCancelled,
     SubtitleSegment,
+    TRANSLATION_PROFILE_ORDER,
+    TRANSLATION_PROFILE_ORDER_STEPS,
     TranslationEngine,
     build_eta_text,
     build_resource_settings,
@@ -21,6 +25,7 @@ from papastop import (
     format_duration_short,
     format_srt_time,
     format_vga_spec,
+    hf_repo_cache_key,
     is_http_media_source,
     merge_vga_specs,
     nllb_lang,
@@ -166,6 +171,16 @@ class SubtitleUtilityTests(unittest.TestCase):
     def test_operation_cancelled(self):
         with self.assertRaises(OperationCancelled):
             raise OperationCancelled("cancelled")
+
+    def test_gemma4_profile_is_registered(self):
+        self.assertIn("gemma4-12b", LLM_MODEL_ORDER)
+        self.assertEqual(LLM_MODELS["gemma4-12b"]["repo"], "ggml-org/gemma-4-12B-it-GGUF")
+        self.assertEqual(LLM_MODELS["gemma4-12b"]["file"], "gemma-4-12B-it-Q4_K_M.gguf")
+        self.assertIn("llm-gemma4-12b", TRANSLATION_PROFILE_ORDER)
+        self.assertEqual(TRANSLATION_PROFILE_ORDER_STEPS["llm-gemma4-12b"][0], ("llama", "gemma4-12b"))
+
+    def test_hf_repo_cache_key_uses_hub_folder_name(self):
+        self.assertEqual(hf_repo_cache_key("ggml-org/gemma-4-12B-it-GGUF"), "models--ggml-org--gemma-4-12B-it-GGUF")
 
     def test_system_spec_formatters(self):
         self.assertEqual(format_bytes_as_gib(8 * 1024**3), "8.0 GB")
