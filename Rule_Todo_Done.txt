@@ -533,3 +533,33 @@ AI 작업 인수인계용 진행 기록 / To-Do Done
   검증: python -m py_compile .\papastop.py 통과.
    .\.venv\Scripts\python.exe -c "from papastop import PapaStopApp; app=PapaStopApp(); app.update(); app._show_tab('help'); app.update(); print('intro_removed=', 'PapaStop 도움말' not in open('papastop.py', encoding='utf-8').read()); print('help_children=', len(app.help_tab.winfo_children())); app.destroy()" 결과 intro_removed=True, help_children=1.
    rg -n "PapaStop 도움말|각 메뉴와 버튼의 역할|이 페이지는 내용이 길어질 수" papastop.py 결과 없음.
+
+------------------------------------------------------------
+
+[완료] 12. TranslateGemma 12B GGUF 번역 모델 추가  (2026-06-14 20:34:59)
+  어디: papastop.py, tests/test_subtitle_utils.py
+  무엇/어떻게:
+   · 외부 Ollama 연동 방식은 포터블 독립 실행 프로그램 목적과 맞지 않아 제거.
+   · TranslateGemma 12B를 기존 LLM 번역 모델들과 같은 GGUF/Hugging Face 다운로드 방식으로 추가.
+   · 사용 파일: mradermacher/translategemma-12b-it-GGUF / translategemma-12b-it.Q4_K_M.gguf.
+   · 파일 자막/실시간 자막 공통 번역 모델 목록에 `llm-translategemma-12b` 프로필로 등록.
+   · 선택 시 기존 llama.cpp 로컬 로딩 경로를 사용하고, 실패 시 기존 NLLB 1.3B 폴백 흐름을 유지.
+   · 모델 파일을 .papastop_data\huggingface\hub 캐시에 실제 다운로드 완료(약 6.8GB).
+  검증: .\.venv\Scripts\python.exe -m py_compile .\papastop.py 통과.
+        .\.venv\Scripts\python.exe -m unittest -q 통과(35개).
+        import 확인: llm-translategemma-12b 프로필 등록=True, ready=True, repo/file 매핑 확인.
+        실제 GGUF 번역 스모크: "Hello, nice to meet you." → "안녕, 만나서 반가워요".
+
+------------------------------------------------------------
+
+[완료] 13. TranslateGemma 포함 일반 배포본 재빌드  (2026-06-14 21:18:08)
+  어디: build_package.ps1, dist\PapaStop
+  무엇/어떻게:
+   · 일반 배포 빌드 명령으로 dist\PapaStop 배포본을 다시 생성.
+   · .papastop_data\huggingface 캐시가 배포 폴더로 복사되어 TranslateGemma 12B GGUF 파일이 포함됨을 확인.
+   · EXE와 CUDA/NLLB 데이터 폴더가 함께 생성된 것을 확인.
+  검증: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build_package.ps1 -SkipInstall 성공.
+        dist\PapaStop\PapaStop.exe 생성 확인(약 69.59MB, 2026-06-14 21:08:48).
+        dist\PapaStop\.papastop_data\huggingface\hub 안의 translategemma-12b-it.Q4_K_M.gguf 확인(약 6.8GB).
+        dist\PapaStop\.papastop_data\nvidia 및 NLLB CT2 600M/1.3B/3.3B 폴더 확인.
+        PapaStop.exe 실행 스모크: 8초 후 프로세스 생존 확인, 강제 종료 후 종료 확인.

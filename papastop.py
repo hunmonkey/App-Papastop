@@ -141,6 +141,7 @@ LLM_MODEL_ORDER = (
     "qwen3-14b",
     "gemma3-12b",
     "gemma4-12b",
+    "translategemma-12b",
     "aya-expanse-8b",
     "mistral-small-24b",
     "qwen3-30b-a3b",
@@ -173,6 +174,12 @@ LLM_MODELS = {
         "file": "gemma-4-12B-it-Q4_K_M.gguf",
         "label": "Gemma 4 12B (최신·고효율)",
         "vram_gb": 8,
+    },
+    "translategemma-12b": {
+        "repo": "mradermacher/translategemma-12b-it-GGUF",
+        "file": "translategemma-12b-it.Q4_K_M.gguf",
+        "label": "TranslateGemma 12B (번역 특화)",
+        "vram_gb": 9,
     },
     "aya-expanse-8b": {
         "repo": "bartowski/aya-expanse-8b-GGUF",

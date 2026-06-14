@@ -179,6 +179,22 @@ class SubtitleUtilityTests(unittest.TestCase):
         self.assertIn("llm-gemma4-12b", TRANSLATION_PROFILE_ORDER)
         self.assertEqual(TRANSLATION_PROFILE_ORDER_STEPS["llm-gemma4-12b"][0], ("llama", "gemma4-12b"))
 
+    def test_translategemma_profile_is_registered(self):
+        self.assertIn("translategemma-12b", LLM_MODEL_ORDER)
+        self.assertEqual(
+            LLM_MODELS["translategemma-12b"]["repo"],
+            "mradermacher/translategemma-12b-it-GGUF",
+        )
+        self.assertEqual(
+            LLM_MODELS["translategemma-12b"]["file"],
+            "translategemma-12b-it.Q4_K_M.gguf",
+        )
+        self.assertIn("llm-translategemma-12b", TRANSLATION_PROFILE_ORDER)
+        self.assertEqual(
+            TRANSLATION_PROFILE_ORDER_STEPS["llm-translategemma-12b"][0],
+            ("llama", "translategemma-12b"),
+        )
+
     def test_hf_repo_cache_key_uses_hub_folder_name(self):
         self.assertEqual(hf_repo_cache_key("ggml-org/gemma-4-12B-it-GGUF"), "models--ggml-org--gemma-4-12B-it-GGUF")
 
