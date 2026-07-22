@@ -62,6 +62,9 @@ LIVE_SPEECH_PAD_MS = 200           # 발화 앞뒤 여유 패딩
 # 실시간은 이미 발화 단위로 잘려 들어오므로 디코딩 폭(beam)을 좁혀 속도를 높인다.
 # 파일 자막은 정확도 우선이라 영향받지 않는다. 더 빠르게 하려면 1(greedy)로 낮출 수 있다.
 LIVE_BEAM_SIZE = 2
+# 자동 감지 모드에서 같은 언어가 이만큼 연속 감지되면 그 언어로 잠시 고정한다.
+# 짧은 발화마다 언어 감지가 흔들려 엉뚱한 언어로 번역되는 것을 막는다.
+LIVE_STICKY_LANGUAGE_HITS = 3
 
 WHISPER_MODEL_ORDER = ("tiny", "base", "small", "medium", "large-v3", "large-v3-turbo", "distil-large-v3")
 WHISPER_MODEL_LABELS = {
@@ -1491,6 +1494,35 @@ def clean_translation_for_subtitle(translated: str, original: str) -> str:
     return cleaned
 
 
+# 실시간 자막 후처리용 패턴. 위스퍼·번역기 출력에 흔한 문장부호 앞 공백, 괄호/따옴표
+# 주변 공백, 과도한 반복 부호, 문두의 홀로 남은 부호를 정리한다.
+_TIDY_SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([,.!?;:…、。！？])")
+_TIDY_OPEN_WRAP_RE = re.compile(r"([(\[\"'“‘])\s+")
+_TIDY_CLOSE_WRAP_RE = re.compile(r"\s+([)\]\"'”’])")
+_TIDY_REPEAT_MARK_RE = re.compile(r"([!?！？])\1{2,}")
+_TIDY_LONG_DOTS_RE = re.compile(r"\.{4,}")
+_TIDY_LEADING_PUNCT_RE = re.compile(r"^[\s,.;:、。·]+")
+
+
+def tidy_korean_subtitle(text: str) -> str:
+    """실시간 한국어 자막의 문장부호·띄어쓰기를 가볍게 정리한다(뜻은 건드리지 않음)."""
+    cleaned = clean_text_for_srt(text)  # 연속 공백 -> 하나
+    if not cleaned:
+        return ""
+    # "안녕 ." -> "안녕.", "정말 ?" -> "정말?" 처럼 부호 앞의 불필요한 공백 제거.
+    cleaned = _TIDY_SPACE_BEFORE_PUNCT_RE.sub(r"\1", cleaned)
+    # 여는 괄호·따옴표 뒤, 닫는 괄호·따옴표 앞의 공백 정리.
+    cleaned = _TIDY_OPEN_WRAP_RE.sub(r"\1", cleaned)
+    cleaned = _TIDY_CLOSE_WRAP_RE.sub(r"\1", cleaned)
+    # 같은 종결부호가 3개 이상 반복되면 하나로 줄인다("!!"는 강조로 남겨 둔다).
+    cleaned = _TIDY_REPEAT_MARK_RE.sub(r"\1", cleaned)
+    # 마침표 4개 이상은 말줄임표로 정리(".."·"..."는 그대로 둔다).
+    cleaned = _TIDY_LONG_DOTS_RE.sub("…", cleaned)
+    # 문장 맨 앞에 홀로 남은 쉼표·마침표 등을 제거.
+    cleaned = _TIDY_LEADING_PUNCT_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
 def default_recording_path(output_dir: Path | None = None) -> Path:
     folder = output_dir if output_dir is not None else PAPASTOP_DATA / "recordings"
     return folder / f"screen-{time.strftime('%Y%m%d-%H%M%S')}.mkv"
@@ -1756,6 +1788,56 @@ def write_pcm16_to_wav(pcm_bytes: bytes, sample_rate: int, output_path: Path) ->
         wf.writeframes(pcm_bytes)
 
 
+# 위스퍼가 무음 구간에서 통째로 지어내는 대표적 인사·구독 유도 문구(유튜브 자막 학습 흔적).
+# 세그먼트 전체가 이 문구와 정확히 일치할 때만 걸러내 실제 문장 오탐을 최소화한다.
+_HALLUCINATION_FILLER_PHRASES = frozenset({
+    # 한국어
+    "감사합니다", "고맙습니다", "시청해주셔서 감사합니다", "시청해 주셔서 감사합니다",
+    "구독과 좋아요", "구독 좋아요 알림설정", "구독과 좋아요 부탁드립니다", "다음 영상에서 만나요",
+    # 영어
+    "thank you", "thank you very much", "thanks for watching", "thank you for watching",
+    "please subscribe", "subscribe to my channel", "see you next time",
+    # 일본어
+    "ありがとうございました", "ご視聴ありがとうございました",
+    # 중국어
+    "谢谢观看", "谢谢大家", "请订阅", "字幕",
+})
+# 양끝 문장부호·따옴표·괄호와 공백을 걷어내고 소문자화해 필러 문구와 비교하기 위한 패턴.
+_FILLER_TRIM_RE = re.compile(r"^[\s\"'“”‘’()\[\].!?…,、。！？·\-~]+|[\s\"'“”‘’()\[\].!?…,、。！？·\-~]+$")
+
+
+def _normalize_for_filler_match(text: str) -> str:
+    cleaned = _FILLER_TRIM_RE.sub("", text.strip().lower())
+    return re.sub(r"\s+", " ", cleaned)
+
+
+def is_probable_hallucination(
+    text: str,
+    no_speech_prob: float,
+    avg_logprob: float,
+    compression_ratio: float,
+) -> bool:
+    """무음·잡음 구간에서 위스퍼가 지어내는 '환각' 자막인지 추정한다(실시간 전용 필터).
+
+    실시간은 침묵·박수·배경음까지 발화로 잘려 들어와, 위스퍼가 "감사합니다", "Thank you"
+    같은 문구나 같은 단어 반복을 지어내 이상한 번역의 주원인이 된다. 실제 발화를 지우지
+    않도록 신호가 뚜렷할 때만 True를 돌려주는 보수적 판단이다.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    # 무음 확률이 매우 높으면(위스퍼가 소리가 없다고 강하게 판단) 지어낸 자막으로 본다.
+    if no_speech_prob >= 0.85:
+        return True
+    # 같은 토큰이 반복되는 환각은 압축률이 비정상적으로 높다(정상 문장은 대개 2.4 미만).
+    if compression_ratio >= 2.6 and avg_logprob <= -0.4:
+        return True
+    # 세그먼트 전체가 알려진 환각 문구와 정확히 일치하면 걸러낸다(부분 일치는 건드리지 않음).
+    if _normalize_for_filler_match(stripped) in _HALLUCINATION_FILLER_PHRASES:
+        return True
+    return False
+
+
 class ASREngine:
     def __init__(self, model_name: str = DEFAULT_WHISPER_MODEL, resource_mode: str = DEFAULT_RESOURCE_MODE):
         self.model_name = model_name
@@ -1901,6 +1983,8 @@ class ASREngine:
         vad_filter: bool = True,
         beam_size: int | None = None,
         word_timestamps: bool = False,
+        language_override: str | None = None,
+        drop_hallucinations: bool = False,
     ) -> tuple[list[SubtitleSegment], str]:
         self._load_model(on_line=on_line)
         assert self._model is not None
@@ -1909,7 +1993,12 @@ class ASREngine:
             raise OperationCancelled("취소되었습니다.")
 
         settings = build_resource_settings(self.resource_mode)
-        forced_language = None if self.source_language == SOURCE_LANG_AUTO else self.source_language
+        # language_override가 주어지면(실시간 sticky 고정) 그 언어를 우선 강제하고,
+        # 없으면 사용자가 고른 소스 언어(자동이면 감지)를 따른다.
+        if language_override is not None:
+            forced_language = language_override
+        else:
+            forced_language = None if self.source_language == SOURCE_LANG_AUTO else self.source_language
         # 파일 경로면 문자열로, 실시간 numpy 파형이면 그대로 넘긴다(faster-whisper가 둘 다 지원).
         audio_input = str(audio) if isinstance(audio, (str, Path)) else audio
         transcribe_kwargs = {
@@ -1934,6 +2023,15 @@ class ASREngine:
 
             text = (segment.text or "").strip()
             if not text:
+                continue
+            # 실시간 전용: 무음·잡음 구간에서 지어낸 환각 자막을 걸러 이상한 번역을 막는다.
+            # 속성이 없는(테스트용 가짜) 세그먼트는 기본값 덕분에 걸러지지 않는다.
+            if drop_hallucinations and is_probable_hallucination(
+                text,
+                float(getattr(segment, "no_speech_prob", 0.0) or 0.0),
+                float(getattr(segment, "avg_logprob", 0.0) or 0.0),
+                float(getattr(segment, "compression_ratio", 0.0) or 0.0),
+            ):
                 continue
             # 단어 타임스탬프가 있으면 실제 첫/마지막 단어 시각으로 자막 구간을 좁혀 싱크를 맞춘다.
             words = getattr(segment, "words", None) if word_timestamps else None
@@ -2495,7 +2593,9 @@ class TranslationEngine:
         assert model is not None
         return self._translate_nllb(english, "en", model)
 
-    def translate_texts(self, texts: list[str], source_code: str) -> list[str]:
+    def translate_texts(
+        self, texts: list[str], source_code: str, allow_original_fallback: bool = True
+    ) -> list[str]:
         if not texts:
             return []
 
@@ -2517,8 +2617,11 @@ class TranslationEngine:
                     raise
                 continue
 
-        # fallback: no translation but keeps flow alive
-        return list(texts)
+        # 모든 엔진이 실패한 경우. 파일 자막은 원문이라도 남기지만(allow_original_fallback),
+        # 실시간은 원문(외국어)이 자막으로 새는 것을 막으려 예외를 던져 해당 구간을 건너뛴다.
+        if allow_original_fallback:
+            return list(texts)
+        raise RuntimeError("번역 엔진을 사용할 수 없어 이 구간을 건너뜁니다.")
 
     def profile_label(self, profile: str | None = None) -> str:
         target = profile or self.preferred
@@ -2801,10 +2904,21 @@ class LiveCaptionService:
         self._source_url: str | None = None
         self._loopback_recorder: object | None = None
         self._srt_path: Path | None = None
+        self._reset_run_state()
+
+    def _reset_run_state(self) -> None:
+        """매 실행마다 0으로 되돌리는 누적·상태 값(__init__과 start()가 함께 쓴다)."""
         self._srt_rows: list[SubtitleSegment] = []
         self._srt_emitted = False
         self._dropped_chunks = 0
         self._lag_warned_at = 0.0
+        # 자동 언어 감지 흔들림 방지용 sticky 상태.
+        self._sticky_language: str | None = None
+        self._sticky_candidate: str | None = None
+        self._sticky_candidate_hits = 0
+        # 발화 처리 중 발생하는 일시적 오류(치명적 아님)의 상태·rate limit용.
+        self._worker_error_warned_at = 0.0
+        self._worker_error_count = 0
 
     def _is_running(self) -> bool:
         return (
@@ -2827,10 +2941,7 @@ class LiveCaptionService:
         self._chunk_queue = queue.Queue(maxsize=8)
         self._source_url = internet_url.strip() if internet_url else None
         self._srt_path = save_srt_path
-        self._srt_rows = []
-        self._srt_emitted = False
-        self._dropped_chunks = 0
-        self._lag_warned_at = 0.0
+        self._reset_run_state()
         source_text = f"인터넷 URL: {self._source_url}" if self._source_url else "PC 스피커 소리"
         emit("log", f"실시간 자막 작업을 준비합니다. 입력: {source_text}")
         if self._srt_path is not None:
@@ -3187,12 +3298,16 @@ class LiveCaptionService:
                     # 이미 발화 단위로 잘라 침묵이 제거됐으므로 위스퍼 쪽 VAD는 끄고(이중 처리 방지),
                     # 디코딩 폭(beam)도 좁혀 실시간 속도를 높인다.
                     asr_started_at = time.monotonic()
+                    lang_override = self._live_language_override()
                     segments, source_language = self.asr.transcribe(
                         audio,
                         should_stop=stop_event.is_set,
                         vad_filter=False,
                         beam_size=LIVE_BEAM_SIZE,
+                        language_override=lang_override,
+                        drop_hallucinations=True,
                     )
+                    self._update_sticky_language(source_language, lang_override, emit)
                     asr_elapsed = time.monotonic() - asr_started_at
                     translate_elapsed = 0.0
                     if segments:
@@ -3200,6 +3315,7 @@ class LiveCaptionService:
                         translated = self.translator.translate_texts(
                             [s.text for s in segments],
                             source_language,
+                            allow_original_fallback=False,
                         )
                         translate_elapsed = time.monotonic() - translate_started_at
                         # [임시 진단] 번역이 느린 경우 입력 텍스트의 길이·내용을 남긴다(원인 파악용).
@@ -3215,6 +3331,7 @@ class LiveCaptionService:
                         pairs = []
                         for segment, text in zip(segments, translated):
                             subtitle_text = clean_translation_for_subtitle(text, segment.text)
+                            subtitle_text = tidy_korean_subtitle(subtitle_text)
                             if subtitle_text:
                                 pairs.append((segment, subtitle_text))
                         lines = [text for _, text in pairs]
@@ -3233,9 +3350,58 @@ class LiveCaptionService:
                 except OperationCancelled:
                     emit("log", "실시간 번역이 취소되었습니다.")
                 except Exception as exc:
-                    emit("error", f"실시간 번역 오류: {exc}")
+                    # 발화 하나의 실패로 실시간 전체를 멈추지 않는다. 치명적 오류(모달 팝업+정지)
+                    # 대신 로그·상태줄에만 남기고 다음 발화를 계속 처리한다.
+                    self._report_worker_error(exc, emit)
         finally:
             emit("log", "실시간 자막 처리 스레드가 종료되었습니다.")
+
+    def _source_is_auto(self) -> bool:
+        # 사용자가 소스 언어를 직접 고르면 transcribe가 이미 그 언어를 강제하므로 sticky는 관여하지 않는다.
+        return self.asr.source_language == SOURCE_LANG_AUTO
+
+    def _live_language_override(self) -> str | None:
+        # 자동 감지 모드에서만, 언어가 고정된 뒤에는 그 언어를 넘겨 감지 흔들림을 없앤다.
+        if not self._source_is_auto():
+            return None
+        return self._sticky_language
+
+    def _update_sticky_language(
+        self,
+        detected: str | None,
+        lang_override: str | None,
+        emit: Callable[[str, object], None],
+    ) -> None:
+        # 자동 감지 모드에서 아직 고정 전이라면, 같은 언어가 연속으로 감지될 때 그 언어로 고정한다.
+        if not self._source_is_auto():
+            return
+        if lang_override is not None or not detected or detected == "auto":
+            return
+        if detected == self._sticky_candidate:
+            self._sticky_candidate_hits += 1
+        else:
+            self._sticky_candidate = detected
+            self._sticky_candidate_hits = 1
+        if self._sticky_candidate_hits >= LIVE_STICKY_LANGUAGE_HITS:
+            self._sticky_language = self._sticky_candidate
+            emit(
+                "log",
+                f"실시간 감지 언어를 '{self._sticky_language}'로 고정합니다"
+                "(짧은 발화마다 언어가 흔들려 오역되는 것을 방지).",
+            )
+
+    def _report_worker_error(self, exc: Exception, emit: Callable[[str, object], None]) -> None:
+        # 일시적 오류는 로그에 모두 남기되, 상태줄 알림은 10초에 한 번으로 묶어 오류 폭주를 막는다.
+        emit("log", f"실시간 처리 오류(계속 진행): {exc}")
+        self._worker_error_count += 1
+        now = time.monotonic()
+        if now - self._worker_error_warned_at < 10.0:
+            return
+        self._worker_error_warned_at = now
+        message = f"⚠ 실시간 처리 중 오류가 발생해 일부 구간을 건너뜁니다: {exc}"
+        if self._worker_error_count > 1:
+            message += f" (누적 {self._worker_error_count}건)"
+        emit("live_worker_error", message)
 
     def _report_processing_lag(
         self,
@@ -4937,6 +5103,11 @@ class PapaStopApp(ctk.CTk):
                 self._clear_file_preview()
             elif kind == "live_status":
                 self.live_status_var.set(str(payload))
+            elif kind == "live_worker_error":
+                # 실시간 발화 처리 중 일시적 오류. 치명적 오류와 달리 모달 팝업을 띄우거나
+                # 실행 상태를 해제하지 않고, 로그와 상태줄에만 표시해 자막이 계속 흐르게 한다.
+                self._append_log(payload)
+                self.live_status_var.set(str(payload))
             elif kind == "record_status":
                 self.record_status_var.set(str(payload))
             elif kind == "progress":
@@ -6135,6 +6306,12 @@ class PapaStopApp(ctk.CTk):
         overlay_text = "표시" if self.show_overlay_var.get() else "숨김"
         self._emit("log", f"실시간 자막 시작 버튼을 눌렀습니다. 입력: {source_text}")
         self._emit("log", f"실시간 설정: 음성 인식 {self.live_asr.model_label()} | 번역 {self.live_translator.profile_label()} | SRT 저장 {srt_text} | 자막창 {overlay_text}")
+        if self.live_asr.source_language == SOURCE_LANG_AUTO:
+            self._emit(
+                "log",
+                "안내: 소스 언어가 '자동 감지'입니다. 듣는 언어가 정해져 있다면 소스 언어를 "
+                "직접 지정하면 짧은 발화의 언어 오인식에 따른 오역을 크게 줄일 수 있습니다.",
+            )
         self._emit("busy_live", True)
         self._emit("live_status", "연결 중 ...")
         self._emit("status", "실시간 자막")

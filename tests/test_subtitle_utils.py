@@ -27,7 +27,9 @@ from papastop import (
     format_vga_spec,
     hf_repo_cache_key,
     is_http_media_source,
+    is_probable_hallucination,
     merge_vga_specs,
+    tidy_korean_subtitle,
     nllb_lang,
     parse_nvidia_smi_csv,
     save_float_audio_to_wav,
@@ -87,6 +89,74 @@ class SubtitleUtilityTests(unittest.TestCase):
 
     def test_clean_translation_for_subtitle_rejects_source_only_japanese(self):
         self.assertEqual(clean_translation_for_subtitle("今日はいい天気ですね", "今日はいい天気ですね"), "")
+
+    def test_is_probable_hallucination_flags_silence_and_repetition(self):
+        # 정상 발화: 무음 확률 낮고 압축률 정상 → 통과.
+        self.assertFalse(is_probable_hallucination("오늘 날씨가 좋네요", 0.1, -0.3, 1.4))
+        # 빈 문자열은 항상 환각으로 본다.
+        self.assertTrue(is_probable_hallucination("   ", 0.0, 0.0, 0.0))
+        # 무음 확률이 매우 높으면(지어낸 자막) 걸러낸다.
+        self.assertTrue(is_probable_hallucination("감사합니다", 0.92, -0.2, 1.5))
+        # 같은 토큰 반복(높은 압축률 + 낮은 신뢰도)은 걸러낸다.
+        self.assertTrue(is_probable_hallucination("야 야 야 야 야 야", 0.2, -0.6, 3.0))
+        # 속성이 없는(가짜) 세그먼트 기본값(0.0)은 걸러지지 않는다.
+        self.assertFalse(is_probable_hallucination("정상 문장", 0.0, 0.0, 0.0))
+
+    def test_is_probable_hallucination_filters_known_filler_phrases(self):
+        # 세그먼트 전체가 알려진 환각 문구면(신호가 약해도) 걸러낸다.
+        self.assertTrue(is_probable_hallucination("시청해주셔서 감사합니다", 0.2, -0.3, 1.5))
+        self.assertTrue(is_probable_hallucination("Thank you.", 0.1, -0.2, 1.4))
+        self.assertTrue(is_probable_hallucination("ご視聴ありがとうございました", 0.2, -0.3, 1.5))
+        # 부분 일치(문구가 실제 문장 안에 포함)는 건드리지 않는다.
+        self.assertFalse(is_probable_hallucination("감사합니다 오늘 뉴스를 전해드립니다", 0.2, -0.3, 1.4))
+
+    def test_tidy_korean_subtitle_normalizes_punctuation_and_spacing(self):
+        self.assertEqual(tidy_korean_subtitle("안녕하세요 ."), "안녕하세요.")
+        self.assertEqual(tidy_korean_subtitle("정말   좋아요 ?"), "정말 좋아요?")
+        self.assertEqual(tidy_korean_subtitle("대박!!!!"), "대박!")
+        self.assertEqual(tidy_korean_subtitle("음..... 그러니까"), "음… 그러니까")
+        self.assertEqual(tidy_korean_subtitle(", 그래서 갔어요"), "그래서 갔어요")
+        # "!!"(2개)와 "..."(3개)는 강조/말줄임으로 그대로 둔다.
+        self.assertEqual(tidy_korean_subtitle("좋아!!"), "좋아!!")
+        self.assertEqual(tidy_korean_subtitle("글쎄..."), "글쎄...")
+        self.assertEqual(tidy_korean_subtitle("   "), "")
+
+    def test_transcribe_drops_hallucinations_only_when_requested(self):
+        real = SimpleNamespace(
+            start=0.0, end=1.0, text="진짜 발화",
+            no_speech_prob=0.1, avg_logprob=-0.3, compression_ratio=1.3,
+        )
+        ghost = SimpleNamespace(
+            start=1.0, end=2.0, text="감사합니다",
+            no_speech_prob=0.95, avg_logprob=-0.2, compression_ratio=1.6,
+        )
+
+        class HallucinationASREngine(ASREngine):
+            def _load_model(self, on_line=None):
+                self._model = SimpleNamespace(
+                    transcribe=lambda *_a, **_k: ([real, ghost], SimpleNamespace(language="ko"))
+                )
+
+        engine = HallucinationASREngine()
+        # 필터를 켜면 환각 세그먼트가 빠진다.
+        rows, _ = engine.transcribe(np.zeros(16000, dtype=np.float32), drop_hallucinations=True)
+        self.assertEqual([r.text for r in rows], ["진짜 발화"])
+        # 파일 자막처럼 필터를 끄면 그대로 유지된다.
+        rows_all, _ = engine.transcribe(np.zeros(16000, dtype=np.float32), drop_hallucinations=False)
+        self.assertEqual([r.text for r in rows_all], ["진짜 발화", "감사합니다"])
+
+    def test_translate_texts_raises_when_fallback_disabled(self):
+        engine = TranslationEngine(preferred="balanced")
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("엔진 없음")
+
+        engine._translate_nllb = boom
+        # 파일 자막: 원문이라도 반환(흐름 유지).
+        self.assertEqual(engine.translate_texts(["hello"], "en"), ["hello"])
+        # 실시간: 원문 노출 대신 예외를 던져 해당 구간을 건너뛰게 한다.
+        with self.assertRaises(RuntimeError):
+            engine.translate_texts(["hello"], "en", allow_original_fallback=False)
 
     def test_llm_numbered_translation_parser_keeps_korean_only(self):
         engine = TranslationEngine()

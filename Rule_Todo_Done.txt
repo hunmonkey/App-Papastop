@@ -563,3 +563,33 @@ AI 작업 인수인계용 진행 기록 / To-Do Done
         dist\PapaStop\.papastop_data\huggingface\hub 안의 translategemma-12b-it.Q4_K_M.gguf 확인(약 6.8GB).
         dist\PapaStop\.papastop_data\nvidia 및 NLLB CT2 600M/1.3B/3.3B 폴더 확인.
         PapaStop.exe 실행 스모크: 8초 후 프로세스 생존 확인, 강제 종료 후 종료 확인.
+
+------------------------------------------------------------
+
+[완료] 14. 실시간 자막 번역 강화·오류 제거 + 코드 경량화 + 풀버전 재빌드  (2026-07-22 15:25:00)
+  배경: 실시간 자막 생성 시 이상한 번역과 중간 엔진 오류로 프로그램이 멈추는 증상 신고.
+  어디: papastop.py, tests/test_subtitle_utils.py, dist\PapaStop
+  무엇/어떻게:
+   (1) 멈춤 제거 — 발화 단위 일시적 오류를 치명적 오류와 분리.
+       · LiveCaptionService._worker_loop의 except가 emit("error") 대신 _report_worker_error 호출
+         (로그·상태줄만 갱신, 10초 rate limit, 루프 계속). 새 이벤트 kind "live_worker_error" 추가.
+       · PapaStopApp._process_events에서 "live_worker_error"는 모달 팝업/busy 해제 없이 표시만 함
+         (기존 "error"는 치명적 시작 오류용으로 모달+정지 유지).
+   (2) 원문 노출 방지 — TranslationEngine.translate_texts에 allow_original_fallback 인자 추가.
+       · 파일 자막은 기존대로 원문 반환, 실시간은 False로 호출해 전 엔진 실패 시 예외→해당 구간 건너뜀.
+   (3) 자동 언어 흔들림 완화 — ASREngine.transcribe에 language_override 인자, LIVE_STICKY_LANGUAGE_HITS(3).
+       · LiveCaptionService._source_is_auto/_live_language_override/_update_sticky_language로 자동 감지 모드에서
+         같은 언어 3회 연속이면 고정. 시작 시 자동 감지면 소스 언어 지정 권장 안내 로그.
+   (4) 환각 자막 필터 — is_probable_hallucination(무음확률/압축률/신뢰도) + 필러 문구 사전(_HALLUCINATION_FILLER_PHRASES).
+       · ASREngine.transcribe drop_hallucinations 인자로 실시간에서만 적용(파일 자막 불변). 세그먼트 전체 일치만 차단.
+   (5) 문장부호/띄어쓰기 후처리 — tidy_korean_subtitle을 실시간 워커에서 clean_translation_for_subtitle 뒤에 적용.
+   (6) 경량화 — __init__/start()에 중복되던 실행 상태 초기화 9줄을 _reset_run_state()로 통합, sticky 자동감지
+       조건 중복을 _source_is_auto()로 통합(방어적 getattr 제거).
+   (7) 풀버전 재빌드 — build_package.ps1 -SkipInstall로 dist\PapaStop 재생성.
+  검증: .venv 기준 python -m py_compile papastop.py 통과. 단위 테스트 37개 통과(신규 4개: 환각 판정·필러 문구·
+        transcribe 필터 on/off·원문 fallback 억제, 그리고 문장부호 후처리).
+        빌드: build_package.ps1 -SkipInstall 성공(exit 0). dist\PapaStop\PapaStop.exe 생성 확인
+        (72,975,860바이트 ≈ 69.6MB, 2026-07-22 15:21). .papastop_data\huggingface\hub에 Whisper 전종·NLLB·OPUS·
+        GGUF LLM(TranslateGemma 12B, Gemma 4 12B 등) 원본과 동일 복사 확인. nvidia 및 NLLB CT2 600M/1.3B/3.3B 확인.
+  보고: 실시간에서 대형 LLM(GGUF) 선택 시 발화마다 느리고 VRAM 부족 시 네이티브 크래시 위험은 남음 → 기본 NLLB 권장.
+        환각 필러 사전은 목록 일치만 차단하므로 새 환각 문구 발견 시 _HALLUCINATION_FILLER_PHRASES에 추가.
