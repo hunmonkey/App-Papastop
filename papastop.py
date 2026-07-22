@@ -321,6 +321,7 @@ UI_OK = "#16a34a"            # 모델 준비 완료 표시 (완료 상태에만 
 UI_WARN = "#d97706"          # 모델 다운로드 필요 표시
 OVERLAY_BG = "#0f172a"       # 자막 오버레이 배경 (어두운 톤 유지)
 OVERLAY_FG = "#f8fafc"
+OVERLAY_IDLE_CLEAR_MS = 6000  # 새 자막이 이 시간(ms) 동안 없으면 오버레이의 오래된 자막을 지운다.
 
 _UI_FONT_FAMILY_CACHE: str | None = None
 
@@ -3803,10 +3804,13 @@ class LiveSubtitleOverlay(tk.Toplevel):
         self._drag_start_x = 0
         self._drag_start_y = 0
         self._visible = False
+        self._clear_after_id: str | None = None
 
         # 윈도우 상단 바가 없는 상태에서도 마우스로 위치를 이동할 수 있게 드래그 이벤트 등록
         self.bind("<Button-1>", self._begin_drag)
         self.bind("<B1-Motion>", self._on_drag)
+        # 창 폭이 바뀌면 자막 줄바꿈 폭을 폭에 맞춰 갱신한다.
+        self.bind("<Configure>", self._on_overlay_configure)
 
         self.label = tk.Label(
             self,
@@ -3838,10 +3842,30 @@ class LiveSubtitleOverlay(tk.Toplevel):
         self._drag_start_x = event.x_root
         self._drag_start_y = event.y_root
 
+    def _on_overlay_configure(self, event: tk.Event) -> None:
+        label = getattr(self, "label", None)
+        if event.widget is self and label is not None:
+            label.config(wraplength=max(300, int(event.width) - 80))
+
     def set_text(self, text: str) -> None:
         if not text:
             return
         self.label.config(text=text)
+        self._schedule_idle_clear()
+
+    def _schedule_idle_clear(self) -> None:
+        # 새 자막이 한동안 오지 않으면(무음/환각 필터로 걸러짐) 오래된 자막을 지워
+        # 화면에 멈춘 것처럼 남지 않게 한다.
+        if self._clear_after_id is not None:
+            try:
+                self.after_cancel(self._clear_after_id)
+            except Exception:
+                pass
+        self._clear_after_id = self.after(OVERLAY_IDLE_CLEAR_MS, self._clear_idle_text)
+
+    def _clear_idle_text(self) -> None:
+        self._clear_after_id = None
+        self.label.config(text="")
 
     def show(self) -> None:
         self.deiconify()
@@ -3858,6 +3882,12 @@ class LiveSubtitleOverlay(tk.Toplevel):
     def close(self) -> None:
         try:
             self._visible = False
+            if self._clear_after_id is not None:
+                try:
+                    self.after_cancel(self._clear_after_id)
+                except Exception:
+                    pass
+                self._clear_after_id = None
             self.destroy()
         except Exception:
             pass
@@ -4570,7 +4600,7 @@ class PapaStopApp(ctk.CTk):
             exportselection=False,
             bg=UI_SURFACE,
             fg=UI_TEXT,
-            font=(self._ui_font_family, 11),
+            font=(self._ui_font_family, 13),
             selectbackground=UI_ACCENT,
             selectforeground=UI_SURFACE,
             activestyle="none",
@@ -4650,6 +4680,7 @@ class PapaStopApp(ctk.CTk):
             text="PC 스피커 소리",
             variable=self.live_source_var,
             value=LIVE_SOURCE_SPEAKER,
+            command=self._on_live_source_selected,
             font=self.font_base,
         ).pack(side="left", padx=(0, 14))
         ctk.CTkRadioButton(
@@ -4657,6 +4688,7 @@ class PapaStopApp(ctk.CTk):
             text="인터넷 URL 스트림",
             variable=self.live_source_var,
             value=LIVE_SOURCE_URL,
+            command=self._on_live_source_selected,
             font=self.font_base,
         ).pack(side="left")
         self._form_label(live_form, "원본 언어", width=76).grid(row=0, column=2, sticky="w", padx=(12, 0), pady=4)
@@ -4670,9 +4702,8 @@ class PapaStopApp(ctk.CTk):
         live_lang_holder.grid(row=0, column=3, sticky="w", padx=10, pady=4)
 
         self._form_label(live_form, "URL").grid(row=1, column=0, sticky="w", pady=4)
-        ctk.CTkEntry(live_form, textvariable=self.live_url_var, **self._entry_kw).grid(
-            row=1, column=1, columnspan=4, sticky="ew", padx=10, pady=4
-        )
+        self.live_url_entry = ctk.CTkEntry(live_form, textvariable=self.live_url_var, **self._entry_kw)
+        self.live_url_entry.grid(row=1, column=1, columnspan=4, sticky="ew", padx=10, pady=4)
 
         self._form_label(live_form, "음성 인식 모델").grid(row=2, column=0, sticky="w", pady=4)
         live_model_holder, self.live_whisper_model_combo = self._make_option_menu(
@@ -4683,15 +4714,26 @@ class PapaStopApp(ctk.CTk):
             width=MODEL_COMBO_W,
         )
         live_model_holder.grid(row=2, column=1, sticky="w", padx=10, pady=4)
+        live_asr_action = ctk.CTkFrame(live_form, fg_color="transparent")
+        live_asr_action.grid(row=2, column=2, sticky="w", pady=4)
+        self.prepare_live_asr_btn = ctk.CTkButton(
+            live_asr_action,
+            text="위스퍼 모델 다운로드",
+            command=self._prepare_live_asr_model,
+            width=MODEL_BTN_W,
+            height=self._sec_btn_h,
+            **self._ghost_btn,
+        )
+        self.prepare_live_asr_btn.pack(side="left")
         self.delete_live_asr_btn = ctk.CTkButton(
-            live_form,
+            live_asr_action,
             text="삭제",
             command=self._delete_live_asr_model,
             width=MODEL_DELETE_BTN_W,
             height=self._sec_btn_h,
             **self._danger_btn,
         )
-        self.delete_live_asr_btn.grid(row=2, column=2, sticky="w", pady=4)
+        self.delete_live_asr_btn.pack(side="left", padx=(8, 0))
         self._hint_label(live_form, "실시간은 빠른 tiny/base 권장", wraplength=360).grid(
             row=2, column=3, columnspan=2, sticky="ew", padx=(10, 10), pady=4
         )
@@ -4705,15 +4747,26 @@ class PapaStopApp(ctk.CTk):
             width=MODEL_COMBO_W,
         )
         live_trans_holder.grid(row=3, column=1, sticky="w", padx=10, pady=4)
+        live_trans_action = ctk.CTkFrame(live_form, fg_color="transparent")
+        live_trans_action.grid(row=3, column=2, sticky="w", pady=4)
+        self.prepare_live_translation_btn = ctk.CTkButton(
+            live_trans_action,
+            text="번역 모델 다운로드",
+            command=self._prepare_live_translation_model,
+            width=MODEL_BTN_W,
+            height=self._sec_btn_h,
+            **self._ghost_btn,
+        )
+        self.prepare_live_translation_btn.pack(side="left")
         self.delete_live_translation_btn = ctk.CTkButton(
-            live_form,
+            live_trans_action,
             text="삭제",
             command=self._delete_live_translation_model,
             width=MODEL_DELETE_BTN_W,
             height=self._sec_btn_h,
             **self._danger_btn,
         )
-        self.delete_live_translation_btn.grid(row=3, column=2, sticky="w", pady=4)
+        self.delete_live_translation_btn.pack(side="left", padx=(8, 0))
         self._hint_label(live_form, "파일 탭과 동일 · LLM은 실시간이 느려질 수 있음", wraplength=360).grid(
             row=3, column=3, columnspan=2, sticky="ew", padx=(10, 10), pady=4
         )
@@ -4742,6 +4795,7 @@ class PapaStopApp(ctk.CTk):
             row=4, column=3, columnspan=2, sticky="ew", padx=(0, 10), pady=4
         )
         self._update_live_secondary_state()
+        self._on_live_source_selected()  # 기본값(PC 스피커)에 맞춰 URL 칸 초기 활성 상태를 정한다.
 
         live_status_row, self.live_asr_status_lbl, self.live_trans_status_lbl = self._make_model_status_row(source_body)
         live_status_row.pack(fill="x", pady=(2, 0))
@@ -4807,6 +4861,11 @@ class PapaStopApp(ctk.CTk):
             text_color=UI_TEXT,
         )
         self.live_preview.pack(fill="x", padx=16, pady=16)
+        # 창 폭이 넓어지면 미리보기 줄바꿈 폭도 넓혀 넓은 화면을 활용한다(안쪽 여백 32 + 여유).
+        preview_card.bind(
+            "<Configure>",
+            lambda event: self.live_preview.configure(wraplength=max(300, int(event.width) - 40)),
+        )
         live_status_line = self._make_status_row(self.live_tab, [("실시간 상태", self.live_status_var)])
         live_status_line.pack(fill="x", pady=6)
 
@@ -5671,9 +5730,11 @@ class PapaStopApp(ctk.CTk):
         for name in (
             "prepare_asr_btn",
             "delete_asr_btn",
+            "prepare_live_asr_btn",
             "delete_live_asr_btn",
             "prepare_translation_btn",
             "delete_translation_btn",
+            "prepare_live_translation_btn",
             "delete_live_translation_btn",
         ):
             widget = getattr(self, name, None)
@@ -5895,6 +5956,87 @@ class PapaStopApp(ctk.CTk):
                 )
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _prepare_live_asr_model(self) -> None:
+        # 실시간 탭 위스퍼 모델을 시작 전에 미리 내려받는다(파일 탭과 동일한 흐름, live_asr 대상).
+        if self._is_file_running or self._is_live_running or self._is_record_running:
+            return
+        if self._is_asr_preparing or self._is_translation_preparing:
+            return
+
+        model_name = self._live_whisper_model_from_selection()
+        self.live_asr.set_model(model_name)
+        self._apply_resource_mode_from_selection()
+        self._set_asr_preparing(True)
+        self._emit("log", f"실시간 위스퍼 모델을 미리 다운로드하는 중입니다: {self.live_asr.model_label(model_name)}")
+
+        def worker() -> None:
+            try:
+                self.live_asr.prepare_model(model_name)
+                self._emit(
+                    "asr_prepare_done",
+                    {
+                        "ok": True,
+                        "message": (
+                            f"실시간 위스퍼 모델 준비 완료: {self.live_asr.model_label(model_name)} | "
+                            f"{self.live_asr.resource_summary()}"
+                        ),
+                    },
+                )
+            except Exception as exc:
+                self._emit("error", str(exc))
+                self._emit(
+                    "asr_prepare_done",
+                    {"ok": False, "message": f"실시간 위스퍼 모델 준비 실패: {exc}"},
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _prepare_live_translation_model(self) -> None:
+        # 실시간 탭 번역 모델을 시작 전에 미리 내려받는다(live_translator 대상).
+        if self._is_file_running or self._is_live_running or self._is_record_running:
+            return
+        if self._is_asr_preparing or self._is_translation_preparing:
+            return
+
+        profile = self._live_translation_profile_from_selection()
+        self.live_translator.set_profile(profile)
+        self._apply_resource_mode_from_selection()
+        self._set_translation_preparing(True)
+        self._emit("log", f"실시간 번역 모델을 준비하는 중입니다: {self.live_translator.profile_label()}")
+
+        def worker() -> None:
+            try:
+                self.live_translator.prepare_profile(profile)
+                self._emit(
+                    "translation_prepare_done",
+                    {
+                        "ok": True,
+                        "message": (
+                            f"실시간 번역 모델 준비 완료: {self.live_translator.profile_label(profile)} | "
+                            f"{self.live_translator.resource_summary()}"
+                        ),
+                    },
+                )
+            except Exception as exc:
+                self._emit("error", str(exc))
+                self._emit(
+                    "translation_prepare_done",
+                    {"ok": False, "message": f"실시간 번역 모델 준비 실패: {exc}"},
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_live_source_selected(self, _event: object | None = None) -> None:
+        # 입력 방식이 'PC 스피커 소리'면 URL 칸을 비활성화(회색)해, 입력해도 무시되는 혼동을 없앤다.
+        entry = getattr(self, "live_url_entry", None)
+        if entry is None:
+            return
+        is_url = self.live_source_var.get() == LIVE_SOURCE_URL
+        try:
+            entry.configure(state="normal" if is_url else "disabled")
+        except Exception:
+            pass
 
     def _select_output_dir(self) -> None:
         folder = filedialog.askdirectory()
