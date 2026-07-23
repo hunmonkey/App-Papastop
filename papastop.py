@@ -1147,6 +1147,29 @@ def find_ffmpeg() -> str | None:
     return None
 
 
+SETTINGS_FILE = PAPASTOP_DATA / "settings.json"
+
+
+def load_user_settings() -> dict:
+    """마지막에 저장한 사용자 선택(모델·번역·자원 방식 등)을 읽어온다. 없으면 빈 dict."""
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_user_settings(data: dict) -> None:
+    """사용자 선택을 settings.json에 저장한다. 실패해도 앱 종료를 막지 않는다."""
+    try:
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 def ensure_cache_dirs() -> None:
     HF_HOME.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("HF_HOME", str(HF_HOME / "home"))
@@ -2059,9 +2082,11 @@ class ASREngine:
 
 
 class TranslationEngine:
-    def __init__(self, preferred: str = "auto", resource_mode: str = DEFAULT_RESOURCE_MODE):
+    def __init__(self, preferred: str = "auto", resource_mode: str = DEFAULT_RESOURCE_MODE, realtime: bool = False):
         self.preferred = preferred
         self.resource_mode = normalize_resource_mode(resource_mode)
+        # 실시간 인스턴스는 지연 예산이 빠듯해, 체감 품질 손실이 거의 없는 선에서 NLLB beam을 낮춘다.
+        self.realtime = realtime
         self._nllb_pipelines: dict[str, object] = {}
         self._nllb_ct2_translators: dict[str, object] = {}
         self._nllb_tokenizer = None
@@ -2246,7 +2271,7 @@ class TranslationEngine:
             results = loaded.translate_batch(  # type: ignore[attr-defined]
                 source_tokens,
                 target_prefix=[["kor_Hang"] for _ in source_tokens],
-                beam_size=4 if self.preferred != "accurate" else 5,
+                beam_size=(3 if self.realtime else (5 if self.preferred == "accurate" else 4)),
                 max_decoding_length=300,
                 max_batch_size=settings.translation_batch_size,
             )
@@ -3319,14 +3344,6 @@ class LiveCaptionService:
                             allow_original_fallback=False,
                         )
                         translate_elapsed = time.monotonic() - translate_started_at
-                        # [임시 진단] 번역이 느린 경우 입력 텍스트의 길이·내용을 남긴다(원인 파악용).
-                        if translate_elapsed > 0.8:
-                            total_chars = sum(len(s.text) for s in segments)
-                            emit(
-                                "log",
-                                f"[진단] 번역 {translate_elapsed:.1f}초 | 언어={source_language} | "
-                                f"조각 {len(segments)}개·{total_chars}자 | 첫 텍스트: {segments[0].text[:60]!r}",
-                            )
                         if len(translated) != len(segments):
                             translated = translated + ["" for _ in range(len(segments) - len(translated))]
                         pairs = []
@@ -3909,12 +3926,14 @@ class PapaStopApp(ctk.CTk):
         set_download_progress_callback(lambda data: self._emit("download_progress", data))
 
         self.asr = ASREngine()
-        # 실시간은 속도(small), 파일은 정확도(large-v3-turbo)로 모델을 따로 쓰도록 엔진을 분리한다.
-        # RTX 5070 Ti(16GB)에서는 small도 GPU로 실시간을 충분히 따라간다.
-        self.live_asr = ASREngine(model_name="small")
+        # 실시간은 반응속도, 파일은 정확도(large-v3-turbo)로 모델을 따로 쓰도록 엔진을 분리한다.
+        # 실시간 기본은 medium: small보다 인식 정확도가 뚜렷이 높고, GPU(예: RTX 5070 Ti 16GB)면
+        # 실시간을 따라간다. GPU 여유가 적은 PC는 실시간 탭에서 small/base로 낮출 수 있다.
+        self.live_asr = ASREngine(model_name="medium")
         self.translator = TranslationEngine(preferred="auto")
         # 실시간 번역도 파일과 따로 둔다. 기본은 품질 우선(1.3B), 실시간 탭 콤보에서 600M(빠름)로 바꿀 수 있다.
-        self.live_translator = TranslationEngine(preferred="balanced")
+        # realtime=True: 실시간 지연 예산에 맞춰 NLLB beam을 낮춰(3) 번역 속도를 확보한다.
+        self.live_translator = TranslationEngine(preferred="balanced", realtime=True)
         self.file_workflow = FileSubtitleWorkflow(self.asr, self.translator)
         self.live_service = LiveCaptionService(self.live_asr, self.live_translator)
         self.record_service = ScreenRecorderService()
@@ -3925,6 +3944,7 @@ class PapaStopApp(ctk.CTk):
         self.file_queue: list[str] = []
         self._batch_outputs: list[Path] = []
         self._batch_current = 0
+        self._failed_sources: list[str] = []
         self.last_output: Path | None = None
         self.overlay: LiveSubtitleOverlay | None = None
         self._is_file_running = False
@@ -3935,9 +3955,73 @@ class PapaStopApp(ctk.CTk):
         self.progress_started_at: float | None = None
 
         self._build_ui()
+        self._apply_saved_settings(load_user_settings())
         self._refresh_status()
         self._refresh_system_specs()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(80, self._process_events)
+
+    def _apply_saved_settings(self, data: dict) -> None:
+        """지난 실행에서 저장한 모델·번역·자원 방식 선택을 UI와 엔진에 되살린다."""
+        if not data:
+            return
+
+        mode = data.get("resource_mode")
+        if mode in RESOURCE_MODE_LABELS:
+            self.resource_mode_var.set(RESOURCE_MODE_LABELS[mode])
+            self._apply_resource_mode_from_selection()
+
+        file_whisper = data.get("file_whisper_model")
+        if file_whisper in WHISPER_MODEL_LABELS:
+            self.whisper_model_var.set(WHISPER_MODEL_LABELS[file_whisper])
+            self.asr.set_model(file_whisper)
+
+        file_profile = data.get("file_translation_profile")
+        if file_profile in TRANSLATION_PROFILE_LABELS:
+            self.translation_profile_var.set(TRANSLATION_PROFILE_LABELS[file_profile])
+            self.translator.set_profile(file_profile)
+
+        source_lang = data.get("source_lang")
+        if source_lang in SOURCE_LANG_LABELS:
+            self.source_lang_var.set(SOURCE_LANG_LABELS[source_lang])
+            self.asr.set_source_language(source_lang)
+            self.live_asr.set_source_language(source_lang)
+
+        live_whisper = data.get("live_whisper_model")
+        if live_whisper in WHISPER_MODEL_LABELS:
+            self.live_whisper_model_var.set(WHISPER_MODEL_LABELS[live_whisper])
+            self.live_asr.set_model(live_whisper)
+
+        live_profile = data.get("live_translation_profile")
+        if live_profile in TRANSLATION_PROFILE_LABELS:
+            self.live_translation_var.set(TRANSLATION_PROFILE_LABELS[live_profile])
+            self.live_translator.set_profile(live_profile)
+            self._update_live_secondary_state()
+
+        live_source = data.get("live_source")
+        if live_source in (LIVE_SOURCE_SPEAKER, LIVE_SOURCE_URL):
+            self.live_source_var.set(live_source)
+            self._on_live_source_selected()
+
+        self._refresh_model_status()
+
+    def _collect_current_settings(self) -> dict:
+        return {
+            "resource_mode": self._resource_mode_from_selection(),
+            "file_whisper_model": self._whisper_model_from_selection(),
+            "file_translation_profile": self._translation_profile_from_selection(),
+            "source_lang": self._source_lang_id_from_label(self.source_lang_var.get()),
+            "live_whisper_model": self._live_whisper_model_from_selection(),
+            "live_translation_profile": self._live_translation_profile_from_selection(),
+            "live_source": self.live_source_var.get(),
+        }
+
+    def _on_close(self) -> None:
+        try:
+            save_user_settings(self._collect_current_settings())
+        except Exception:
+            pass
+        self.destroy()
 
     def _apply_theme(self) -> None:
         """customtkinter 라이트 테마 + 인디고 액센트를 전역으로 설정합니다."""
@@ -4501,6 +4585,14 @@ class PapaStopApp(ctk.CTk):
         ctk.CTkButton(
             action_row, text="결과 열기", command=self._open_output, **self._open_btn_kw
         ).pack(side="right")
+        ctk.CTkButton(
+            action_row, text="폴더 열기", command=self._open_output_folder, **self._open_btn_kw
+        ).pack(side="right", padx=8)
+        self.retry_failed_btn = ctk.CTkButton(
+            action_row, text="실패 재시도", command=self._retry_failed_files,
+            state="disabled", **self._open_btn_kw
+        )
+        self.retry_failed_btn.pack(side="right")
 
         # 모델 선택 행: 콤보·다운로드 버튼 열을 위 경로 행과 같은 왼쪽 기준으로 맞춘다.
         model_form = ctk.CTkFrame(self.file_tab, fg_color="transparent")
@@ -5192,6 +5284,9 @@ class PapaStopApp(ctk.CTk):
             elif kind == "live_subtitle_output":
                 self.last_output = Path(str(payload))
                 self._append_log(f"실시간 자막을 저장하는 중: {self.last_output}")
+            elif kind == "file_retryable":
+                self._failed_sources = list(payload) if isinstance(payload, list) else []
+                self._update_retry_button()
             elif kind == "busy_file":
                 self._set_file_busy(bool(payload))
             elif kind == "busy_live":
@@ -5257,6 +5352,13 @@ class PapaStopApp(ctk.CTk):
             self.start_file_btn.configure(state="disabled")
         self._refresh_resource_mode_control_state()
         self._refresh_model_action_states()
+        self._update_retry_button()
+
+    def _update_retry_button(self) -> None:
+        if not hasattr(self, "retry_failed_btn"):
+            return
+        can_retry = bool(self._failed_sources) and not self._is_file_running
+        self.retry_failed_btn.configure(state="normal" if can_retry else "disabled")
 
     def _refresh_resource_mode_control_state(self) -> None:
         if not hasattr(self, "resource_mode_combo"):
@@ -6212,6 +6314,7 @@ class PapaStopApp(ctk.CTk):
                 return
 
         self.file_cancel_event.clear()
+        self._failed_sources = []
         self._set_file_busy(True)
         self._begin_timed_progress()
         self._clear_file_preview()
@@ -6229,6 +6332,7 @@ class PapaStopApp(ctk.CTk):
         def worker() -> None:
             saved_count = 0
             failed_count = 0
+            failed_sources: list[str] = []
             try:
                 for index, media_source in enumerate(media_sources, start=1):
                     self._batch_current = index
@@ -6263,6 +6367,7 @@ class PapaStopApp(ctk.CTk):
                         break
                     except Exception as exc:
                         failed_count += 1
+                        failed_sources.append(media_source)
                         self._emit("log", f"[{index}/{total}] 실패: {exc}")
                         continue
 
@@ -6281,6 +6386,7 @@ class PapaStopApp(ctk.CTk):
             except Exception as exc:
                 self._emit("error", str(exc))
             finally:
+                self._emit("file_retryable", list(failed_sources))
                 self._emit("busy_file", False)
                 self._emit("status", "대기 중")
                 if total > 0:
@@ -6495,6 +6601,15 @@ class PapaStopApp(ctk.CTk):
         self._emit("eta_status", "대기 중")
         self._append_log("실시간 자막 중지가 완료되었습니다.")
 
+    def _retry_failed_files(self) -> None:
+        if self._is_file_running or self._is_live_running or self._is_record_running:
+            return
+        if not self._failed_sources:
+            return
+        self.file_queue = list(self._failed_sources)
+        self._refresh_file_queue()
+        self._start_file_job()
+
     def _open_output(self) -> None:
         if self.last_output is None or not self.last_output.exists():
             messagebox.showwarning(APP_NAME, "아직 열 수 있는 결과 파일이 없습니다.")
@@ -6503,6 +6618,16 @@ class PapaStopApp(ctk.CTk):
             os.startfile(str(self.last_output))
         else:
             self._emit("log", f"이 운영체제에서는 자동 열기를 사용할 수 없습니다: {self.last_output}")
+
+    def _open_output_folder(self) -> None:
+        if self.last_output is None or not self.last_output.exists():
+            messagebox.showwarning(APP_NAME, "아직 열 수 있는 결과 폴더가 없습니다.")
+            return
+        folder = self.last_output.parent
+        if os.name == "nt":
+            os.startfile(str(folder))
+        else:
+            self._emit("log", f"이 운영체제에서는 자동 열기를 사용할 수 없습니다: {folder}")
 def main() -> None:
     if not APP_ROOT.exists():
         raise RuntimeError(f"앱 폴더를 확인할 수 없습니다: {APP_ROOT}")
