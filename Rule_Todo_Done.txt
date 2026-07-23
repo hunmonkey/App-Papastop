@@ -821,3 +821,20 @@ AI 작업 인수인계용 진행 기록 / To-Do Done
   검증: python -m py_compile papastop.py 통과. .venv 단위 테스트 34개 통과.
         앱 객체 확인: 삭제 버튼 4개 생성, 파일/실시간 번역 콤보에 Gemma 4 12B 표시.
         Gemma 4 12B Q4_K_M 다운로드 완료(ggml-org/gemma-4-12B-it-GGUF, 6.87GiB), ready=True 확인.
+
+[완료] 12. 실행·정지·종료 멈춤 수정 + 모델 초기화(메모리 내리기) 버튼 추가  (2026-07-23)
+  어디: papastop.py
+  무엇/어떻게:
+   · 멈춤(응답 없음) 수정: 정지·종료 시 메인 UI 스레드가 스레드 join·프로세스 종료 대기로 최대 수 초 블록되던 문제 해결.
+     - _stop_live_job / _stop_record_job: 정지 정리(서비스 stop 호출)를 백그라운드 스레드로 이동해 창이 멈추지 않게 함.
+       _live_stopping / _record_stopping 플래그로 정지 중 버튼 비활성화·중복 클릭 방지. busy 해제 시 플래그 리셋.
+     - _on_close: 창을 닫을 때 진행 중 실시간/녹화에 중지 신호(cancel_event.set)를 보내고 ffmpeg 자식 프로세스·PC 스피커
+       캡처 장치를 정리한 뒤 destroy. _closing 플래그로 중복 실행 방지.
+   · 초기화(메모리 내리기) 버튼: 각 모델의 다운로드/삭제 버튼 옆에 "초기화" 버튼 4개 추가(파일 ASR/번역, 실시간 ASR/번역).
+     - 엔진/모델을 GPU(VRAM)·CPU 메모리에서 내림. 디스크 파일은 유지되어 다음 사용 시 자동으로 다시 올라옴("삭제"와 구분).
+     - _release_gpu_memory() 헬퍼 신설: gc.collect + torch.cuda.empty_cache/ipc_collect. ASREngine.unload가 이를 사용하도록 통합.
+     - TranslationEngine.unload_all() 신설: llama close + NLLB/OPUS 파이프라인·토크나이저 캐시 정리 후 메모리 반환.
+     - _unload_engine() 공통 핸들러로 버튼 4개를 백그라운드 처리. _refresh_model_action_states에 버튼 4개 등록해 작업 중 비활성화.
+  검증: python -m py_compile papastop.py 통과. 변경분 스레드 안전성 검토(tkinter 위젯 접근은 메인 스레드/_emit 이벤트 큐로 분리,
+        cancel_event와 서비스 내부 _stop_event 동일 객체 확인). /simplify 4관점 간결화로 중복 헬퍼(_unload_asr/_unload_translation)를
+        _unload_engine 하나로 통합.

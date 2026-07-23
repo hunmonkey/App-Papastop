@@ -1862,6 +1862,23 @@ def is_probable_hallucination(
     return False
 
 
+def _release_gpu_memory() -> None:
+    """참조가 풀린 모델이 점유하던 GPU/CPU 메모리를 즉시 반환하도록 캐시를 비운다.
+    엔진/모델을 메모리에서 내리는 '초기화' 기능과 대형 모델 교체 직전에 호출한다."""
+    import gc
+
+    gc.collect()
+    if has_module("torch"):
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
 class ASREngine:
     def __init__(self, model_name: str = DEFAULT_WHISPER_MODEL, resource_mode: str = DEFAULT_RESOURCE_MODE):
         self.model_name = model_name
@@ -1905,9 +1922,7 @@ class ASREngine:
         with self._load_lock:
             self._model = None
             self._batched_model = None
-        import gc
-
-        gc.collect()
+        _release_gpu_memory()
 
     def model_label(self, model_name: str | None = None) -> str:
         target = model_name or self.model_name
@@ -2717,6 +2732,24 @@ class TranslationEngine:
                 self._nllb_tokenizer = None
             elif engine == "opus":
                 self._opus_pipelines.clear()
+
+    def unload_all(self) -> None:
+        """메모리(VRAM/RAM)에 올라간 모든 번역 모델을 내린다('초기화' 버튼용).
+        다음 번역 시 각 로더가 자동으로 다시 올린다."""
+        with self._pipeline_lock:
+            for loaded in list(self._llama_models.values()):
+                close = getattr(loaded, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+            self._llama_models.clear()
+            self._nllb_ct2_translators.clear()
+            self._nllb_pipelines.clear()
+            self._nllb_tokenizer = None
+            self._opus_pipelines.clear()
+        _release_gpu_memory()
 
 
 class FileSubtitleWorkflow:
@@ -3952,6 +3985,10 @@ class PapaStopApp(ctk.CTk):
         self._is_record_running = False
         self._is_asr_preparing = False
         self._is_translation_preparing = False
+        # 정지 버튼을 눌러 백그라운드에서 서비스를 정리하는 중인지(중복 클릭·UI 멈춤 방지).
+        self._live_stopping = False
+        self._record_stopping = False
+        self._closing = False
         self.progress_started_at: float | None = None
 
         self._build_ui()
@@ -4017,8 +4054,27 @@ class PapaStopApp(ctk.CTk):
         }
 
     def _on_close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
         try:
             save_user_settings(self._collect_current_settings())
+        except Exception:
+            pass
+        # 진행 중인 실시간/녹화/파일 작업에 중지 신호를 보내고, ffmpeg 자식 프로세스와
+        # PC 스피커 캡처 장치를 정리해 창을 닫은 뒤에도 좀비 프로세스가 남지 않게 한다.
+        for cancel in (self.live_cancel_event, self.record_cancel_event, self.file_cancel_event):
+            try:
+                cancel.set()
+            except Exception:
+                pass
+        try:
+            if self.record_service.is_running():
+                self.record_service.stop(timeout=3.0)
+        except Exception:
+            pass
+        try:
+            self.live_service.stop(timeout=1.5)
         except Exception:
             pass
         self.destroy()
@@ -4534,6 +4590,7 @@ class PapaStopApp(ctk.CTk):
         MODEL_COMBO_W = 250
         MODEL_BTN_W = 160
         MODEL_DELETE_BTN_W = 74
+        MODEL_UNLOAD_BTN_W = 74  # 초기화(메모리에서 내리기) 버튼
         PATH_BTN1_W = 120   # 선택 / 같은 이름으로 (왼쪽 버튼 열)
         PATH_BTN2_W = 110   # 목록에 추가 / 폴더 선택 (오른쪽 버튼 열)
 
@@ -4619,6 +4676,15 @@ class PapaStopApp(ctk.CTk):
             **self._ghost_btn,
         )
         self.prepare_asr_btn.pack(side="left")
+        self.unload_asr_btn = ctk.CTkButton(
+            asr_action_frame,
+            text="초기화",
+            command=self._unload_file_asr_model,
+            width=MODEL_UNLOAD_BTN_W,
+            height=self._sec_btn_h,
+            **self._ghost_btn,
+        )
+        self.unload_asr_btn.pack(side="left", padx=(8, 0))
         self.delete_asr_btn = ctk.CTkButton(
             asr_action_frame,
             text="삭제",
@@ -4658,6 +4724,15 @@ class PapaStopApp(ctk.CTk):
             **self._ghost_btn,
         )
         self.prepare_translation_btn.pack(side="left")
+        self.unload_translation_btn = ctk.CTkButton(
+            translation_action_frame,
+            text="초기화",
+            command=self._unload_file_translation_model,
+            width=MODEL_UNLOAD_BTN_W,
+            height=self._sec_btn_h,
+            **self._ghost_btn,
+        )
+        self.unload_translation_btn.pack(side="left", padx=(8, 0))
         self.delete_translation_btn = ctk.CTkButton(
             translation_action_frame,
             text="삭제",
@@ -4817,6 +4892,15 @@ class PapaStopApp(ctk.CTk):
             **self._ghost_btn,
         )
         self.prepare_live_asr_btn.pack(side="left")
+        self.unload_live_asr_btn = ctk.CTkButton(
+            live_asr_action,
+            text="초기화",
+            command=self._unload_live_asr_model,
+            width=MODEL_UNLOAD_BTN_W,
+            height=self._sec_btn_h,
+            **self._ghost_btn,
+        )
+        self.unload_live_asr_btn.pack(side="left", padx=(8, 0))
         self.delete_live_asr_btn = ctk.CTkButton(
             live_asr_action,
             text="삭제",
@@ -4850,6 +4934,15 @@ class PapaStopApp(ctk.CTk):
             **self._ghost_btn,
         )
         self.prepare_live_translation_btn.pack(side="left")
+        self.unload_live_translation_btn = ctk.CTkButton(
+            live_trans_action,
+            text="초기화",
+            command=self._unload_live_translation_model,
+            width=MODEL_UNLOAD_BTN_W,
+            height=self._sec_btn_h,
+            **self._ghost_btn,
+        )
+        self.unload_live_translation_btn.pack(side="left", padx=(8, 0))
         self.delete_live_translation_btn = ctk.CTkButton(
             live_trans_action,
             text="삭제",
@@ -5413,6 +5506,8 @@ class PapaStopApp(ctk.CTk):
 
     def _set_live_busy(self, busy: bool) -> None:
         self._is_live_running = busy
+        if not busy:
+            self._live_stopping = False
         self.start_live_btn.configure(state="disabled" if busy else "normal")
         self.stop_live_btn.configure(state="normal" if busy else "disabled")
         if not busy and self.overlay is not None:
@@ -5481,6 +5576,8 @@ class PapaStopApp(ctk.CTk):
 
     def _set_record_busy(self, busy: bool) -> None:
         self._is_record_running = busy
+        if not busy:
+            self._record_stopping = False
         for widget in self._record_controls:
             state = "disabled" if busy else "normal"
             if widget is self.stop_record_btn:
@@ -5831,12 +5928,16 @@ class PapaStopApp(ctk.CTk):
         state = "disabled" if busy else "normal"
         for name in (
             "prepare_asr_btn",
+            "unload_asr_btn",
             "delete_asr_btn",
             "prepare_live_asr_btn",
+            "unload_live_asr_btn",
             "delete_live_asr_btn",
             "prepare_translation_btn",
+            "unload_translation_btn",
             "delete_translation_btn",
             "prepare_live_translation_btn",
+            "unload_live_translation_btn",
             "delete_live_translation_btn",
         ):
             widget = getattr(self, name, None)
@@ -5935,6 +6036,34 @@ class PapaStopApp(ctk.CTk):
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"번역 모델 삭제 실패: {exc}")
             self._append_log(f"번역 모델 삭제 실패: {exc}")
+
+    def _unload_file_asr_model(self) -> None:
+        self._unload_engine(self.asr.unload, "파일 자막 음성 인식 엔진")
+
+    def _unload_live_asr_model(self) -> None:
+        self._unload_engine(self.live_asr.unload, "실시간 음성 인식 엔진")
+
+    def _unload_file_translation_model(self) -> None:
+        self._unload_engine(self.translator.unload_all, "파일 자막 번역 모델")
+
+    def _unload_live_translation_model(self) -> None:
+        self._unload_engine(self.live_translator.unload_all, "실시간 번역 모델")
+
+    def _unload_engine(self, unload_call: Callable[[], None], label: str) -> None:
+        """엔진/번역 모델을 메모리(GPU/CPU)에서 내린다('초기화' 버튼 공통 처리)."""
+        if self._model_change_busy():
+            messagebox.showwarning(APP_NAME, "현재 작업이 끝난 뒤 초기화해 주세요.")
+            return
+        self._append_log(f"{label}을 메모리(GPU/CPU)에서 내리는 중입니다 ...")
+
+        def worker() -> None:
+            try:
+                unload_call()
+                self._emit("log", f"{label}을 메모리에서 내렸습니다. 다음 사용 시 자동으로 다시 올립니다.")
+            except Exception as exc:
+                self._emit("log", f"{label} 초기화 오류: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _live_secondary_from_selection(self) -> str:
         label = self.live_secondary_var.get()
@@ -6505,14 +6634,23 @@ class PapaStopApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _stop_record_job(self) -> None:
-        if not self._is_record_running:
+        if not self._is_record_running or self._record_stopping:
             return
 
+        # ffmpeg 종료·파일 저장은 몇 초 걸릴 수 있어 백그라운드에서 처리한다.
+        # busy_record 해제는 녹화 감시 스레드(_monitor_recording)의 finally가 emit한다.
+        self._record_stopping = True
         self._emit("record_status", "중지하는 중 ...")
-        try:
-            self.record_service.stop()
-        except Exception as exc:
-            self._append_log(f"화면 녹화 중지 오류: {exc}")
+        self.record_cancel_event.set()
+        self.stop_record_btn.configure(state="disabled")
+
+        def worker() -> None:
+            try:
+                self.record_service.stop()
+            except Exception as exc:
+                self._emit("log", f"화면 녹화 중지 오류: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _start_live_job(self) -> None:
         if self._is_asr_preparing or self._is_translation_preparing:
@@ -6586,20 +6724,30 @@ class PapaStopApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _stop_live_job(self) -> None:
-        if not self._is_live_running:
+        if not self._is_live_running or self._live_stopping:
             return
 
+        # 정지 정리(스레드 join·프로세스 종료)는 몇 초 걸릴 수 있어, 메인 UI 스레드가 아닌
+        # 백그라운드에서 처리해 창이 '응답 없음'으로 멈추지 않게 한다.
+        self._live_stopping = True
         self._append_log("실시간 자막 중지 버튼을 눌렀습니다.")
         self._emit("live_status", "중지하는 중 ...")
-        try:
-            self.live_service.stop(emit=self._emit)
-        except Exception as exc:
-            self._append_log(f"실시간 자막 중지 오류: {exc}")
-        self._emit("busy_live", False)
-        self._emit("live_status", "대기 중")
-        self._emit("status", "대기 중")
-        self._emit("eta_status", "대기 중")
-        self._append_log("실시간 자막 중지가 완료되었습니다.")
+        self.live_cancel_event.set()
+        self.stop_live_btn.configure(state="disabled")
+
+        def worker() -> None:
+            try:
+                self.live_service.stop(emit=self._emit)
+            except Exception as exc:
+                self._emit("log", f"실시간 자막 중지 오류: {exc}")
+            finally:
+                self._emit("busy_live", False)
+                self._emit("live_status", "대기 중")
+                self._emit("status", "대기 중")
+                self._emit("eta_status", "대기 중")
+                self._emit("log", "실시간 자막 중지가 완료되었습니다.")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _retry_failed_files(self) -> None:
         if self._is_file_running or self._is_live_running or self._is_record_running:
